@@ -77,6 +77,21 @@ async def list_events(
     )
 
 
+async def get_event(
+    session: AsyncSession,
+    transport: httpx.AsyncClient,
+    *,
+    account_id: UUID,
+    tenant_id: UUID,
+    event_id: str,
+) -> CalendarEvent:
+    """Read one timed event, scoped to ``(account_id, tenant_id)``."""
+    account = await _load_account(session, account_id=account_id, tenant_id=tenant_id)
+    return await fetch_event(
+        transport, access_token=_access_token(account), event_id=event_id
+    )
+
+
 def _zone_matches(requested: str, event_start: datetime, declared: str) -> bool:
     """True when the event's effective zone equals the requested zone.
 
