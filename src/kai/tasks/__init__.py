@@ -1,0 +1,1 @@
+"""Task Manager package: model, state machine, service, schemas, API."""

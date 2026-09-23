@@ -1,0 +1,20 @@
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-kai}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-kai}
+      POSTGRES_DB: ${POSTGRES_DB:-kai}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - kai_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-kai} -d ${POSTGRES_DB:-kai}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+volumes:
+  kai_pgdata:

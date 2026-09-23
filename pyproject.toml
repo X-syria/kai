@@ -1,0 +1,65 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "kai"
+version = "0.1.0"
+description = "SaaS-ready personal AI agent platform (KAI)"
+readme = "README.md"
+requires-python = ">=3.13"
+license = { text = "Proprietary" }
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.34",
+    "sqlalchemy>=2.0.41",
+    "alembic>=1.16",
+    "psycopg[binary]>=3.2",
+    "asyncpg>=0.30",
+    "email-validator>=2.2",
+    "pydantic>=2.11",
+    "pydantic-settings>=2.9",
+    "PyJWT>=2.10",
+    "structlog>=25.2",
+    "httpx>=0.28",
+    "cryptography>=44",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=1.0",
+    "httpx>=0.28",
+    "ruff>=0.11",
+    "mypy>=1.15",
+]
+
+[project.scripts]
+kai = "kai.cli:cli"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/kai"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "session"
+asyncio_default_test_loop_scope = "session"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "C4"]
+ignore = ["B008"]
+
+[tool.mypy]
+python_version = "3.13"
+strict = false
+check_untyped_defs = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+ignore_missing_imports = true
+packages = ["kai"]
