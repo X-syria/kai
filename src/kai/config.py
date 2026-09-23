@@ -51,6 +51,16 @@ class Settings(BaseSettings):
     # Google credentials at rest. Never the plaintext client secret itself.
     google_creds_encryption_secret: str = DEFAULT_GOOGLE_CRED_SECRET
 
+    # Planner — exactly one fixed model in this phase; no routing. The URL is
+    # an OpenAI-compatible ``/chat/completions`` endpoint. The API key (if the
+    # endpoint requires one) must come from the environment, never be baked
+    # into code. An empty URL means the provider refuses to run (tests use a
+    # deterministic stub and never hit the network).
+    planner_model: str = "kai-planner-v0.5"
+    planner_model_url: str = ""
+    planner_model_api_key: str = ""
+    planner_model_timeout_seconds: float = 60.0
+
 
 @lru_cache
 def get_settings() -> Settings:

@@ -756,7 +756,7 @@ async def test_responses_never_expose_internal_metadata(
 # --- migration -------------------------------------------------------------
 
 REVISION_PREV = "5f3e1d2c4b6a"
-REVISION_HEAD = "b7ceb86460ce"
+REVISION_HEAD = "9ca1c4a9906e"
 
 
 def _alembic(*args: str) -> subprocess.CompletedProcess[str]:
@@ -801,10 +801,12 @@ def test_migration_is_rollbackable_and_forward() -> None:
         assert REVISION_PREV in current
 
         assert "tasks" not in _table_names_fresh()
+        assert "task_plans" not in _table_names_fresh()
 
         up = _alembic("upgrade", "head")
         assert up.returncode == 0, up.stderr
         assert "tasks" in _table_names_fresh()
+        assert "task_plans" in _table_names_fresh()
         assert REVISION_HEAD in _alembic("current").stdout
     finally:
         # Never leave the schema behind head, even on assertion failure.

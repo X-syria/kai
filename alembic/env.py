@@ -10,6 +10,7 @@ from kai.config import get_settings
 # Import models so their tables are registered on Base.metadata.
 from kai.db import models  # noqa: F401
 from kai.db.base import Base
+from kai.planner import models as planner_models  # noqa: F401
 from kai.tasks import models as task_models  # noqa: F401
 
 config = context.config

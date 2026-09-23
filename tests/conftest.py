@@ -47,7 +47,7 @@ async def _clean_state() -> AsyncIterator[None]:
     async with engine.begin() as conn:
         await conn.execute(
             text(
-                "TRUNCATE TABLE tenants, users, google_accounts, tasks"
+                "TRUNCATE TABLE tenants, users, google_accounts, tasks, task_plans"
                 " RESTART IDENTITY CASCADE"
             )
         )
@@ -55,7 +55,7 @@ async def _clean_state() -> AsyncIterator[None]:
     async with engine.begin() as conn:
         await conn.execute(
             text(
-                "TRUNCATE TABLE tenants, users, google_accounts, tasks"
+                "TRUNCATE TABLE tenants, users, google_accounts, tasks, task_plans"
                 " RESTART IDENTITY CASCADE"
             )
         )
