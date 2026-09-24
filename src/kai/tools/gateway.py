@@ -14,10 +14,13 @@ Pipeline (in order, from :mod:`kai.tools` design):
 5. ``validate schema`` — the tool's own Pydantic schema with ``extra=forbid``
    rejects malformed, missing, wrong-typed, unknown, oversized values.
 6. ``classify risk`` — the tool's declared ``RiskLevel`` (application-set).
-7. ``policy boundary`` — Denied here stops before anything else runs.
-8. ``content boundary`` — Denied here stops (no implicit permissions).
-9. ``approval boundary`` — only when risk >= ``approval_threshold``; REQUIRED
-   means "do not execute", DENIED means "do not execute".
+7. ``policy boundary`` — the deterministic Policy Engine; DENY stops here
+   before anything else runs, REQUIRE_APPROVAL flows to the approval boundary.
+8. ``content boundary`` — Denied here stops (no implicit permissions);
+   escalated content stops as APPROVAL_REQUIRED.
+9. ``approval boundary`` — contacted only when the policy decision is
+   REQUIRE_APPROVAL; REQUIRED means "do not execute", DENIED means "do not
+   execute". The engine is the single source of "needs a human".
 10. ``account guard`` — tools marked ``requires_account`` need an account_id.
 11. ``execute`` — the registered executor (adapter) talks to the provider.
 12. ``verify`` — the tool's declared ``VerificationContract`` is re-asserted by
@@ -36,6 +39,7 @@ from typing import Any
 import structlog
 
 from kai.logging import get_logger
+from kai.policy.models import IdentityStatus, PolicyDecisionKind, PolicyInput
 from kai.tasks.models import Task
 from kai.tasks.service import TaskNotFoundError, get_task
 from kai.tools.boundaries import (
@@ -80,7 +84,6 @@ class ToolGateway:
         content_authorizer: ContentAuthorizer,
         approval_manager: ApprovalManager,
         verification_engine: VerificationEngine,
-        approval_threshold: RiskLevel = RiskLevel.MEDIUM,
         logger: structlog.BoundLogger | None = None,
     ) -> None:
         self.registry = registry
@@ -88,7 +91,6 @@ class ToolGateway:
         self.content_authorizer = content_authorizer
         self.approval_manager = approval_manager
         self.verification_engine = verification_engine
-        self.approval_threshold = approval_threshold
         self._log = logger or get_logger("kai.tools.gateway")
 
     async def execute(self, intent: ToolIntent, context: ToolContext) -> ToolResult:
@@ -103,19 +105,28 @@ class ToolGateway:
             arguments = self._validate_arguments(tool, intent)
 
             risk = tool.risk_level
-            policy = await self.policy_engine.authorize(
-                intent=intent, context=context, tool=tool, task=task, arguments=arguments
+            policy = await self.policy_engine.evaluate(
+                input=self._policy_input(
+                    intent=intent,
+                    context=context,
+                    tool=tool,
+                    task=task,
+                    arguments=arguments,
+                    risk=risk,
+                )
             )
-            if not policy.allowed:
+            if policy.decision is PolicyDecisionKind.DENY:
                 return self._denied(intent, tool, risk, policy)
 
             content = await self.content_authorizer.authorize(
                 intent=intent, context=context, tool=tool, task=task, arguments=arguments
             )
+            if not content.allowed and content.escalate:
+                return self._approval_required(intent, tool, risk, content)
             if not content.allowed:
                 return self._denied(intent, tool, risk, content)
 
-            if risk >= self.approval_threshold:
+            if policy.decision is PolicyDecisionKind.REQUIRE_APPROVAL:
                 approval = await self.approval_manager.decide(
                     intent=intent,
                     context=context,
@@ -225,6 +236,38 @@ class ToolGateway:
             messages = self._validation_messages(exc)
             raise ToolValidationError(messages) from exc
         return instance.model_dump()
+
+    def _policy_input(
+        self,
+        *,
+        intent: ToolIntent,
+        context: ToolContext,
+        tool: ToolDefinition,
+        task: Task,
+        arguments: Mapping[str, Any],
+        risk: RiskLevel,
+    ) -> PolicyInput:
+        """Assemble the trusted engine input from context + task + tool.
+
+        Step count, cost, and identity come from ``context.metadata`` (trusted
+        execution metadata), never from the arguments. ``arguments`` is carried
+        only so the input's whole shape is visible; the engine never reads it.
+        """
+        return PolicyInput(
+            tenant_id=context.tenant_id,
+            user_id=context.user_id,
+            task_id=context.task_id,
+            account_id=context.account_id,
+            task=task,
+            tool=tool,
+            intent=intent,
+            arguments=arguments,
+            risk_level=risk,
+            steps_used=_metadata_int(context, "steps_used"),
+            estimated_cost=_metadata_float(context, "estimated_cost"),
+            recipient_identity=_metadata_identity(context),
+            content_category=_metadata_str(context, "content_category"),
+        )
 
     def _finalize(
         self,
@@ -388,6 +431,38 @@ class ToolGateway:
             user_id=str(intent.user_id),
             request_id=intent.request_id,
         )
+
+
+def _metadata_str(context: ToolContext, key: str) -> str | None:
+    value = context.metadata.get(key)
+    if isinstance(value, str) and value.strip():
+        return value
+    return None
+
+
+def _metadata_int(context: ToolContext, key: str) -> int:
+    try:
+        return int(context.metadata.get(key, 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _metadata_float(context: ToolContext, key: str) -> float:
+    try:
+        return float(context.metadata.get(key, 0.0))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _metadata_identity(context: ToolContext) -> IdentityStatus | None:
+    raw = context.metadata.get("recipient_identity")
+    if raw is None:
+        return None
+    try:
+        return IdentityStatus(str(raw).upper())
+    except ValueError:
+        # Unknown identity metadata is escalation-safe, never permissive.
+        return IdentityStatus.UNKNOWN
 
 
 __all__ = ["ToolGateway"]

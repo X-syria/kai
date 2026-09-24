@@ -204,6 +204,6 @@ async def test_gateway_run_never_mutates_the_task_row() -> None:
             user_id=user_id,
         )
         assert reloaded.id == task.id
-        assert reloaded.state == task.state  # CREATED, untouched
+        assert reloaded.state == task.state  # EXECUTING, untouched
         assert reloaded.attempts == task.attempts
         assert reloaded.last_error is None

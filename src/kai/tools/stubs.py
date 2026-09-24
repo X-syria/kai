@@ -7,8 +7,6 @@ classifiers) swap in behind the same protocols without touching the gateway.
 
 Rigor properties the stubs guarantee:
 
-* ``ProductPolicyEngine`` refuses CRITICAL tools (the MVP catalog ships no
-  CRITICAL capability) and refuses tools the task contract did not permit.
 * ``ApprovalManagerStub`` behaves exactly as configured (APPROVED/REQUIRED/
   DENIED) and records every consult for audit/tests.
 * ``ContentAuthorizerStub`` allows or denies exactly as configured; it never
@@ -16,6 +14,9 @@ Rigor properties the stubs guarantee:
 * ``ContractVerificationEngine`` enforces that an execution may only be
   reported ``verified`` when the tool's declared verification contract was
   honored; a read contract with no evidence is treated as not verified.
+
+The real policy engine lives in :mod:`kai.policy.engine`; the deterministic
+content classifier lives in :mod:`kai.policy.content`.
 """
 
 from __future__ import annotations
@@ -28,7 +29,6 @@ from kai.tools.boundaries import (
     ApprovalDecision,
     ApprovalDecisionRecord,
     ContentAuthorization,
-    PolicyDecision,
     VerificationOutcome,
 )
 from kai.tools.context import ToolContext
@@ -39,58 +39,12 @@ from kai.tools.execution import (
     VerificationMismatch,
 )
 from kai.tools.intent import ToolIntent
-from kai.tools.risk import RiskLevel
 
 __all__ = [
     "ApprovalManagerStub",
     "ContentAuthorizerStub",
     "ContractVerificationEngine",
-    "ProductPolicyEngine",
 ]
-
-
-class ProductPolicyEngine:
-    """Deterministic MVP policy: CRITICAL is never allowed and the task
-    contract always wins on permitted capability. No inference, no heuristics."""
-
-    def __init__(self) -> None:
-        self.decisions: list[PolicyDecision] = []
-
-    def _task_allows(self, tool: ToolDefinition, task: Task) -> bool:
-        allowed = task.allowed_tools or ()
-        if not allowed:
-            return True
-        for permitted in allowed:
-            if permitted == tool.capability or permitted == tool.name:
-                return True
-            if permitted.endswith(".") and tool.capability.startswith(permitted):
-                return True
-            if tool.name.startswith(f"{permitted}."):
-                return True
-        return False
-
-    async def authorize(
-        self,
-        *,
-        intent: ToolIntent,
-        context: ToolContext,
-        tool: ToolDefinition,
-        task: Task,
-        arguments: Mapping[str, Any],
-    ) -> PolicyDecision:
-        if tool.risk_level is RiskLevel.CRITICAL:
-            decision = PolicyDecision(
-                False, "CRITICAL tools are not part of the MVP tool catalog"
-            )
-        elif not self._task_allows(tool, task):
-            decision = PolicyDecision(
-                False,
-                f"task contract does not permit capability {tool.capability!r}",
-            )
-        else:
-            decision = PolicyDecision(True, "permitted by MVP policy")
-        self.decisions.append(decision)
-        return decision
 
 
 class ContentAuthorizerStub:

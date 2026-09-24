@@ -48,7 +48,6 @@ from kai.tools.stubs import (
     ApprovalManagerStub,
     ContentAuthorizerStub,
     ContractVerificationEngine,
-    ProductPolicyEngine,
 )
 
 __all__ = [
@@ -62,7 +61,6 @@ __all__ = [
     "ContractVerificationEngine",
     "PolicyDecision",
     "PolicyEngine",
-    "ProductPolicyEngine",
     "RESERVED_ARGUMENTS",
     "RiskLevel",
     "ToolContext",

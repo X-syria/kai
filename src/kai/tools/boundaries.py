@@ -17,6 +17,8 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Protocol
 
+from kai.policy.models import PolicyDecision, PolicyInput
+
 if TYPE_CHECKING:
     from kai.tasks.models import Task
     from kai.tools.definition import ToolDefinition
@@ -27,19 +29,20 @@ from kai.tools.context import ToolContext
 
 
 @dataclass(frozen=True)
-class PolicyDecision:
-    """Outcome of the policy boundary."""
-
-    allowed: bool
-    reason: str
-
-
-@dataclass(frozen=True)
 class ContentAuthorization:
-    """Outcome of the content authorization boundary."""
+    """Outcome of the content authorization boundary.
+
+    ``escalate`` marks verdicts a human must look at before any execution;
+    ``allowed=False, escalate=False`` is a hard deny. The message body is never
+    part of the verdict — content decisions come from the trusted context.
+    """
 
     allowed: bool
     reason: str
+    escalate: bool = False
+
+    def __str__(self) -> str:
+        return self.reason
 
 
 class ApprovalDecision(StrEnum):
@@ -74,14 +77,8 @@ class VerificationOutcome:
 class PolicyEngine(Protocol):
     """Decides whether the invocation may happen at all."""
 
-    async def authorize(
-        self,
-        *,
-        intent: ToolIntent,
-        context: ToolContext,
-        tool: ToolDefinition,
-        task: Task,
-        arguments: Mapping[str, Any],
+    async def evaluate(
+        self, *, input: PolicyInput
     ) -> PolicyDecision: ...
 
 
@@ -133,6 +130,7 @@ __all__ = [
     "ContentAuthorizer",
     "PolicyDecision",
     "PolicyEngine",
+    "PolicyInput",
     "VerificationEngine",
     "VerificationOutcome",
 ]

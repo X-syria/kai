@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import base64
 import uuid
+from collections import deque
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
@@ -21,19 +22,19 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from kai.db.engine import async_session_factory
 from kai.db.models import GoogleAccount, Tenant, User
 from kai.google.crypto import encrypt_credentials
+from kai.policy import PolicyEngine, PolicyInput
 from kai.tasks.models import Task
 from kai.tasks.schemas import TaskContractInput
-from kai.tasks.service import create_task
+from kai.tasks.service import create_task, transition_task
 from kai.tools import (
     ApprovalManager,
     ApprovalManagerStub,
     ContentAuthorizer,
     ContentAuthorizerStub,
     ContractVerificationEngine,
-    PolicyEngine,
-    ProductPolicyEngine,
     RiskLevel,
     ToolContext,
+    ToolDefinition,
     ToolGateway,
     ToolIntent,
     ToolRegistry,
@@ -288,24 +289,101 @@ async def make_task(
     user_id: uuid.UUID,
     allowed_tools: list[str] | None = None,
     risk_policy: str = "LOW",
+    deadline: Any = None,
+    max_cost: float = 0.0,
+    max_steps: int = 20,
+    state: str = "EXECUTING",
 ) -> Task:
+    """Create a task and walk the legal state machine path to ``state``.
+
+    The default ``EXECUTING`` is the only state in which the Policy Engine
+    allows tool execution; callers that need an earlier state pass
+    ``state="CREATED"`` etc. The walk goes through real ``transition_task``
+    calls so a test fixture is always in a machine-legal state.
+    """
     contract = TaskContractInput.model_validate(
         {
             "goal": "Assist the user",
             "success_criteria": ["done"],
             "allowed_tools": allowed_tools or [],
             "risk_policy": risk_policy,
-            "deadline": None,
-            "max_cost": 0.0,
-            "max_steps": 20,
+            "deadline": deadline,
+            "max_cost": max_cost,
+            "max_steps": max_steps,
             "verification_method": "automatic",
             "fallback": "ask the user",
         }
     )
     async with async_session_factory() as session:
-        return await create_task(
+        task = await create_task(
             session, tenant_id=tenant_id, user_id=user_id, contract=contract
         )
+        path = _transition_path(state)
+        for target in path[1:]:
+            task = await transition_task(
+                session,
+                task_id=task.id,
+                tenant_id=tenant_id,
+                user_id=user_id,
+                target=target,
+            )
+        return task
+
+
+_HAPPY_STATES = frozenset(
+    {
+        "UNDERSTANDING",
+        "PLANNING",
+        "POLICY_CHECK",
+        "WAITING_APPROVAL",
+        "EXECUTING",
+        "WAITING_EXTERNAL",
+        "VERIFYING",
+        "COMPLETED",
+    }
+)
+
+
+def _transition_path(target: str) -> list[str]:
+    """Shortest machine-legal path from CREATED to ``target``.
+
+    BFS prefers the happy path and only rewrites into failure/retry states when
+    the requested state itself requires it, so default fixtures never tarnish
+    a task through ``FAILED -> RETRY``.
+    """
+    from kai.tasks.state import CREATED, TRANSITIONS
+
+    if target == CREATED:
+        return [CREATED]
+
+    def _bfs(edges: dict[str, frozenset[str]]) -> list[str] | None:
+        queue: deque[str] = deque([CREATED])
+        parents: dict[str, str | None] = {CREATED: None}
+        while queue:
+            current = queue.popleft()
+            if current == target:
+                path: list[str] = []
+                while current is not None:
+                    path.append(current)
+                    current = parents[current]
+                return list(reversed(path))
+            for nxt in sorted(edges[current]):
+                if nxt not in parents:
+                    parents[nxt] = current
+                    queue.append(nxt)
+        return None
+
+    happy_edges = {
+        state: frozenset(nxt for nxt in nexts if nxt in _HAPPY_STATES)
+        for state, nexts in TRANSITIONS.items()
+    }
+    path = _bfs(happy_edges)
+    if path is not None:
+        return path
+    full = _bfs(dict(TRANSITIONS))
+    if full is not None:
+        return full
+    raise ValueError(f"no legal state-machine path from CREATED to {target!r}")
 
 
 def make_intent(
@@ -359,11 +437,10 @@ def make_gateway(
     content: ContentAuthorizer | None = None,
     approval: ApprovalManager | None = None,
     verification: VerificationEngine | None = None,
-    approval_threshold: RiskLevel = RiskLevel.MEDIUM,
 ) -> tuple[ToolGateway, dict[str, Any]]:
     """Build a fully wired gateway; return (gateway, {boundary objects})."""
     reg = registry if registry is not None else default_registry()
-    pol = policy if policy is not None else ProductPolicyEngine()
+    pol = policy if policy is not None else PolicyEngine()
     cont = content if content is not None else ContentAuthorizerStub()
     appr = approval if approval is not None else ApprovalManagerStub()
     ver = verification if verification is not None else ContractVerificationEngine()
@@ -373,9 +450,31 @@ def make_gateway(
         content_authorizer=cont,
         approval_manager=appr,
         verification_engine=ver,
-        approval_threshold=approval_threshold,
     )
     return gateway, {"policy": pol, "content": cont, "approval": appr, "verification": ver}
+
+
+def make_policy_input(
+    *,
+    task: Task,
+    tool: ToolDefinition,
+    intent: ToolIntent,
+    risk_level: RiskLevel | None = None,
+    tenant_id: uuid.UUID | None = None,
+    user_id: uuid.UUID | None = None,
+    **kwargs: Any,
+) -> PolicyInput:
+    """Trusted PolicyInput for engine-level tests, derived from task/tool."""
+    return PolicyInput(
+        tenant_id=tenant_id if tenant_id is not None else task.tenant_id,
+        user_id=user_id if user_id is not None else task.user_id,
+        task_id=task.id,
+        task=task,
+        tool=tool,
+        intent=intent,
+        risk_level=risk_level if risk_level is not None else tool.risk_level,
+        **kwargs,
+    )
 
 
 async def close_context(context: ToolContext) -> None:
@@ -399,6 +498,7 @@ __all__ = [
     "make_context",
     "make_gateway",
     "make_intent",
+    "make_policy_input",
     "make_task",
     "make_tenant_user",
     "message_payload",
