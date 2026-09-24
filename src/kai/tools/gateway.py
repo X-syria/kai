@@ -19,11 +19,19 @@ Pipeline (in order, from :mod:`kai.tools` design):
 8. ``content boundary`` — Denied here stops (no implicit permissions);
    escalated content stops as APPROVAL_REQUIRED.
 9. ``approval boundary`` — contacted only when the policy decision is
-   REQUIRE_APPROVAL; REQUIRED means "do not execute", DENIED means "do not
-   execute". The engine is the single source of "needs a human".
+    REQUIRE_APPROVAL; REQUIRED (PENDING), DENIED, EXPIRED, and STALE all mean
+    "do not execute". APPROVED is the only verdict that proceeds.
 10. ``account guard`` — tools marked ``requires_account`` need an account_id.
-11. ``execute`` — the registered executor (adapter) talks to the provider.
-12. ``verify`` — the tool's declared ``VerificationContract`` is re-asserted by
+11. ``final policy re-check`` — the current Policy is re-evaluated after every
+    other authorization check (content, approval, account) and immediately
+    before the approval's single use is consumed; a DENY here still wins and
+    never consumes an approval.
+12. ``consume single use`` — the APPROVED approval's one executor slot is
+    claimed by an atomic compare-and-set (exact intent hash, APPROVED status,
+    not expired, not already consumed all in one statement), so concurrent
+    duplicate attempts can never both execute.
+13. ``execute`` — the registered executor (adapter) talks to the provider.
+14. ``verify`` — the tool's declared ``VerificationContract`` is re-asserted by
     the verification boundary; unverified executions are never reported as
     success.
 
@@ -33,11 +41,13 @@ The gateway never mutates the task or the registry; it only produces
 
 from __future__ import annotations
 
+import uuid
 from collections.abc import Mapping
 from typing import Any
 
 import structlog
 
+from kai.approvals.errors import ApprovalError
 from kai.logging import get_logger
 from kai.policy.models import IdentityStatus, PolicyDecisionKind, PolicyInput
 from kai.tasks.models import Task
@@ -97,6 +107,7 @@ class ToolGateway:
         """Run the pipeline and always return a structured ``ToolResult``."""
         tool: ToolDefinition | None = None
         result: ToolResult
+        approved_approval_id: uuid.UUID | None = None
         try:
             task = await self._authenticate(context)
             self._assert_identity(intent, context)
@@ -127,7 +138,7 @@ class ToolGateway:
                 return self._denied(intent, tool, risk, content)
 
             if policy.decision is PolicyDecisionKind.REQUIRE_APPROVAL:
-                approval = await self.approval_manager.decide(
+                approval = await self.approval_manager.check(
                     intent=intent,
                     context=context,
                     tool=tool,
@@ -138,6 +149,14 @@ class ToolGateway:
                     return self._approval_required(intent, tool, risk, approval)
                 if approval.decision is ApprovalDecision.DENIED:
                     return self._denied(intent, tool, risk, approval)
+                if approval.decision is ApprovalDecision.EXPIRED:
+                    return self._denied(intent, tool, risk, approval)
+                if approval.decision is ApprovalDecision.STALE:
+                    return self._denied(intent, tool, risk, approval)
+                # APPROVED: exact-intent binding was re-verified by the hash
+                # inside the manager's check; the single use is consumed below
+                # only once this invocation is actually about to execute.
+                approved_approval_id = approval.approval_id
 
             if tool.requires_account and context.account_id is None:
                 return self._attention(
@@ -146,6 +165,36 @@ class ToolGateway:
                     risk,
                     ACCOUNT_REQUIRED,
                     "a connected google account is required",
+                )
+
+            # Final authorization gate (TOCTOU hardening): the current Policy is
+            # re-evaluated *after* every other authorization check (content,
+            # approval, account) and immediately before the single use is
+            # consumed. DENY always wins here and never consumes an approval.
+            final_policy = await self.policy_engine.evaluate(
+                input=self._policy_input(
+                    intent=intent,
+                    context=context,
+                    tool=tool,
+                    task=task,
+                    arguments=arguments,
+                    risk=risk,
+                )
+            )
+            if final_policy.decision is PolicyDecisionKind.DENY:
+                return self._denied(intent, tool, risk, final_policy)
+
+            if (
+                policy.decision is PolicyDecisionKind.REQUIRE_APPROVAL
+                and approved_approval_id is not None
+            ):
+                await self.approval_manager.consume(
+                    approval_id=approved_approval_id,
+                    intent=intent,
+                    context=context,
+                    tool=tool,
+                    task=task,
+                    arguments=arguments,
                 )
 
             execution = await tool.executor.execute(
@@ -177,6 +226,25 @@ class ToolGateway:
             )
         except ToolExecutionError as exc:
             result = self._execution_failure(intent, tool, exc)
+        except ApprovalError as exc:
+            # An approval's single use could not be claimed (already consumed by
+            # a concurrent attempt, settled, mismatched intent, or expired).
+            # This is a denial of *this* execution, not an internal fault.
+            self._log.info(
+                "approval single use could not be claimed",
+                tool_name=intent.tool_name,
+                task_id=str(intent.task_id),
+                tenant_id=str(intent.tenant_id),
+                user_id=str(intent.user_id),
+                request_id=intent.request_id,
+                reason=str(exc),
+            )
+            result = self._denied(
+                intent,
+                tool,
+                tool.risk_level if tool is not None else RiskLevel.LOW,
+                exc,
+            )
         except Exception as exc:
             self._log.exception(
                 "tool gateway unexpected failure",

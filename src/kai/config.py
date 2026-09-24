@@ -61,6 +61,18 @@ class Settings(BaseSettings):
     planner_model_api_key: str = ""
     planner_model_timeout_seconds: float = 60.0
 
+    # Approval Manager — every approval is time-boxed; a PENDING or APPROVED
+    # request past its expiration is lazy-expired and never authorizes.
+    approval_ttl_minutes: float = 1440.0  # 24h
+    # Approval fatigue: N approvals for the same (tool, risk, recipient_class)
+    # inside the window trigger ONE rule suggestion, which is a non-authorizing
+    # proposal only. Rejecting it starts the cooldown; suggestions never grant
+    # permission automatically.
+    approval_fatigue_threshold: int = 5
+    approval_fatigue_window_days: int = 14
+    approval_fatigue_cooldown_days: int = 30
+    approval_suggestion_expiration_days: int = 30
+
 
 @lru_cache
 def get_settings() -> Settings:

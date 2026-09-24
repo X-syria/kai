@@ -1,5 +1,6 @@
 from fastapi import APIRouter
 
+from kai.api.approvals import router as approvals_router
 from kai.api.auth import router as auth_router
 from kai.api.calendar import router as calendar_router
 from kai.api.contacts import router as contacts_router
@@ -18,3 +19,4 @@ api_router.include_router(calendar_router)
 api_router.include_router(gmail_router)
 api_router.include_router(tasks_router)
 api_router.include_router(planner_router)
+api_router.include_router(approvals_router)

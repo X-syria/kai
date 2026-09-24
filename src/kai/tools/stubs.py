@@ -81,7 +81,7 @@ class ApprovalManagerStub:
         self.decided_by = decided_by
         self.decisions: list[ApprovalDecisionRecord] = []
 
-    async def decide(
+    async def check(
         self,
         *,
         intent: ToolIntent,
@@ -97,6 +97,18 @@ class ApprovalManagerStub:
         )
         self.decisions.append(record)
         return record
+
+    async def consume(
+        self,
+        *,
+        approval_id: Any,
+        intent: ToolIntent,
+        context: ToolContext,
+        tool: ToolDefinition,
+        task: Task,
+        arguments: Mapping[str, Any],
+    ) -> None:
+        return None
 
 
 class ContractVerificationEngine:

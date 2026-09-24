@@ -12,6 +12,7 @@ definition.
 
 from __future__ import annotations
 
+import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -46,20 +47,31 @@ class ContentAuthorization:
 
 
 class ApprovalDecision(StrEnum):
-    """What the approval manager says about this invocation."""
+    """What the approval manager says about this invocation.
+
+    APPROVED is the only verdict that may proceed; REQUIRED means a PENDING
+    request is open, DENIED/EXPIRED/STALE all mean "do not execute".
+    """
 
     APPROVED = "APPROVED"
     REQUIRED = "REQUIRED"
     DENIED = "DENIED"
+    EXPIRED = "EXPIRED"
+    STALE = "STALE"
 
 
 @dataclass(frozen=True)
 class ApprovalDecisionRecord:
-    """Full approval verdict, including who decided it."""
+    """Full approval verdict, including who decided it.
+
+    ``approval_id`` names the exact persisted approval behind the verdict so
+    the gateway (or the runtime) can act on it later.
+    """
 
     decision: ApprovalDecision
     reason: str
     decided_by: str
+    approval_id: uuid.UUID | None = None
 
     def require_execution_stop_pending_user(self) -> bool:
         return self.decision is ApprovalDecision.REQUIRED
@@ -97,9 +109,14 @@ class ContentAuthorizer(Protocol):
 
 
 class ApprovalManager(Protocol):
-    """Decides whether a human approval step must block execution."""
+    """Decides whether a human approval step must block execution.
 
-    async def decide(
+    ``check`` evaluates one invocation against the persisted approval manager;
+    ``consume`` records the single use of an APPROVED approval right before an
+    execution is authorized to proceed.
+    """
+
+    async def check(
         self,
         *,
         intent: ToolIntent,
@@ -108,6 +125,17 @@ class ApprovalManager(Protocol):
         task: Task,
         arguments: Mapping[str, Any],
     ) -> ApprovalDecisionRecord: ...
+
+    async def consume(
+        self,
+        *,
+        approval_id: uuid.UUID,
+        intent: ToolIntent,
+        context: ToolContext,
+        tool: ToolDefinition,
+        task: Task,
+        arguments: Mapping[str, Any],
+    ) -> None: ...
 
 
 class VerificationEngine(Protocol):
