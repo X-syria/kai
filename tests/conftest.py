@@ -48,7 +48,8 @@ async def _clean_state() -> AsyncIterator[None]:
         await conn.execute(
             text(
                 "TRUNCATE TABLE tenants, users, google_accounts, tasks, task_plans,"
-                " approvals, approval_rule_suggestions RESTART IDENTITY CASCADE"
+                " approvals, approval_rule_suggestions, memory_entries,"
+                " memory_preferences RESTART IDENTITY CASCADE"
             )
         )
     yield
@@ -56,7 +57,8 @@ async def _clean_state() -> AsyncIterator[None]:
         await conn.execute(
             text(
                 "TRUNCATE TABLE tenants, users, google_accounts, tasks, task_plans,"
-                " approvals, approval_rule_suggestions RESTART IDENTITY CASCADE"
+                " approvals, approval_rule_suggestions, memory_entries,"
+                " memory_preferences RESTART IDENTITY CASCADE"
             )
         )
 

@@ -61,6 +61,15 @@ class Settings(BaseSettings):
     planner_model_api_key: str = ""
     planner_model_timeout_seconds: float = 60.0
 
+    # Memory — deterministic, per-user long-term facts. TTL levels translate to
+    # concrete lifetimes (PERMANENT never expires); freshness decays from
+    # ``updated_at`` with an injectable ``now`` and is never a grant of any
+    # kind. Memory can never change policy, permissions, approvals, or identity.
+    memory_long_ttl_days: int = 365
+    memory_short_ttl_days: int = 30
+    memory_ephemeral_hours: int = 24
+    memory_freshness_half_life_days: int = 14
+
     # Approval Manager — every approval is time-boxed; a PENDING or APPROVED
     # request past its expiration is lazy-expired and never authorizes.
     approval_ttl_minutes: float = 1440.0  # 24h

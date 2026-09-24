@@ -5,12 +5,12 @@ from alembic import context
 from sqlalchemy import pool
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
-from kai.config import get_settings
-
 # Import models so their tables are registered on Base.metadata.
 from kai.approvals import models as approval_models  # noqa: F401
+from kai.config import get_settings
 from kai.db import models  # noqa: F401
 from kai.db.base import Base
+from kai.memory import models as memory_models  # noqa: F401
 from kai.planner import models as planner_models  # noqa: F401
 from kai.tasks import models as task_models  # noqa: F401
 
