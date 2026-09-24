@@ -24,6 +24,8 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
+from kai.identity.models import IdentityResult, IdentityStatus
+from kai.identity.schemas import IdentityQuery
 from kai.tasks.models import Task
 from kai.tools.boundaries import (
     ApprovalDecision,
@@ -44,6 +46,7 @@ __all__ = [
     "ApprovalManagerStub",
     "ContentAuthorizerStub",
     "ContractVerificationEngine",
+    "IdentityResolverStub",
 ]
 
 
@@ -109,6 +112,28 @@ class ApprovalManagerStub:
         arguments: Mapping[str, Any],
     ) -> None:
         return None
+
+
+class IdentityResolverStub:
+    """Resolves to the configured status without any I/O or contacts lookup.
+
+    Deterministic stand-in for gateway pipeline tests that need a pinned
+    identity verdict; the real :class:`kai.identity.service.IdentityResolver`
+    computes status from evidence instead of accepting it as configuration.
+    """
+
+    def __init__(self, *, status: IdentityStatus = IdentityStatus.UNKNOWN) -> None:
+        self.status = status
+        self.calls: list[IdentityQuery] = []
+
+    async def resolve(
+        self,
+        *,
+        query: IdentityQuery,
+        context: ToolContext,
+    ) -> IdentityResult:
+        self.calls.append(query)
+        return IdentityResult(status=self.status, confidence=0.0)
 
 
 class ContractVerificationEngine:

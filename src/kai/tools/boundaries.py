@@ -21,6 +21,8 @@ from typing import TYPE_CHECKING, Any, Protocol
 from kai.policy.models import PolicyDecision, PolicyInput
 
 if TYPE_CHECKING:
+    from kai.identity.models import IdentityResult
+    from kai.identity.schemas import IdentityQuery
     from kai.tasks.models import Task
     from kai.tools.definition import ToolDefinition
     from kai.tools.execution import ToolExecutionOutcome, VerificationMismatch
@@ -138,6 +140,22 @@ class ApprovalManager(Protocol):
     ) -> None: ...
 
 
+class IdentityResolver(Protocol):
+    """Tells the gateway *who* an invocation is about (never what is allowed).
+
+    ``resolve`` derives an ``IdentityResult`` deterministically from trusted
+    sources scoped to ``context``. The result is a verdict about identity;
+    ALLOW/DENY continues to belong to the Policy Engine alone.
+    """
+
+    async def resolve(
+        self,
+        *,
+        query: IdentityQuery,
+        context: ToolContext,
+    ) -> IdentityResult: ...
+
+
 class VerificationEngine(Protocol):
     """Decides whether a raw execution outcome may be trusted."""
 
@@ -156,6 +174,7 @@ __all__ = [
     "ApprovalManager",
     "ContentAuthorization",
     "ContentAuthorizer",
+    "IdentityResolver",
     "PolicyDecision",
     "PolicyEngine",
     "PolicyInput",

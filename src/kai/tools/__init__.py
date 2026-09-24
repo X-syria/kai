@@ -25,6 +25,7 @@ from kai.tools.boundaries import (
     ApprovalManager,
     ContentAuthorization,
     ContentAuthorizer,
+    IdentityResolver,
     PolicyDecision,
     PolicyEngine,
     VerificationEngine,
@@ -48,6 +49,7 @@ from kai.tools.stubs import (
     ApprovalManagerStub,
     ContentAuthorizerStub,
     ContractVerificationEngine,
+    IdentityResolverStub,
 )
 
 __all__ = [
@@ -59,6 +61,8 @@ __all__ = [
     "ContentAuthorizer",
     "ContentAuthorizerStub",
     "ContractVerificationEngine",
+    "IdentityResolver",
+    "IdentityResolverStub",
     "PolicyDecision",
     "PolicyEngine",
     "RESERVED_ARGUMENTS",

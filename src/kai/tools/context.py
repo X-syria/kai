@@ -10,10 +10,13 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import httpx
 from sqlalchemy.ext.asyncio import AsyncSession
+
+if TYPE_CHECKING:
+    from kai.identity.schemas import IdentityQuery
 
 
 @dataclass
@@ -27,6 +30,10 @@ class ToolContext:
     account_id: uuid.UUID | None = None
     transport: httpx.AsyncClient | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    #: An explicit identity to resolve via the Identity Resolver. The query
+    #: carries *identifiers* (data); tenant/user/account scope is always the
+    #: context itself, never the query.
+    identity: IdentityQuery | None = None
 
     @property
     def has_account(self) -> bool:

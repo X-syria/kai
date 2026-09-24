@@ -43,11 +43,12 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Mapping
-from typing import Any
+from typing import Any, Final
 
 import structlog
 
 from kai.approvals.errors import ApprovalError
+from kai.identity.models import IdentityStatus as ResolvedIdentityStatus
 from kai.logging import get_logger
 from kai.policy.models import IdentityStatus, PolicyDecisionKind, PolicyInput
 from kai.tasks.models import Task
@@ -56,6 +57,7 @@ from kai.tools.boundaries import (
     ApprovalDecision,
     ApprovalManager,
     ContentAuthorizer,
+    IdentityResolver,
     PolicyEngine,
     VerificationEngine,
     VerificationOutcome,
@@ -94,6 +96,7 @@ class ToolGateway:
         content_authorizer: ContentAuthorizer,
         approval_manager: ApprovalManager,
         verification_engine: VerificationEngine,
+        identity_resolver: IdentityResolver | None = None,
         logger: structlog.BoundLogger | None = None,
     ) -> None:
         self.registry = registry
@@ -101,6 +104,7 @@ class ToolGateway:
         self.content_authorizer = content_authorizer
         self.approval_manager = approval_manager
         self.verification_engine = verification_engine
+        self.identity_resolver = identity_resolver
         self._log = logger or get_logger("kai.tools.gateway")
 
     async def execute(self, intent: ToolIntent, context: ToolContext) -> ToolResult:
@@ -116,6 +120,7 @@ class ToolGateway:
             arguments = self._validate_arguments(tool, intent)
 
             risk = tool.risk_level
+            recipient_identity = await self._resolve_recipient_identity(context)
             policy = await self.policy_engine.evaluate(
                 input=self._policy_input(
                     intent=intent,
@@ -124,6 +129,7 @@ class ToolGateway:
                     task=task,
                     arguments=arguments,
                     risk=risk,
+                    recipient_identity=recipient_identity,
                 )
             )
             if policy.decision is PolicyDecisionKind.DENY:
@@ -179,6 +185,7 @@ class ToolGateway:
                     task=task,
                     arguments=arguments,
                     risk=risk,
+                    recipient_identity=recipient_identity,
                 )
             )
             if final_policy.decision is PolicyDecisionKind.DENY:
@@ -314,12 +321,14 @@ class ToolGateway:
         task: Task,
         arguments: Mapping[str, Any],
         risk: RiskLevel,
+        recipient_identity: IdentityStatus | None,
     ) -> PolicyInput:
         """Assemble the trusted engine input from context + task + tool.
 
-        Step count, cost, and identity come from ``context.metadata`` (trusted
-        execution metadata), never from the arguments. ``arguments`` is carried
-        only so the input's whole shape is visible; the engine never reads it.
+        Step count, cost, and identity come from trusted execution paths (the
+        context's resolved identity / execution metadata), never from the
+        arguments. ``arguments`` is carried only so the input's whole shape is
+        visible; the engine never reads it.
         """
         return PolicyInput(
             tenant_id=context.tenant_id,
@@ -333,9 +342,31 @@ class ToolGateway:
             risk_level=risk,
             steps_used=_metadata_int(context, "steps_used"),
             estimated_cost=_metadata_float(context, "estimated_cost"),
-            recipient_identity=_metadata_identity(context),
+            recipient_identity=recipient_identity,
             content_category=_metadata_str(context, "content_category"),
         )
+
+    async def _resolve_recipient_identity(self, context: ToolContext) -> IdentityStatus | None:
+        """Derive the recipient identity through the Identity Resolver.
+
+        When the caller supplied an explicit ``context.identity`` query, the
+        real resolver (deterministic, evidence-backed, scope from context
+        alone) answers; escalation-safe UNKNOWN is used if it is not wired.
+        Otherwise the trusted ``context.metadata["recipient_identity"]`` path is
+        kept as the legacy fallback for callers that pre-resolved identity.
+        Message content never reaches here as an identity claim.
+        """
+        if context.identity is None:
+            return _metadata_identity(context)
+        if self.identity_resolver is None:
+            # Asked to resolve identity but no resolver is wired: never guess.
+            return IdentityStatus.UNKNOWN
+        result = await self.identity_resolver.resolve(
+            query=context.identity, context=context
+        )
+        context.metadata["identity_status"] = result.status.value
+        context.metadata["identity_confidence"] = result.confidence
+        return _IDENTITY_TO_POLICY[result.status]
 
     def _finalize(
         self,
@@ -531,6 +562,19 @@ def _metadata_identity(context: ToolContext) -> IdentityStatus | None:
     except ValueError:
         # Unknown identity metadata is escalation-safe, never permissive.
         return IdentityStatus.UNKNOWN
+
+
+#: Translation from the resolver's five-state verdict into the Policy Engine's
+#: three-state vocabulary. Positive trust levels proceed to the risk rules;
+#: UNKNOWN escalates and CONFLICTING denies. The resolver only answers *who*;
+#: policy decides *what*.
+_IDENTITY_TO_POLICY: Final[dict[ResolvedIdentityStatus, IdentityStatus]] = {
+    ResolvedIdentityStatus.CONTACT_MATCH: IdentityStatus.VERIFIED,
+    ResolvedIdentityStatus.CHANNEL_VERIFIED: IdentityStatus.VERIFIED,
+    ResolvedIdentityStatus.PROVIDER_VERIFIED: IdentityStatus.VERIFIED,
+    ResolvedIdentityStatus.UNKNOWN: IdentityStatus.UNKNOWN,
+    ResolvedIdentityStatus.CONFLICTING: IdentityStatus.CONFLICTING,
+}
 
 
 __all__ = ["ToolGateway"]

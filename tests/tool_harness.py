@@ -22,6 +22,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from kai.db.engine import async_session_factory
 from kai.db.models import GoogleAccount, Tenant, User
 from kai.google.crypto import encrypt_credentials
+from kai.identity.schemas import IdentityQuery
+from kai.identity.service import IdentityResolver
 from kai.policy import PolicyEngine, PolicyInput
 from kai.tasks.models import Task
 from kai.tasks.schemas import TaskContractInput
@@ -40,6 +42,9 @@ from kai.tools import (
     ToolRegistry,
     VerificationEngine,
     default_registry,
+)
+from kai.tools import (
+    IdentityResolver as IdentityResolverProtocol,
 )
 
 ACCESS_TOKEN = "test-access-token"
@@ -415,6 +420,7 @@ def make_context(
     task_id: uuid.UUID | None = None,
     tenant_id: uuid.UUID | None = None,
     user_id: uuid.UUID | None = None,
+    identity: IdentityQuery | None = None,
 ) -> ToolContext:
     return ToolContext(
         session=session,
@@ -427,6 +433,7 @@ def make_context(
             base_url="http://google.api.test",
             timeout=15.0,
         ),
+        identity=identity,
     )
 
 
@@ -437,6 +444,7 @@ def make_gateway(
     content: ContentAuthorizer | None = None,
     approval: ApprovalManager | None = None,
     verification: VerificationEngine | None = None,
+    identity: IdentityResolverProtocol | None = None,
 ) -> tuple[ToolGateway, dict[str, Any]]:
     """Build a fully wired gateway; return (gateway, {boundary objects})."""
     reg = registry if registry is not None else default_registry()
@@ -444,14 +452,22 @@ def make_gateway(
     cont = content if content is not None else ContentAuthorizerStub()
     appr = approval if approval is not None else ApprovalManagerStub()
     ver = verification if verification is not None else ContractVerificationEngine()
+    ident = identity if identity is not None else IdentityResolver()
     gateway = ToolGateway(
         registry=reg,
         policy_engine=pol,
         content_authorizer=cont,
         approval_manager=appr,
         verification_engine=ver,
+        identity_resolver=ident,
     )
-    return gateway, {"policy": pol, "content": cont, "approval": appr, "verification": ver}
+    return gateway, {
+        "policy": pol,
+        "content": cont,
+        "approval": appr,
+        "verification": ver,
+        "identity": ident,
+    }
 
 
 def make_policy_input(
