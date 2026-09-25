@@ -13,6 +13,7 @@ import logging
 import subprocess
 import sys
 from datetime import UTC, datetime
+from uuid import UUID
 
 import httpx
 import pytest
@@ -26,6 +27,10 @@ from kai.main import app
 from kai.tasks.models import Task
 from kai.tasks.schemas import TaskContractInput
 from kai.tasks.service import (
+    CLIENT_TRANSITION_TARGETS,
+    EXTERNAL_ACTOR,
+    INTERNAL_ACTOR,
+    InvalidActorError,
     InvalidTransition,
     TaskNotFoundError,
     archive_task,
@@ -37,18 +42,28 @@ from kai.tasks.service import (
     transition_task,
 )
 from kai.tasks.state import (
+    ALL_STATES,
     COMPLETED,
     CREATED,
     ESCALATE,
     EXECUTING,
     FAILED,
+    PLANNING,
+    POLICY_CHECK,
     REQUIRES_ATTENTION,
     RETRY,
     TRANSITIONS,
     UNDERSTANDING,
+    VERIFYING,
+    WAITING_APPROVAL,
 )
 
 API_PREFIX = "/api/v1"
+
+#: Everything a client may NOT assert: the full vocabulary minus the three
+#: states it is entitled to ask for. Derived, so widening the client allow-list
+#: has to be a deliberate edit here too.
+_RUNTIME_OWNED_STATES = ALL_STATES - CLIENT_TRANSITION_TARGETS
 
 
 def _contract(**overrides: object) -> TaskContractInput:
@@ -350,6 +365,65 @@ async def test_every_declared_transition_applies() -> None:
                 assert reloaded.state == target, (current, target)
 
 
+async def test_client_actor_may_only_assert_its_own_states() -> None:
+    """The actor check is the service's, not just the endpoint's."""
+    for target in sorted(_RUNTIME_OWNED_STATES):
+        row = await _persist(state=CREATED)
+        async with async_session_factory() as session:
+            with pytest.raises(InvalidActorError) as exc_info:
+                await transition_task(
+                    session,
+                    task_id=row.id,
+                    tenant_id=row.tenant_id,
+                    user_id=row.user_id,
+                    target=target,
+                    actor=EXTERNAL_ACTOR,
+                )
+            assert "asserted by the agent runtime" in str(exc_info.value)
+            await session.rollback()
+
+        async with async_session_factory() as session:
+            reloaded = await get_task(
+                session,
+                task_id=row.id,
+                tenant_id=row.tenant_id,
+                user_id=row.user_id,
+            )
+            assert reloaded.state == CREATED, target
+
+
+def test_the_client_allow_list_is_exactly_three_honest_states() -> None:
+    """Pin the boundary: FAILED, REQUIRES_ATTENTION, RETRY - and nothing else."""
+    assert frozenset({FAILED, REQUIRES_ATTENTION, RETRY}) == CLIENT_TRANSITION_TARGETS
+    assert CLIENT_TRANSITION_TARGETS < ALL_STATES
+    assert COMPLETED not in CLIENT_TRANSITION_TARGETS
+    assert ESCALATE not in CLIENT_TRANSITION_TARGETS
+
+
+async def test_internal_actor_may_still_assert_lifecycle_states() -> None:
+    """The runtime's own writes are untouched by the client restriction."""
+    row = await _persist(state=CREATED)
+    async with async_session_factory() as session:
+        for target in (UNDERSTANDING, PLANNING, POLICY_CHECK, EXECUTING):
+            await transition_task(
+                session,
+                task_id=row.id,
+                tenant_id=row.tenant_id,
+                user_id=row.user_id,
+                target=target,
+                actor=INTERNAL_ACTOR,
+            )
+
+    async with async_session_factory() as session:
+        reloaded = await get_task(
+            session,
+            task_id=row.id,
+            tenant_id=row.tenant_id,
+            user_id=row.user_id,
+        )
+        assert reloaded.state == EXECUTING
+
+
 async def test_illegal_transition_is_rejected_and_persists_nothing() -> None:
     row = await _persist(state=CREATED)
     async with async_session_factory() as session:
@@ -555,21 +629,28 @@ async def test_archive_requires_terminal_state() -> None:
 
 
 async def test_archive_via_api_hides_from_list(client: httpx.AsyncClient) -> None:
-    token, _ = await _register(client, "archive@example.com")
+    token, claims = await _register(client, "archive@example.com")
     created = await _create_via_api(client, token)
-    await client.post(
-        f"{API_PREFIX}/tasks/{created['id']}/transition",
-        json={"target_state": UNDERSTANDING},
-        headers={"Authorization": f"Bearer {token}"},
-    )
-    # archive requires terminal: move it there through the machine.
-    for target in ("PLANNING", "POLICY_CHECK", "EXECUTING", "VERIFYING", COMPLETED):
-        resp = await client.post(
-            f"{API_PREFIX}/tasks/{created['id']}/transition",
-            json={"target_state": target},
-            headers={"Authorization": f"Bearer {token}"},
-        )
-        assert resp.status_code == 200, (target, resp.text)
+    # archive requires terminal, and a terminal state is not a client's to
+    # assert: the machine is walked here the way the runtime walks it, through
+    # the service rather than the public endpoint.
+    async with async_session_factory() as session:
+        for target in (
+            UNDERSTANDING,
+            PLANNING,
+            POLICY_CHECK,
+            EXECUTING,
+            VERIFYING,
+            COMPLETED,
+        ):
+            await transition_task(
+                session,
+                task_id=UUID(created["id"]),
+                tenant_id=claims.tenant_id,
+                user_id=claims.user_id,
+                target=target,
+            )
+
     resp = await client.post(
         f"{API_PREFIX}/tasks/{created['id']}/archive",
         headers={"Authorization": f"Bearer {token}"},
@@ -585,25 +666,119 @@ async def test_archive_via_api_hides_from_list(client: httpx.AsyncClient) -> Non
 # --- API transitions -------------------------------------------------------
 
 async def test_transition_via_api(client: httpx.AsyncClient) -> None:
+    """A client can say the honest thing about its own task: that it failed."""
     token, _ = await _register(client, "api@example.com")
     created = await _create_via_api(client, token)
 
     resp = await client.post(
         f"{API_PREFIX}/tasks/{created['id']}/transition",
-        json={"target_state": UNDERSTANDING},
+        json={"target_state": FAILED},
         headers={"Authorization": f"Bearer {token}"},
     )
     assert resp.status_code == 200
-    assert resp.json()["state"] == UNDERSTANDING
+    assert resp.json()["state"] == FAILED
 
 
-async def test_illegal_transition_via_api_is_409(client: httpx.AsyncClient) -> None:
+async def test_client_can_request_the_three_states_it_owns(
+    client: httpx.AsyncClient,
+) -> None:
+    token, _ = await _register(client, "api@example.com")
+    created = await _create_via_api(client, token)
+    auth = {"Authorization": f"Bearer {token}"}
+
+    for target in (REQUIRES_ATTENTION, RETRY):
+        resp = await client.post(
+            f"{API_PREFIX}/tasks/{created['id']}/transition",
+            json={"target_state": target},
+            headers=auth,
+        )
+        assert resp.status_code == 200, (target, resp.text)
+        assert resp.json()["state"] == target
+
+
+@pytest.mark.parametrize("target", sorted(_RUNTIME_OWNED_STATES))
+async def test_client_cannot_assert_a_runtime_lifecycle_state(
+    client: httpx.AsyncClient, target: str
+) -> None:
+    """No client may write down a state only the runtime can establish.
+
+    Every one of these edges exists in the machine, so nothing but the actor
+    check stands between a caller and a task that looks finished and is not.
+    """
     token, _ = await _register(client, "api@example.com")
     created = await _create_via_api(client, token)
 
     resp = await client.post(
         f"{API_PREFIX}/tasks/{created['id']}/transition",
+        json={"target_state": target},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 403, (target, resp.text)
+    assert "asserted by the agent runtime" in resp.json()["detail"]["error"]
+
+    verify = await client.get(
+        f"{API_PREFIX}/tasks/{created['id']}",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert verify.json()["state"] == CREATED
+
+
+async def test_client_is_refused_even_where_the_machine_allows_the_edge(
+    client: httpx.AsyncClient,
+) -> None:
+    """Entitlement is not legality: WAITING_APPROVAL -> EXECUTING is legal here.
+
+    If the refusal depended on the machine, this request would succeed and the
+    caller could drive its own task around the approval checkpoint it is
+    supposed to be waiting on.
+    """
+    token, claims = await _register(client, "api@example.com")
+    created = await _create_via_api(client, token)
+    task_id = UUID(created["id"])
+
+    async with async_session_factory() as session:
+        for step in (UNDERSTANDING, PLANNING, POLICY_CHECK, WAITING_APPROVAL):
+            await transition_task(
+                session,
+                task_id=task_id,
+                tenant_id=claims.tenant_id,
+                user_id=claims.user_id,
+                target=step,
+            )
+        parked = await get_task(
+            session,
+            task_id=task_id,
+            tenant_id=claims.tenant_id,
+            user_id=claims.user_id,
+        )
+        assert parked.state == WAITING_APPROVAL
+        assert EXECUTING in TRANSITIONS[WAITING_APPROVAL]
+
+    resp = await client.post(
+        f"{API_PREFIX}/tasks/{task_id}/transition",
         json={"target_state": EXECUTING},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 403, resp.text
+
+    async with async_session_factory() as session:
+        still = await get_task(
+            session,
+            task_id=task_id,
+            tenant_id=claims.tenant_id,
+            user_id=claims.user_id,
+        )
+        assert still.state == "WAITING_APPROVAL"
+
+
+async def test_illegal_transition_via_api_is_409(client: httpx.AsyncClient) -> None:
+    """A client-owned state the machine refuses is still a conflict, not a 403."""
+    token, _ = await _register(client, "api@example.com")
+    created = await _create_via_api(client, token)
+
+    resp = await client.post(
+        f"{API_PREFIX}/tasks/{created['id']}/transition",
+        json={"target_state": RETRY},
         headers={"Authorization": f"Bearer {token}"},
     )
     assert resp.status_code == 409
@@ -727,9 +902,10 @@ async def test_responses_never_expose_internal_metadata(
     created = await _create_via_api(client, token)
     resp = await client.post(
         f"{API_PREFIX}/tasks/{created['id']}/transition",
-        json={"target_state": UNDERSTANDING},
+        json={"target_state": FAILED},
         headers={"Authorization": f"Bearer {token}"},
     )
+    assert resp.status_code == 200, resp.text
     listing = await client.get(
         f"{API_PREFIX}/tasks", headers={"Authorization": f"Bearer {token}"}
     )

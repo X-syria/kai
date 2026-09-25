@@ -9,7 +9,7 @@ the *default* dependency whose endpoint URL is empty, so a request fails with
 
 from __future__ import annotations
 
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import httpx
 import pytest
@@ -118,6 +118,26 @@ def _task_json() -> dict:
     }
 
 
+async def _walk(task: dict, *targets: str) -> dict:
+    """Drive the machine to a state the way the runtime does.
+
+    A client may not assert the lifecycle states over the public endpoint - the
+    runtime establishes those from evidence it gathered - so a test that needs a
+    task parked in one walks the service instead of the API.
+    """
+    async with async_session_factory() as session:
+        for target in targets:
+            await transition_task(
+                session,
+                task_id=UUID(task["id"]),
+                tenant_id=UUID(task["tenant_id"]),
+                user_id=UUID(task["user_id"]),
+                target=target,
+            )
+    task["state"] = targets[-1]
+    return task
+
+
 async def _create_task(
     client: httpx.AsyncClient, token: str, *, understanding: bool = False
 ) -> dict:
@@ -129,13 +149,7 @@ async def _create_task(
     assert resp.status_code == 201, resp.text
     task = resp.json()
     if understanding:
-        tri = await client.post(
-            f"{API_PREFIX}/tasks/{task['id']}/transition",
-            json={"target_state": UNDERSTANDING},
-            headers={"Authorization": f"Bearer {token}"},
-        )
-        assert tri.status_code == 200, tri.text
-        task = tri.json()
+        await _walk(task, UNDERSTANDING)
     return task
 
 
@@ -525,18 +539,7 @@ async def test_planning_refused_after_policy_check(
     token = await _register(client, "postpolicy@example.com")
     task = await _create_task(client, token, understanding=True)
     # The machine only reaches POLICY_CHECK through PLANNING.
-    tri = await client.post(
-        f"{API_PREFIX}/tasks/{task['id']}/transition",
-        json={"target_state": PLANNING},
-        headers={"Authorization": f"Bearer {token}"},
-    )
-    assert tri.status_code == 200
-    tri = await client.post(
-        f"{API_PREFIX}/tasks/{task['id']}/transition",
-        json={"target_state": POLICY_CHECK},
-        headers={"Authorization": f"Bearer {token}"},
-    )
-    assert tri.status_code == 200, tri.text
+    await _walk(task, PLANNING, POLICY_CHECK)
 
     resp = await client.post(
         f"{API_PREFIX}/tasks/{task['id']}/plan",
@@ -747,12 +750,7 @@ async def test_prompt_injection_in_goal_stays_data(
     )
     assert resp.status_code == 201
     task = resp.json()
-    tri = await client.post(
-        f"{API_PREFIX}/tasks/{task['id']}/transition",
-        json={"target_state": UNDERSTANDING},
-        headers={"Authorization": f"Bearer {token}"},
-    )
-    assert tri.status_code == 200
+    await _walk(task, UNDERSTANDING)
 
     stub.response = _valid_plan(goal=injected, success_criteria=["a thing happens"])
 

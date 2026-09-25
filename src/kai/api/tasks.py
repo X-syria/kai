@@ -6,7 +6,9 @@ the only terminal-state data path). The caller supplies ``tenant_id`` and
 ``WHERE tenant_id = ?`` predicate in :mod:`kai.tasks.service`, so a task id
 from another tenant resolves to 404 and no row can be read or mutated through
 a foreign tenant context. Transition refusal is a 409 Conflict, not a
-silently-ignored no-op.
+silently-ignored no-op. A transition the caller is not entitled to ask for at
+all - a runtime lifecycle state such as ``COMPLETED`` - is 403 Forbidden,
+which is a different answer from "the machine would not allow that edge".
 """
 
 from uuid import UUID
@@ -25,6 +27,9 @@ from kai.tasks.schemas import (
     TaskResponse,
 )
 from kai.tasks.service import (
+    CLIENT_TRANSITION_TARGETS,
+    EXTERNAL_ACTOR,
+    InvalidActorError,
     InvalidTransition,
     TaskNotFoundError,
     archive_task,
@@ -109,6 +114,13 @@ async def task_transition(
     current: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_session),
 ) -> TaskResponse:
+    """Move the caller's own task, within the states a client may assert.
+
+    A client may fail, escalate-for-attention, or retry a task it owns. It may
+    not name a lifecycle state: those are the runtime's to assert from evidence
+    it gathered, so asking for one is 403 Forbidden rather than a transition
+    the machine happens to allow. Refusing a legal edge is 409 Conflict.
+    """
     try:
         task = await transition_task(
             session,
@@ -116,10 +128,20 @@ async def task_transition(
             tenant_id=current.tenant_id,
             user_id=current.id,
             target=body.target_state,
+            actor=EXTERNAL_ACTOR,
         )
     except TaskNotFoundError as exc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)
+        ) from exc
+    except InvalidActorError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "error": str(exc),
+                "current_task_id": str(task_id),
+                "client_transition_targets": sorted(CLIENT_TRANSITION_TARGETS),
+            },
         ) from exc
     except InvalidTransition as exc:
         raise HTTPException(

@@ -5,11 +5,17 @@ caller is a specific user), so a task id from another tenant or another user
 simply does not resolve. State changes go through the explicit machine in
 :mod:`kai.tasks.state`; anything the machine refuses raises
 :class:`InvalidTransition` and the row is left untouched.
+
+Who may *ask* for a state is a separate question from whether the machine
+allows it: the runtime asserts the lifecycle states from real evidence, and an
+external client may only ask for the ones in
+:data:`CLIENT_TRANSITION_TARGETS` (see :class:`InvalidActorError`).
 """
 
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from typing import Final
 from uuid import UUID
 
 from sqlalchemy import Select, func, select
@@ -19,6 +25,8 @@ from kai.tasks.models import Task
 from kai.tasks.schemas import TaskContractInput
 from kai.tasks.state import (
     CREATED,
+    FAILED,
+    REQUIRES_ATTENTION,
     RETRY,
     InvalidTransition,
     apply_retry_budget,
@@ -27,9 +35,41 @@ from kai.tasks.state import (
     resolve_transition,
 )
 
+#: The runtime, the approvals flow, and every other in-process caller: the
+#: things that establish a lifecycle state from real evidence.
+INTERNAL_ACTOR: Final[str] = "internal"
+#: An authenticated API caller acting for itself.
+EXTERNAL_ACTOR: Final[str] = "client"
+
 
 class TaskNotFoundError(ValueError):
     """Raised when no task resolves for the requested ``(tenant, user, id)``."""
+
+
+#: The states an external client is allowed to move its own task into, and the
+#: rest of the lifecycle it may not. ``FAILED``/``REQUIRES_ATTENTION`` are the
+#: honest answers a client can give about its own request - "I am not paying for
+#: this" and "this needs a human" - and the machine accepts them from any
+#: non-terminal state. ``RETRY`` re-enters the lifecycle and spends the budget.
+#:
+#: Everything else in :data:`kai.tasks.state.ALL_STATES` is asserted by the
+#: runtime from real evidence: that the planner produced a plan, that the policy
+#: engine cleared the task, that a tool call actually returned, that the
+#: success criteria are actually satisfied. The machine allows those edges, but
+#: a client is not the thing that establishes the fact, so letting it name them
+#: would let a caller record work that never happened - including declaring
+#: ``COMPLETED`` on a task whose calendar event does not exist.
+CLIENT_TRANSITION_TARGETS: frozenset[str] = frozenset(
+    {FAILED, REQUIRES_ATTENTION, RETRY}
+)
+
+
+class InvalidActorError(ValueError):
+    """Raised when a caller may not drive a state the machine would allow.
+
+    Distinct from :class:`InvalidTransition`: the machine is not refusing the
+    edge, the caller is not entitled to ask for it.
+    """
 
 
 async def create_task(
@@ -126,16 +166,32 @@ async def transition_task(
     user_id: UUID | None,
     target: str,
     fail_reason: str | None = None,
+    actor: str = INTERNAL_ACTOR,
 ) -> Task:
     """Move a task to ``target`` through the explicit machine.
 
     Legal transitions update the row; the machine also enforces the retry
     budget on the failure -> retry path. Anything else raises
     :class:`InvalidTransition` and persists nothing.
+
+    ``actor`` says who is asking. Only the runtime, which establishes these
+    states from real evidence, may name the lifecycle ones
+    (:data:`CLIENT_TRANSITION_TARGETS` is the rest); an external client asking
+    for one raises :class:`InvalidActorError` before the machine is consulted,
+    because the edge being legal is beside the point.
+
+    The task is resolved first on purpose: an id from another tenant has to keep
+    answering 404, not turn into a 403 that would report on rows the caller
+    cannot see.
     """
     task = await _load_task(
         session, task_id=task_id, tenant_id=tenant_id, user_id=user_id
     )
+    if actor == EXTERNAL_ACTOR and target not in CLIENT_TRANSITION_TARGETS:
+        raise InvalidActorError(
+            f"state {target} is asserted by the agent runtime, not by a client; "
+            f"a client may only request {', '.join(sorted(CLIENT_TRANSITION_TARGETS))}"
+        )
     decision = resolve_transition(task.state, target)
     if not decision.ok or decision.next_state is None:
         raise InvalidTransition(decision.error or "transition refused")
