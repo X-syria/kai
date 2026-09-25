@@ -36,6 +36,11 @@ Guarantees kept here:
   transactions and is *never* held across an external provider call, so a
   concurrent or duplicate resume writes nothing at all and can never overwrite
   the owner's result; a claim abandoned by a crashed worker expires.
+* A live owner is never replaced. While it works, a heartbeat renews its lease
+  on its own short transaction, so a slow model or provider call cannot let the
+  lease lapse and hand the task to a second worker; and every step boundary and
+  side effect re-proves ownership, so a worker that *did* lose the claim aborts
+  before it acts on the task or records anything about it.
 * Failure is deterministic: unknown identity, unsupported capability, no free
   slot, a denied/expired approval, or an unverified execution all move the task
   through the existing Task Manager machine.
@@ -43,20 +48,26 @@ Guarantees kept here:
 
 from __future__ import annotations
 
+import asyncio
 import json
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
 from typing import Any, Final
 from uuid import UUID, uuid4
 
+import structlog
 from sqlalchemy import or_, select, update
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from kai.approvals.models import Approval, ApprovalStatus
+from kai.db.engine import async_session_factory
 from kai.db.models import GoogleAccount
 from kai.identity.models import IdentityStatus
 from kai.identity.schemas import IdentityQuery
 from kai.identity.service import IdentityResolver
+from kai.logging import get_logger
 from kai.memory.models import MemoryType
 from kai.memory.service import retrieve_memory
 from kai.planner.model import PlannerModel
@@ -111,8 +122,14 @@ _RESUMABLE_STATES: frozenset[str] = frozenset(
 #: How long a trigger's execution claim stays valid before another trigger may
 #: take it over. A live trigger finishes in seconds; a claim this old belongs
 #: to a worker that died mid-flight, and leaving it forever would strand the
-#: task.
+#: task. A live worker never reaches this age: :meth:`AgentRuntime._heartbeat`
+#: renews the lease while it works, and this is only the crash-detection window.
 _CLAIM_LEASE: Final[timedelta] = timedelta(minutes=5)
+
+#: How often the owner renews its claim lease, on its own session. Comfortably
+#: inside :data:`_CLAIM_LEASE` so a few slow or failed renewals cannot expire a
+#: live worker's claim, and rare enough to be a rounding error on the database.
+_CLAIM_HEARTBEAT_SECONDS: Final[float] = 30.0
 
 _POSITIVE_IDENTITY: frozenset[IdentityStatus] = frozenset(
     {
@@ -135,6 +152,15 @@ class RuntimeFatal(ValueError):
     """A deterministic stop condition the runtime translates into a failure."""
 
 
+class ClaimLostError(Exception):
+    """The execution claim moved to another worker while this one was running.
+
+    Raised at a fence: the caller has proved it is no longer the owner, so it
+    must abandon the trigger without writing anything. It is deliberately not a
+    :class:`RuntimeFatal` — a lost claim is never this task's failure to record.
+    """
+
+
 @dataclass(frozen=True)
 class TriggerOutcome:
     """What one trigger produced, for the API surface."""
@@ -149,9 +175,20 @@ class TriggerOutcome:
 class AgentRuntime:
     """Coordinates the slice pipeline for one task, per trigger."""
 
-    def __init__(self, *, gateway: ToolGateway, model: PlannerModel) -> None:
+    def __init__(
+        self,
+        *,
+        gateway: ToolGateway,
+        model: PlannerModel,
+        session_factory: async_sessionmaker[AsyncSession] | None = None,
+        logger: structlog.BoundLogger | None = None,
+    ) -> None:
         self.gateway = gateway
         self.model = model
+        # The heartbeat needs a session of its own: renewing on the owner's
+        # session would queue behind whatever long call the owner is inside.
+        self._session_factory = session_factory or async_session_factory
+        self._log = logger or get_logger("kai.runtime.service")
 
     # ------------------------------------------------------------------ #
     # Submit
@@ -213,6 +250,12 @@ class AgentRuntime:
         cannot take it writes nothing and returns ``RESUME_IN_PROGRESS``, which
         is what makes a concurrent/duplicate resume deterministic instead of a
         second writer racing the owner into another final state.
+
+        Ownership is kept alive for that whole run by a background heartbeat on
+        its own session, and re-proved at every step boundary and before every
+        tool call. So the lease only ever lapses for a worker that really died:
+        a live slow owner is never taken over, and an owner that *was* taken
+        over returns ``CLAIM_LOST`` having written nothing.
         """
         try:
             task = await get_task(
@@ -253,6 +296,18 @@ class AgentRuntime:
             )
         # Captured before the ``finally`` rollback expires the ORM instances.
         owned_task_id = task.id
+        # Renewed in the background for as long as this trigger runs, so a live
+        # but slow worker keeps its lease instead of being replaced mid-flight.
+        heartbeat_stop = asyncio.Event()
+        heartbeat = asyncio.create_task(
+            self._heartbeat(
+                task_id=owned_task_id,
+                tenant_id=tenant_id,
+                claim=claim,
+                stop=heartbeat_stop,
+            )
+        )
+        state_at_start = task.state
         try:
             # The claim is a bulk UPDATE, so the identity-mapped row must be
             # re-read before the pipeline trusts its cursor/evidence. The task
@@ -274,11 +329,26 @@ class AgentRuntime:
                     f"task state {task.state} is not resumable by the agent runtime"
                 )
             return await self._drive(
-                session, task=task, row=row, transport=transport
+                session, task=task, row=row, transport=transport, claim=claim
+            )
+        except ClaimLostError:
+            self._log.warning(
+                "execution claim lost to another worker",
+                task_id=str(owned_task_id),
+                tenant_id=str(tenant_id),
+            )
+            return await self._lost_claim_outcome(
+                task_id=owned_task_id,
+                tenant_id=tenant_id,
+                fallback_state=state_at_start,
             )
         finally:
-            # Discard anything an aborted trigger left uncommitted, then hand
-            # ownership back in its own short transaction.
+            # Discard anything an aborted trigger left uncommitted, stop
+            # renewing, then hand ownership back in its own short transaction.
+            heartbeat_stop.set()
+            heartbeat.cancel()
+            with suppress(asyncio.CancelledError):
+                await heartbeat
             await session.rollback()
             await self._release_execution(
                 session, task_id=owned_task_id, tenant_id=tenant_id, claim=claim
@@ -291,8 +361,17 @@ class AgentRuntime:
         task: Task,
         row: RuntimeExecution,
         transport: Any,
+        claim: UUID,
     ) -> TriggerOutcome:
-        """Run the owned pipeline for one task (see :meth:`trigger`)."""
+        """Run the owned pipeline for one task (see :meth:`trigger`).
+
+        Every stage below opens with a fence: the first write of the stage, and
+        the external call it wraps, only ever happen while this worker is still
+        the owner.
+        """
+        await self._fence_execution(
+            session, task_id=task.id, tenant_id=task.tenant_id, claim=claim
+        )
         account = await self._resolve_account(session, task)
         if account is None:
             return await self._fail(
@@ -307,6 +386,9 @@ class AgentRuntime:
 
         # Stage 1 - understanding (CREATED / UNDERSTANDING only).
         if task.state in {CREATED, UNDERSTANDING}:
+            await self._fence_execution(
+                session, task_id=task.id, tenant_id=task.tenant_id, claim=claim
+            )
             if task.state == CREATED:
                 await transition_task(
                     session,
@@ -327,12 +409,17 @@ class AgentRuntime:
             except UnderstandingFailed as exc:
                 return await self._fail(session, task, str(exc))
             row.scenario = scenario.model_dump(mode="json")
-            await session.commit()
+            await self._fence_execution(
+                session, task_id=task.id, tenant_id=task.tenant_id, claim=claim
+            )
 
         assert scenario is not None
 
         # Stage 2 - identity, exactly once per task.
         if not row.identities:
+            await self._fence_execution(
+                session, task_id=task.id, tenant_id=task.tenant_id, claim=claim
+            )
             try:
                 identities = await self._resolve_guest_identities(
                     session, task, scenario=scenario, account=account, transport=transport
@@ -340,12 +427,17 @@ class AgentRuntime:
             except RuntimeFatal as exc:
                 return await self._fail(session, task, str(exc))
             row.identities = identities
-            await session.commit()
+            await self._fence_execution(
+                session, task_id=task.id, tenant_id=task.tenant_id, claim=claim
+            )
 
         # Stage 3 - planning (UNDERSTANDING/PLANNING only; resume reuses the row).
         service = PlannerService(self.model)
         try:
             if task.state == UNDERSTANDING:
+                await self._fence_execution(
+                    session, task_id=task.id, tenant_id=task.tenant_id, claim=claim
+                )
                 await service.create_plan(
                     session,
                     task_id=task.id,
@@ -374,7 +466,7 @@ class AgentRuntime:
         # that changed underneath them can no longer be resumed from it, and
         # guessing would either skip the new plan's steps or re-run finished
         # ones (a duplicate calendar insert).
-        bound, plan_version = await self._bind_plan(session, row, plan)
+        bound, plan_version = await self._bind_plan(session, row, plan, claim)
         if not bound:
             return await self._halt(
                 session,
@@ -385,6 +477,10 @@ class AgentRuntime:
         # Stage 4 - promote through the machine. A task parked in
         # WAITING_APPROVAL whose approval is still pending is a no-op: it stays
         # in that real state instead of bouncing through EXECUTING.
+        if task.state in {PLANNING, WAITING_APPROVAL, POLICY_CHECK}:
+            await self._fence_execution(
+                session, task_id=task.id, tenant_id=task.tenant_id, claim=claim
+            )
         if task.state == PLANNING:
             await transition_task(
                 session,
@@ -432,6 +528,7 @@ class AgentRuntime:
             plan_version=plan_version,
             transport=transport,
             account=account,
+            claim=claim,
         )
 
     # ------------------------------------------------------------------ #
@@ -513,6 +610,7 @@ class AgentRuntime:
         plan_version: int,
         transport: Any,
         account: GoogleAccount,
+        claim: UUID,
     ) -> TriggerOutcome:
         evidence: list[dict[str, Any]] = list(row.evidence)
         identities: list[dict[str, Any]] = list(row.identities)
@@ -528,6 +626,9 @@ class AgentRuntime:
                     # Completed on an earlier trigger. Never re-run: re-running
                     # a finished calendar insert would create a duplicate event.
                     continue
+                await self._fence_execution(
+                    session, task_id=task.id, tenant_id=task.tenant_id, claim=claim
+                )
                 intents = self._intents_for(
                     step.action,
                     scenario=scenario,
@@ -564,13 +665,26 @@ class AgentRuntime:
                         },
                         identity=identity,
                     )
+                    # Last gate before the one call that can change the world:
+                    # a worker that lost the claim never reaches the provider.
+                    await self._fence_execution(
+                        session,
+                        task_id=task.id,
+                        tenant_id=task.tenant_id,
+                        claim=claim,
+                    )
                     result = await self.gateway.execute(intent, context)
                     evidence.append(_record(step.order, tool_name, args, result))
                     row.evidence = list(evidence)
                     row.steps_used = steps_used
 
                     if result.outcome is ToolOutcome.APPROVAL_REQUIRED:
-                        await session.commit()
+                        await self._fence_execution(
+                            session,
+                            task_id=task.id,
+                            tenant_id=task.tenant_id,
+                            claim=claim,
+                        )
                         # The task really parks in WAITING_APPROVAL; the runtime
                         # never reports a state the task did not enter.
                         await session.refresh(task)
@@ -600,7 +714,12 @@ class AgentRuntime:
                             if result.outcome is ToolOutcome.REQUIRES_ATTENTION
                             else "FAILED"
                         )
-                        await session.commit()
+                        await self._fence_execution(
+                            session,
+                            task_id=task.id,
+                            tenant_id=task.tenant_id,
+                            claim=claim,
+                        )
                         await transition_task(
                             session,
                             task_id=task.id,
@@ -623,8 +742,13 @@ class AgentRuntime:
                 row.cursor = step.order
                 row.evidence = list(evidence)
                 row.steps_used = steps_used
-                await session.commit()
+                await self._fence_execution(
+                    session, task_id=task.id, tenant_id=task.tenant_id, claim=claim
+                )
 
+            await self._fence_execution(
+                session, task_id=task.id, tenant_id=task.tenant_id, claim=claim
+            )
             await transition_task(
                 session,
                 task_id=task.id,
@@ -734,7 +858,7 @@ class AgentRuntime:
 
     @staticmethod
     async def _bind_plan(
-        session: AsyncSession, row: RuntimeExecution, plan: TaskPlan
+        session: AsyncSession, row: RuntimeExecution, plan: TaskPlan, claim: UUID
     ) -> tuple[bool, int]:
         """Bind the saved cursor to the plan version it counts, or refuse.
 
@@ -756,7 +880,12 @@ class AgentRuntime:
             return False, version
         row.plan_version = version
         row.plan_hash = digest
-        await session.commit()
+        await AgentRuntime._fence_execution(
+            session,
+            task_id=row.task_id,
+            tenant_id=row.tenant_id,
+            claim=claim,
+        )
         return True, version
 
     @staticmethod
@@ -790,6 +919,132 @@ class AgentRuntime:
         claimed = result.scalar_one_or_none() is not None
         await session.commit()
         return token if claimed else None
+
+    @staticmethod
+    async def _renew_claim(
+        session: AsyncSession, *, task_id: UUID, tenant_id: UUID, claim: UUID
+    ) -> bool:
+        """Renew the lease if and only if ``claim`` still owns the row.
+
+        One conditional statement decides it, so the answer is never stale: it
+        matches the row only while the stored token is this worker's, and
+        matching rows get a fresh ``claimed_at``. The caller commits.
+        """
+        result = await session.execute(
+            update(RuntimeExecution)
+            .where(
+                RuntimeExecution.task_id == task_id,
+                RuntimeExecution.tenant_id == tenant_id,
+                RuntimeExecution.claim_token == claim,
+            )
+            .values(claimed_at=datetime.now(UTC))
+            .returning(RuntimeExecution.task_id)
+        )
+        return result.scalar_one_or_none() is not None
+
+    @staticmethod
+    async def _fence_execution(
+        session: AsyncSession, *, task_id: UUID, tenant_id: UUID, claim: UUID
+    ) -> None:
+        """Prove this worker still owns the claim, or abandon the trigger.
+
+        The renewal is committed, so a fence that passes both proves ownership
+        and buys a fresh :data:`_CLAIM_LEASE` before the caller's next external
+        call or write — nobody else can take the claim in that window. A fence
+        that fails rolls back first, discarding everything this worker had
+        pending, and then raises: by then its cursor, evidence, and state are
+        known stale, and the new owner is the only writer that counts.
+        """
+        if await AgentRuntime._renew_claim(
+            session, task_id=task_id, tenant_id=tenant_id, claim=claim
+        ):
+            await session.commit()
+            return
+        await session.rollback()
+        raise ClaimLostError("the execution claim is no longer owned by this trigger")
+
+    async def _heartbeat(
+        self,
+        *,
+        task_id: UUID,
+        tenant_id: UUID,
+        claim: UUID,
+        stop: asyncio.Event,
+    ) -> None:
+        """Keep the owner's claim lease fresh for as long as it works.
+
+        Renews on its own short-lived session, never on the owner's, so a slow
+        model or a slow provider call cannot serialize the renewal behind the
+        very work it is protecting — which is the whole point: the lease has to
+        stay young while the owner is inside a call, not only between them.
+
+        Stops on ``stop``, and gives up for good the moment a renewal matches
+        nothing: from then on this worker is not the executor, and the owner's
+        next fence is what stops it before it writes anything.
+        """
+        while not stop.is_set():
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=_CLAIM_HEARTBEAT_SECONDS)
+                return
+            except TimeoutError:
+                pass
+            try:
+                async with self._session_factory() as beat:
+                    if await self._renew_claim(
+                        beat, task_id=task_id, tenant_id=tenant_id, claim=claim
+                    ):
+                        await beat.commit()
+                    else:
+                        await beat.rollback()
+                        self._log.warning(
+                            "execution claim heartbeat lost the claim",
+                            task_id=str(task_id),
+                            tenant_id=str(tenant_id),
+                        )
+                        return
+            except asyncio.CancelledError:
+                raise
+            except SQLAlchemyError as exc:
+                # A renewal that never reached the database proves nothing, and
+                # the lease is still valid for the rest of its window. Say so
+                # and let the next tick try again rather than dropping the
+                # heartbeat on a transient connection failure.
+                self._log.warning(
+                    "execution claim heartbeat could not renew the lease",
+                    task_id=str(task_id),
+                    tenant_id=str(tenant_id),
+                    error=str(exc),
+                )
+
+    async def _lost_claim_outcome(
+        self, *, task_id: UUID, tenant_id: UUID, fallback_state: str
+    ) -> TriggerOutcome:
+        """Report where the task actually is, not what this worker last saw.
+
+        Read through a fresh session because this worker's own session is being
+        abandoned: anything uncommitted in it is stale by definition, and the
+        owner now driving the task is the only one whose state counts.
+        """
+        async with self._session_factory() as probe:
+            state = await probe.scalar(
+                select(Task.state).where(
+                    Task.id == task_id, Task.tenant_id == tenant_id
+                )
+            )
+            steps_used = await probe.scalar(
+                select(RuntimeExecution.steps_used).where(
+                    RuntimeExecution.task_id == task_id,
+                    RuntimeExecution.tenant_id == tenant_id,
+                )
+            )
+        return TriggerOutcome(
+            state or fallback_state,
+            "CLAIM_LOST",
+            "this trigger lost the execution claim to another worker; it ran no "
+            "step and wrote no state",
+            [],
+            int(steps_used or 0),
+        )
 
     @staticmethod
     async def _release_execution(
@@ -994,6 +1249,7 @@ def _fulfilled(
 
 __all__ = [
     "AgentRuntime",
+    "ClaimLostError",
     "RuntimeFatal",
     "RuntimeNotFoundError",
     "RuntimeResumeError",

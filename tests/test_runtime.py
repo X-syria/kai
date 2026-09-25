@@ -12,7 +12,8 @@ import asyncio
 import json
 import subprocess
 import sys
-from collections.abc import AsyncIterator, Iterator
+import time
+from collections.abc import AsyncIterator, Callable, Iterator
 from contextlib import contextmanager
 from datetime import UTC, date, datetime, timedelta
 from typing import Final
@@ -636,6 +637,71 @@ async def test_trigger_never_writes_while_another_trigger_owns_the_execution(
     assert backend.created_events == {}
 
 
+async def _claimed_at(task_id: str) -> datetime | None:
+    """When the current claim was last taken or renewed, as the database sees it."""
+    from kai.runtime.models import RuntimeExecution
+
+    async with async_session_factory() as session:
+        row = (
+            await session.execute(
+                select(RuntimeExecution).where(
+                    RuntimeExecution.task_id == UUID(task_id)
+                )
+            )
+        ).scalar_one()
+        return row.claimed_at
+
+
+def _gated_client(
+    backend: GoogleBackend, *, started: asyncio.Event, release: asyncio.Event
+) -> Callable[[], AsyncIterator[httpx.AsyncClient]]:
+    """A Google client whose *first* call parks until ``release`` is set.
+
+    Only the network is still faked, exactly as in the default fixture; the gate
+    just decides when the provider answers, so a test can hold a trigger inside
+    a real tool call for as long as it needs.
+    """
+
+    async def _handler(request: httpx.Request) -> httpx.Response:
+        if not started.is_set():
+            started.set()
+            await release.wait()
+        return backend.handler(request)
+
+    async def _client() -> AsyncIterator[httpx.AsyncClient]:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(_handler),
+            base_url="http://google.api.test",
+            timeout=15.0,
+        ) as client:
+            yield client
+
+    return _client
+
+
+async def _wait_for_claim(task_id: str, *, timeout: float = 10.0) -> None:
+    """Block until some worker actually owns the task's execution claim."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if await _claimed_at(task_id) is not None:
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError("no worker claimed the execution")
+
+
+def _short_lease(monkeypatch: pytest.MonkeyPatch, *, seconds: float) -> None:
+    """Compress the claim lease and its heartbeat so a test runs in real time.
+
+    The ratio is what matters and is preserved: the heartbeat renews an order of
+    magnitude inside the lease, so a slow worker is never taken over, while a
+    *dead* worker's claim still expires and is reclaimed.
+    """
+    monkeypatch.setattr("kai.runtime.service._CLAIM_LEASE", timedelta(seconds=seconds))
+    monkeypatch.setattr(
+        "kai.runtime.service._CLAIM_HEARTBEAT_SECONDS", seconds / 20.0
+    )
+
+
 async def test_claim_abandoned_by_a_crash_is_reclaimed(
     client: httpx.AsyncClient,
     backend: GoogleBackend,
@@ -652,6 +718,112 @@ async def test_claim_abandoned_by_a_crash_is_reclaimed(
     assert (await _inspect(client, token, task_id))["task_state"] == "COMPLETED"
     assert len(backend.created_events) == 1
     assert (await _row(task_id))[3] == 0
+
+
+async def test_a_live_slow_worker_is_never_replaced(
+    client: httpx.AsyncClient,
+    backend: GoogleBackend,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A worker still inside a provider call keeps the task to itself.
+
+    The owner is parked in its first Google call for several times the claim
+    lease, so a second trigger is offered the exact window in which a slow but
+    live worker used to be declared dead and replaced. The heartbeat has to keep
+    the lease young across the call, not just between them.
+    """
+    _short_lease(monkeypatch, seconds=0.4)
+    token, task_id, approval_id = await _ready_task(client, "khaled@example.com")
+    await _approve(client, token, approval_id)
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+    app.dependency_overrides[get_google_http_client] = _gated_client(
+        backend, started=started, release=release
+    )
+
+    owner = asyncio.create_task(_trigger(client, token, task_id))
+    await asyncio.wait_for(started.wait(), timeout=10)
+    await _wait_for_claim(task_id)
+
+    # Sit well past the lease with the owner alive but blocked in the provider.
+    claimed_before = await _claimed_at(task_id)
+    assert claimed_before is not None
+    await asyncio.sleep(1.2)
+    claimed_after = await _claimed_at(task_id)
+    assert claimed_after is not None and claimed_after > claimed_before, (
+        "the heartbeat did not renew a live worker's lease"
+    )
+
+    # The offer to take over is refused: the claim is fresh, so it writes nothing.
+    intruder = await _trigger(client, token, task_id)
+    assert intruder["outcome"] == "RESUME_IN_PROGRESS", intruder
+    assert backend.created_events == {}
+
+    release.set()
+    done = await asyncio.wait_for(owner, timeout=30)
+    assert done["outcome"] == "COMPLETED", done
+    assert len(backend.created_events) == 1
+    assert (await _row(task_id))[3] == 0
+
+
+async def test_a_worker_that_lost_the_claim_writes_nothing(
+    client: httpx.AsyncClient,
+    backend: GoogleBackend,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A replaced worker stops before it acts on the task or records anything.
+
+    The claim is taken over while the worker is inside its first provider call.
+    Everything the loser had pending is stale by definition, so it must not
+    resolve identities, plan, transition, or fail the task on its way out — not
+    even to record its own loss.
+    """
+    _short_lease(monkeypatch, seconds=0.4)
+    token = await _register(client, "khaled@example.com")
+    tenant_id, user_id = await _user_scope("khaled@example.com")
+    await insert_account(
+        tenant_id=tenant_id,
+        user_id=user_id,
+        email="khaled@example.com",
+        scopes=(
+            "openid email "
+            "https://www.googleapis.com/auth/calendar.events "
+            "https://www.googleapis.com/auth/contacts.readonly"
+        ),
+    )
+    await _seed_attendee_memory(tenant_id, user_id)
+    task_id, _ = await _submit(client, token)
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+    app.dependency_overrides[get_google_http_client] = _gated_client(
+        backend, started=started, release=release
+    )
+
+    owner = asyncio.create_task(_trigger(client, token, task_id))
+    await asyncio.wait_for(started.wait(), timeout=10)
+
+    # Another worker took the claim over (fresh token, fresh lease) while this
+    # one was still blocked on the provider.
+    await _set_claim(task_id, claimed_at=datetime.now(UTC))
+    release.set()
+
+    lost = await asyncio.wait_for(owner, timeout=30)
+    assert lost["outcome"] == "CLAIM_LOST", lost
+    assert lost["task_state"] == "UNDERSTANDING", lost
+    assert lost["steps_used"] == 0
+    assert lost["approval_ids"] == []
+
+    row = await _internal_row(task_id)
+    # The loser wrote no identities, no evidence, and no cursor of its own, and
+    # it did not rewrite the state it found into a failure either.
+    assert list(row.identities) == []
+    assert list(row.evidence) == []
+    assert row.cursor == 0
+    assert row.steps_used == 0
+    assert (await _inspect(client, token, task_id))["task_state"] == "UNDERSTANDING"
+    assert backend.created_events == {}
 
 
 async def test_crash_after_create_before_persist_never_duplicates(
