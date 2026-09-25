@@ -1,10 +1,15 @@
 from functools import lru_cache
-from typing import Literal
+from typing import Final, Literal
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 DEFAULT_JWT_SECRET = "change-me-in-production"
 DEFAULT_GOOGLE_CRED_SECRET = "change-me-google-token-encryption"
+
+#: Production floor for ``google_creds_encryption_secret``, matching the "32+
+#: random bytes" its own documentation requires. Enforced only in production so
+#: local and test runs keep working with the shipped defaults.
+_MIN_GOOGLE_SECRET_LENGTH: Final[int] = 32
 
 
 class Settings(BaseSettings):
@@ -86,9 +91,26 @@ class Settings(BaseSettings):
 @lru_cache
 def get_settings() -> Settings:
     settings = Settings()
-    if (
-        settings.environment == "production"
-        and settings.jwt_secret == DEFAULT_JWT_SECRET
-    ):
+    if settings.environment != "production":
+        return settings
+
+    # Both secrets below ship in this source tree, so a deployment that never
+    # overrides one runs on a value that is public by construction. Fail at
+    # startup rather than encrypting a whole database of Google refresh tokens
+    # under a key anyone can derive from the repository.
+    if settings.jwt_secret == DEFAULT_JWT_SECRET:
         raise RuntimeError("JWT_SECRET must be set to a non-default value in production")
+    if settings.google_creds_encryption_secret == DEFAULT_GOOGLE_CRED_SECRET:
+        raise RuntimeError(
+            "GOOGLE_CREDS_ENCRYPTION_SECRET must be set to a non-default value in production"
+        )
+    # The contract for this secret is "32+ random bytes" (see the field above);
+    # production enforces it, because a short value is a real-looking secret
+    # that would otherwise pass a non-default check and protect nothing.
+    if len(settings.google_creds_encryption_secret.strip()) < _MIN_GOOGLE_SECRET_LENGTH:
+        raise RuntimeError(
+            "GOOGLE_CREDS_ENCRYPTION_SECRET must be at least "
+            f"{_MIN_GOOGLE_SECRET_LENGTH} characters in production; it derives the "
+            "Fernet key that encrypts every stored Google credential"
+        )
     return settings
