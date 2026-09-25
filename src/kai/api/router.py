@@ -9,6 +9,7 @@ from kai.api.google import router as google_router
 from kai.api.health import router as health_router
 from kai.api.memory import router as memory_router
 from kai.api.planner import router as planner_router
+from kai.api.runtime import router as runtime_router
 from kai.api.tasks import router as tasks_router
 
 api_router = APIRouter(prefix="/api/v1")
@@ -22,3 +23,4 @@ api_router.include_router(tasks_router)
 api_router.include_router(planner_router)
 api_router.include_router(approvals_router)
 api_router.include_router(memory_router)
+api_router.include_router(runtime_router)

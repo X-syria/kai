@@ -756,7 +756,7 @@ async def test_responses_never_expose_internal_metadata(
 # --- migration -------------------------------------------------------------
 
 REVISION_PREV = "5f3e1d2c4b6a"
-REVISION_HEAD = "d1a2b3c4e5f6"
+REVISION_HEAD = "f1e2d3c4b5a6"
 
 
 def _alembic(*args: str) -> subprocess.CompletedProcess[str]:

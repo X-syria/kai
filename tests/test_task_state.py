@@ -17,6 +17,7 @@ from kai.tasks.state import (
     REQUIRES_ATTENTION,
     RETRY,
     TRANSITIONS,
+    VERIFYING,
     apply_retry_budget,
     is_retryable_failure,
     is_terminal,
@@ -29,13 +30,14 @@ HAPPY_PATH = [
     ("PLANNING", "POLICY_CHECK"),
     ("POLICY_CHECK", "WAITING_APPROVAL"),
     ("POLICY_CHECK", EXECUTING),
+    (EXECUTING, "WAITING_APPROVAL"),
     ("WAITING_APPROVAL", EXECUTING),
     ("WAITING_APPROVAL", "POLICY_CHECK"),
     (EXECUTING, "WAITING_EXTERNAL"),
     (EXECUTING, "VERIFYING"),
     ("WAITING_EXTERNAL", EXECUTING),
-    ("VERIFYING", COMPLETED),
-    ("VERIFYING", EXECUTING),
+    (VERIFYING, COMPLETED),
+    (VERIFYING, EXECUTING),
 ]
 
 FAILURE_EDGES = [
@@ -116,7 +118,7 @@ def test_dead_state_has_no_escape() -> None:
 def test_unknown_states_are_refused() -> None:
     for current, target in (("NOT_A_STATE", CREATED), (CREATED, "NOT_A_STATE")):
         decision = resolve_transition(current, target)
-        assert not decision.ok
+        assert not decision.ok, (current, target)
         assert "unknown state" in (decision.error or "")
 
 

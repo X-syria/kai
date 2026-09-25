@@ -12,6 +12,7 @@ from kai.db import models  # noqa: F401
 from kai.db.base import Base
 from kai.memory import models as memory_models  # noqa: F401
 from kai.planner import models as planner_models  # noqa: F401
+from kai.runtime import models as runtime_models  # noqa: F401
 from kai.tasks import models as task_models  # noqa: F401
 
 config = context.config

@@ -968,8 +968,8 @@ async def test_requesting_and_deciding_moves_the_task_through_the_machine() -> N
         assert (await _count_rows(TaskRow)) >= 2  # tasks were never invented
 
 
-async def test_running_task_never_regresses_to_waiting() -> None:
-    """The machine is authoritative: EXECUTING has no path back to waiting."""
+async def test_running_task_pauses_for_approval() -> None:
+    """An EXECUTING task that needs a human really parks in WAITING_APPROVAL."""
     tenant_id, user_id, _ = await _registered_with_account()
     task = await make_task(
         tenant_id=tenant_id, user_id=user_id, allowed_tools=["gmail"]
@@ -980,7 +980,7 @@ async def test_running_task_never_regresses_to_waiting() -> None:
         context = _context(
             session=session, task=task, tenant_id=tenant_id, user_id=user_id
         )
-        await service.request(
+        approval = await service.request(
             session=session,
             intent=make_intent(GM_SEND, task=task),
             context=context,
@@ -993,7 +993,19 @@ async def test_running_task_never_regresses_to_waiting() -> None:
         after = await get_task(
             session, task_id=task.id, tenant_id=tenant_id, user_id=user_id
         )
-        assert after.state == "EXECUTING"
+        assert after.state == "WAITING_APPROVAL"
+
+        await service.decide(
+            session=session,
+            approval_id=approval.id,
+            decision=ApprovalAction.APPROVE,
+            tenant_id=tenant_id,
+            user_id=user_id,
+        )
+        resumed = await get_task(
+            session, task_id=task.id, tenant_id=tenant_id, user_id=user_id
+        )
+        assert resumed.state == "EXECUTING"
 
 
 # ---------------------------------------------------------------------------

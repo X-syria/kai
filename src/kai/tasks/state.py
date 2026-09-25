@@ -77,8 +77,17 @@ TRANSITIONS: Final[dict[str, frozenset[str]]] = {
     WAITING_APPROVAL: frozenset(
         {POLICY_CHECK, EXECUTING, FAILED, REQUIRES_ATTENTION}
     ),
+    # An execution that stops mid-flight for a human decision parks in
+    # WAITING_APPROVAL; without this edge the only honest machine state for a
+    # paused approval would be to keep pretending the task is EXECUTING.
     EXECUTING: frozenset(
-        {WAITING_EXTERNAL, VERIFYING, FAILED, REQUIRES_ATTENTION}
+        {
+            WAITING_APPROVAL,
+            WAITING_EXTERNAL,
+            VERIFYING,
+            FAILED,
+            REQUIRES_ATTENTION,
+        }
     ),
     WAITING_EXTERNAL: frozenset({EXECUTING, FAILED, REQUIRES_ATTENTION}),
     VERIFYING: frozenset({COMPLETED, EXECUTING, FAILED, REQUIRES_ATTENTION}),
