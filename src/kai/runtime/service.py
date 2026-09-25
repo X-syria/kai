@@ -50,6 +50,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
@@ -108,6 +109,8 @@ from kai.tasks.state import (
     UNDERSTANDING,
     VERIFYING,
     WAITING_APPROVAL,
+    WAITING_EXTERNAL,
+    is_retryable_failure,
     is_terminal,
 )
 from kai.tools.context import ToolContext
@@ -116,8 +119,21 @@ from kai.tools.intent import ToolIntent
 from kai.tools.result import ToolOutcome, ToolResult
 
 _RESUMABLE_STATES: frozenset[str] = frozenset(
-    {CREATED, UNDERSTANDING, PLANNING, POLICY_CHECK, EXECUTING, WAITING_APPROVAL}
+    {
+        CREATED,
+        UNDERSTANDING,
+        PLANNING,
+        POLICY_CHECK,
+        EXECUTING,
+        WAITING_APPROVAL,
+        VERIFYING,
+    }
 )
+
+#: States where the runtime is blocked on somebody else, so triggering the task
+#: again would achieve nothing. ``WAITING_APPROVAL`` is not one of them: an
+#: approval that is already settled leaves the task able to move on.
+_WAITING_ON_OTHERS: frozenset[str] = frozenset({WAITING_EXTERNAL})
 
 #: How long a trigger's execution claim stays valid before another trigger may
 #: take it over. A live trigger finishes in seconds; a claim this old belongs
@@ -159,6 +175,28 @@ class ClaimLostError(Exception):
     must abandon the trigger without writing anything. It is deliberately not a
     :class:`RuntimeFatal` — a lost claim is never this task's failure to record.
     """
+
+
+def next_action_for(state: str, *, approval_ids: Sequence[str] = ()) -> str:
+    """What the caller can usefully do about a task sitting in ``state``.
+
+    One mapping, derived from the Task Manager machine instead of a second
+    hand-written list of "finished" states that could drift away from it:
+
+    * a pending approval outranks everything - a human is the bottleneck;
+    * a terminal or failed task is ``DONE``, because the runtime will not touch
+      it again and only the caller (retry, escalate) can;
+    * a task waiting on a third party is ``WAIT``, because triggering it again
+      would achieve nothing;
+    * everything else is ``EXECUTE``, which is a call the runtime can honour.
+    """
+    if approval_ids:
+        return "APPROVE"
+    if is_terminal(state) or is_retryable_failure(state):
+        return "DONE"
+    if state in _WAITING_ON_OTHERS:
+        return "WAIT"
+    return "EXECUTE"
 
 
 @dataclass(frozen=True)
@@ -383,6 +421,20 @@ class AgentRuntime:
             if row.scenario is not None
             else None
         )
+
+        # A task that died between the VERIFYING transition and its outcome is
+        # finished here rather than re-run. The verdict is a pure function of
+        # the scenario, the identities, and the evidence, all of which are
+        # already durable, so the crash window costs one decision and never a
+        # re-execution, a re-plan, or a second model call.
+        if task.state == VERIFYING:
+            if scenario is None:
+                return await self._fail(
+                    session, task, "cannot verify: no understanding on record"
+                )
+            return await self._settle_verification(
+                session, task=task, row=row, scenario=scenario, claim=claim
+            )
 
         # Stage 1 - understanding (CREATED / UNDERSTANDING only).
         if task.state in {CREATED, UNDERSTANDING}:
@@ -756,29 +808,51 @@ class AgentRuntime:
                 user_id=task.user_id,
                 target=VERIFYING,
             )
-            fulfilled = _fulfilled(scenario, identities, evidence)
-            if fulfilled:
-                await transition_task(
-                    session,
-                    task_id=task.id,
-                    tenant_id=task.tenant_id,
-                    user_id=task.user_id,
-                    target="COMPLETED",
-                )
-                return TriggerOutcome(
-                    "COMPLETED",
-                    "COMPLETED",
-                    "meeting scheduled and verified",
-                    [],
-                    steps_used,
-                )
-            return await self._fail(
-                session,
-                task,
-                "verified execution did not satisfy the task success criteria",
+            return await self._settle_verification(
+                session, task=task, row=row, scenario=scenario, claim=claim
             )
         except RuntimeFatal as exc:
             return await self._fail(session, task, str(exc))
+
+    async def _settle_verification(
+        self,
+        session: AsyncSession,
+        *,
+        task: Task,
+        row: RuntimeExecution,
+        scenario: UnderstandingOutput,
+        claim: UUID,
+    ) -> TriggerOutcome:
+        """Give a task in ``VERIFYING`` the verdict its evidence already implies.
+
+        Shared by the live execution path and by the recovery path, so a task
+        that crashed a moment ago and a task that ran cleanly are decided by
+        exactly the same code, on exactly the same inputs.
+        """
+        await self._fence_execution(
+            session, task_id=task.id, tenant_id=task.tenant_id, claim=claim
+        )
+        if _fulfilled(scenario, list(row.identities), list(row.evidence)):
+            await transition_task(
+                session,
+                task_id=task.id,
+                tenant_id=task.tenant_id,
+                user_id=task.user_id,
+                target="COMPLETED",
+            )
+            return TriggerOutcome(
+                "COMPLETED",
+                "COMPLETED",
+                "meeting scheduled and verified",
+                [],
+                row.steps_used,
+            )
+        return await self._fail(
+            session,
+            task,
+            "verified execution did not satisfy the task success criteria",
+            steps_used=row.steps_used,
+        )
 
     def _intents_for(
         self,
@@ -1104,6 +1178,8 @@ class AgentRuntime:
         session: AsyncSession,
         task: Task,
         reason: str,
+        *,
+        steps_used: int = 0,
     ) -> TriggerOutcome:
         await transition_task(
             session,
@@ -1113,7 +1189,7 @@ class AgentRuntime:
             target=FAILED,
             fail_reason=reason,
         )
-        return TriggerOutcome("FAILED", "FAILED", reason, [], 0)
+        return TriggerOutcome("FAILED", "FAILED", reason, [], steps_used)
 
     @classmethod
     async def _halt(

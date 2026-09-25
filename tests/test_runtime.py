@@ -32,8 +32,22 @@ from kai.memory.models import MemoryType
 from kai.memory.service import create_memory
 from kai.planner.deps import get_planner_model
 from kai.planner.model import PLANNER_SYSTEM_PROMPT
+from kai.runtime.models import RuntimeExecution
+from kai.runtime.service import next_action_for
 from kai.runtime.understanding import UNDERSTANDING_SYSTEM_PROMPT
 from kai.tasks.models import Task
+from kai.tasks.state import (
+    COMPLETED,
+    CREATED,
+    ESCALATE,
+    FAILED,
+    REQUIRES_ATTENTION,
+    RETRY,
+    UNDERSTANDING,
+    VERIFYING,
+    WAITING_APPROVAL,
+    WAITING_EXTERNAL,
+)
 from tool_harness import GoogleBackend, contact_payload, insert_account
 
 API_PREFIX: Final = "/api/v1"
@@ -547,6 +561,143 @@ async def test_task_walks_the_real_state_machine(
         "EXECUTING",
         "VERIFYING",
     ]
+
+
+async def test_a_task_parked_in_verifying_is_settled_not_re_executed(
+    client: httpx.AsyncClient,
+    backend: GoogleBackend,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A worker that dies mid-verification costs a decision, not a re-execution.
+
+    ``VERIFYING`` is the one state the task used to be stranded in: the machine
+    had already moved there, and nothing was left to tell the next trigger what
+    the verdict was. The evidence was all on record, so the next trigger reads
+    it and finishes the task - without touching Google again, and without
+    spending a second step.
+    """
+    token, task_id, approval_id = await _ready_task(client, "khaled@example.com")
+    await _approve(client, token, approval_id)
+
+    # The crash: the task is in VERIFYING, and the verdict blows up before it is
+    # recorded. A non-RuntimeFatal error is not swallowed by the pipeline, so it
+    # surfaces exactly as a lost worker would - leaving the state behind.
+    def _explode(*_args: object, **_kwargs: object) -> bool:
+        raise RuntimeError("worker died mid-verification")
+
+    monkeypatch.setattr("kai.runtime.service._fulfilled", _explode)
+
+    with pytest.raises(RuntimeError, match="mid-verification"):
+        await _trigger(client, token, task_id)
+
+    stranded = await _inspect(client, token, task_id)
+    assert stranded["task_state"] == "VERIFYING"
+    # The projection still tells the truth about a task the runtime can advance.
+    assert stranded["next_action"] == "EXECUTE"
+    assert len(backend.created_events) == 1
+    calls_before = len(backend.calendar_calls) + len(backend.contacts_calls)
+    steps_before = (await _row(task_id))[1]
+    assert steps_before > 0, "the steps had already run before the crash"
+
+    monkeypatch.undo()
+
+    settled = await _trigger(client, token, task_id)
+    assert settled["outcome"] == "COMPLETED", settled
+    # No second call to the provider, and the steps stay the steps the crashed
+    # worker already spent: the cursor and evidence were durable.
+    assert len(backend.created_events) == 1
+    assert len(backend.calendar_calls) + len(backend.contacts_calls) == calls_before, (
+        "settling a stranded verification must not touch the provider again"
+    )
+    assert settled["steps_used"] == steps_before
+    assert (await _row(task_id))[1] == steps_before
+    assert (await _inspect(client, token, task_id))["task_state"] == "COMPLETED"
+
+
+async def test_a_task_parked_in_verifying_fails_the_same_way_when_evidence_is_short(
+    client: httpx.AsyncClient,
+    backend: GoogleBackend,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Recovery decides on the evidence, not on how the task got there."""
+    token, task_id, approval_id = await _ready_task(client, "khaled@example.com")
+    await _approve(client, token, approval_id)
+
+    def _explode(*_args: object, **_kwargs: object) -> bool:
+        raise RuntimeError("worker died mid-verification")
+
+    monkeypatch.setattr("kai.runtime.service._fulfilled", _explode)
+    with pytest.raises(RuntimeError):
+        await _trigger(client, token, task_id)
+    monkeypatch.undo()
+
+    # Drop the create-event evidence: the same durable state, one step short of
+    # the success criteria, so recovery must fail the task honestly instead of
+    # completing it on the strength of a state it never earned.
+    async with async_session_factory() as session:
+        row = await session.scalar(
+            select(RuntimeExecution).where(RuntimeExecution.task_id == task_id)
+        )
+        assert row is not None
+        row.evidence = [
+            entry for entry in row.evidence if entry["tool"] != "calendar.create_event"
+        ]
+        await session.commit()
+
+    settled = await _trigger(client, token, task_id)
+    assert settled["outcome"] == "FAILED", settled
+    assert "success criteria" in settled["message"]
+    assert len(backend.created_events) == 1
+
+
+# ----------------------------------------------------------------------------------
+# next_action: one mapping, derived from the state machine
+# ----------------------------------------------------------------------------------
+
+
+async def test_next_action_is_derived_from_the_state_machine(
+    client: httpx.AsyncClient,
+) -> None:
+    """The projection asks the machine, rather than keeping its own list."""
+    assert next_action_for(CREATED) == "EXECUTE"
+    assert next_action_for(UNDERSTANDING) == "EXECUTE"
+    assert next_action_for(VERIFYING) == "EXECUTE"
+    assert next_action_for(RETRY) == "EXECUTE"
+    # A settled approval leaves the task movable, so it is not a WAIT.
+    assert next_action_for(WAITING_APPROVAL) == "EXECUTE"
+    # Nothing the runtime can do about these: the caller has to.
+    assert next_action_for(WAITING_EXTERNAL) == "WAIT"
+    for state in (COMPLETED, ESCALATE, FAILED, REQUIRES_ATTENTION):
+        assert next_action_for(state) == "DONE", state
+    # A pending approval outranks every state, terminal or not.
+    for state in (CREATED, WAITING_EXTERNAL, COMPLETED, FAILED):
+        assert next_action_for(state, approval_ids=["a1"]) == "APPROVE", state
+
+
+async def test_a_task_waiting_on_someone_else_says_wait(
+    client: httpx.AsyncClient,
+    backend: GoogleBackend,
+) -> None:
+    """``EXECUTE`` on a task the runtime cannot move is a lie the caller acts on."""
+    token, task_id, approval_id = await _ready_task(client, "khaled@example.com")
+    assert (await _inspect(client, token, task_id))["next_action"] == "APPROVE"
+
+    await _approve(client, token, approval_id)
+    assert (await _inspect(client, token, task_id))["next_action"] == "EXECUTE"
+
+    # Park it on the one state that waits for a third party, and ask again.
+    async with async_session_factory() as session:
+        task = await session.scalar(
+            select(Task).where(Task.id == task_id)
+        )
+        assert task is not None
+        task.state = WAITING_EXTERNAL
+        await session.commit()
+
+    snapshot = await _inspect(client, token, task_id)
+    assert snapshot["task_state"] == "WAITING_EXTERNAL"
+    assert snapshot["next_action"] == "WAIT"
+    assert backend.created_events == {}
 
 
 async def test_trigger_while_approval_pending_is_a_noop(

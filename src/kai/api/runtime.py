@@ -36,6 +36,7 @@ from kai.runtime.service import (
     AgentRuntime,
     RuntimeNotFoundError,
     RuntimeResumeError,
+    next_action_for,
 )
 from kai.tasks.service import TaskNotFoundError, get_task
 
@@ -89,12 +90,7 @@ async def runtime_get(
         )
 
     approval_ids = await runtime.pending_approval_ids(session, task)
-    if approval_ids:
-        next_action = "APPROVE"
-    elif task.state in ("COMPLETED", "FAILED", "REQUIRES_ATTENTION", "ESCALATE"):
-        next_action = "DONE"
-    else:
-        next_action = "EXECUTE"
+    next_action = next_action_for(task.state, approval_ids=approval_ids)
     return RuntimeTaskResponse(
         task_id=str(task.id),
         task_state=task.state,
