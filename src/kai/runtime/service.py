@@ -436,8 +436,12 @@ class AgentRuntime:
                 session, task=task, row=row, scenario=scenario, claim=claim
             )
 
-        # Stage 1 - understanding (CREATED / UNDERSTANDING only).
-        if task.state in {CREATED, UNDERSTANDING}:
+        # Stage 1 - understanding, exactly once per task. The scenario is
+        # committed while the task is still in UNDERSTANDING, so a resume can
+        # find one already on record; reading that one back is what keeps a
+        # crash in this window from costing a second model call that might not
+        # even agree with the first one about which day the meeting is on.
+        if task.state in {CREATED, UNDERSTANDING} and scenario is None:
             await self._fence_execution(
                 session, task_id=task.id, tenant_id=task.tenant_id, claim=claim
             )

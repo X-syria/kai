@@ -700,6 +700,80 @@ async def test_a_task_waiting_on_someone_else_says_wait(
     assert backend.created_events == {}
 
 
+async def test_a_resumed_task_does_not_understand_itself_twice(
+    client: httpx.AsyncClient,
+    backend: GoogleBackend,
+    stub: RuntimeStubModel,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A saved understanding is the answer, not a suggestion to ask again.
+
+    The scenario is committed while the task is still in UNDERSTANDING, so a
+    crash before the planner moves it leaves the task in a state where the
+    understanding is on record and the plan is not. Re-reading is what makes
+    that window cheap: one model call, and the same understanding it gave the
+    first time - not a fresh one that might move the meeting to another day.
+    """
+    token = await _register(client, "khaled@example.com")
+    tenant_id, user_id = await _user_scope("khaled@example.com")
+    await insert_account(
+        tenant_id=tenant_id,
+        user_id=user_id,
+        email="khaled@example.com",
+        scopes=(
+            "openid email "
+            "https://www.googleapis.com/auth/calendar.events "
+            "https://www.googleapis.com/auth/contacts.readonly"
+        ),
+    )
+    await _seed_attendee_memory(tenant_id, user_id)
+    task_id, _ = await _submit(client, token)
+
+    # The crash lands in the window: understanding is saved and committed, the
+    # planner has not run, so the task is still in UNDERSTANDING.
+    async def _boom(*_args: object, **_kwargs: object) -> object:
+        raise RuntimeError("planner worker died before the plan")
+
+    monkeypatch.setattr("kai.planner.service.PlannerService.create_plan", _boom)
+
+    with pytest.raises(RuntimeError, match="before the plan"):
+        await _trigger(client, token, task_id)
+
+    stranded = await _inspect(client, token, task_id)
+    assert stranded["task_state"] == "UNDERSTANDING"
+    assert stranded["scenario"] is not None
+    assert stub.understanding_calls == 1
+    saved = stranded["scenario"]
+
+    monkeypatch.undo()
+
+    # A second understanding would answer a different question: the next
+    # Monday, from a model asked again a moment later.
+    async def _a_different_week(*_args: object, **kwargs: object) -> dict:
+        return _valid_understanding(
+            window={
+                "start_date": (_next_monday() + timedelta(days=14)).isoformat(),
+                "end_date": (_next_monday() + timedelta(days=17)).isoformat(),
+                "earliest_time": EARLIEST,
+                "title": "اجتماع مع " + ATTENDEE_NAME,
+            }
+        )
+
+    monkeypatch.setattr("kai.runtime.understanding.understand_scenario", _a_different_week)
+
+    resumed = await _trigger(client, token, task_id)
+    assert resumed["outcome"] == "WAITING_APPROVAL", resumed
+    # The whole point: the model was asked once, and the understanding that
+    # survived is the one the task was already built on.
+    assert stub.understanding_calls == 1
+    after = await _inspect(client, token, task_id)
+    assert after["scenario"] == saved
+    # It resumed from the saved understanding into planning, and stopped at the
+    # approval checkpoint without touching the user's calendar.
+    assert after["task_state"] == "WAITING_APPROVAL"
+    assert backend.created_events == {}
+
+
 async def test_trigger_while_approval_pending_is_a_noop(
     client: httpx.AsyncClient,
     backend: GoogleBackend,
