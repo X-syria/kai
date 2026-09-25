@@ -1899,3 +1899,107 @@ async def test_expired_approval_is_never_consumed_atomically() -> None:
             await session.execute(select(Approval).where(Approval.id == approval_id))
         ).scalar_one()
         assert row.consumed_at is None
+
+
+# ---------------------------------------------------------------------------
+# 11. Concurrency: two decisions, one approval
+# ---------------------------------------------------------------------------
+
+
+async def test_a_decision_waits_for_one_already_in_flight(
+    client: httpx.AsyncClient,
+) -> None:
+    """A second decision must block, not read a PENDING row that is already gone.
+
+    Without the row lock the arriving decision reads PENDING, passes the
+    immutability check, and overwrites a decision that is in flight - so the
+    approval the gateway later reads is whichever one happened to commit last,
+    while both callers were told they had decided it.
+    """
+    _, claims = await _register(client, "in-flight@corp.example")
+    approval_id = await _seed_approval(claims.tenant_id, claims.user_id)
+    service = ApprovalService()
+
+    async with session_scope() as holder:
+        locked = (
+            await holder.execute(
+                select(Approval).where(Approval.id == approval_id).with_for_update()
+            )
+        ).scalar_one()
+        locked.status = ApprovalStatus.APPROVED.value
+        locked.decided_at = datetime.now(UTC)
+        await holder.flush()
+
+        async with session_scope() as other:
+            second = asyncio.create_task(
+                service.decide(
+                    session=other,
+                    approval_id=approval_id,
+                    decision=ApprovalAction.REJECT,
+                    tenant_id=claims.tenant_id,
+                    user_id=claims.user_id,
+                    reason="racing decision",
+                )
+            )
+            await asyncio.sleep(0.3)
+            assert not second.done(), (
+                "a second decision was taken against a PENDING row while another "
+                "decision held the approval"
+            )
+
+            await holder.commit()
+
+            # Unblocked, it is re-read and refused, because approvals are
+            # immutable once decided.
+            with pytest.raises(InvalidApprovalTransition):
+                await asyncio.wait_for(second, timeout=10)
+
+    async with session_scope() as session:
+        row = (
+            await session.execute(select(Approval).where(Approval.id == approval_id))
+        ).scalar_one()
+    assert row.status == ApprovalStatus.APPROVED.value
+
+
+async def test_an_approve_racing_a_reject_produces_one_decision(
+    client: httpx.AsyncClient,
+) -> None:
+    """Through the API: an approve and a reject cannot both be told they won."""
+    for attempt in range(5):
+        token, claims = await _register(client, f"race{attempt}@corp.example")
+        approval_id = await _seed_approval(claims.tenant_id, claims.user_id)
+        headers = {"Authorization": f"Bearer {token}"}
+
+        approve, reject = await asyncio.gather(
+            client.post(
+                f"{API_PREFIX}/approvals/{approval_id}/approve",
+                json={"reason": "yes"},
+                headers=headers,
+            ),
+            client.post(
+                f"{API_PREFIX}/approvals/{approval_id}/reject",
+                json={"reason": "no"},
+                headers=headers,
+            ),
+        )
+        codes = sorted([approve.status_code, reject.status_code])
+        assert codes == [200, 409], (
+            f"attempt {attempt}: {codes} {approve.text} {reject.text}"
+        )
+
+        won_approval = approve.status_code == 200
+        winner = approve if won_approval else reject
+        expected = (
+            ApprovalStatus.APPROVED.value
+            if won_approval
+            else ApprovalStatus.DENIED.value
+        )
+        assert winner.json()["status"] == expected
+
+        async with session_scope() as session:
+            row = (
+                await session.execute(
+                    select(Approval).where(Approval.id == approval_id)
+                )
+            ).scalar_one()
+        assert row.status == expected

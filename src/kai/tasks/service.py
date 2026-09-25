@@ -123,6 +123,31 @@ async def _load_task(
     return task
 
 
+async def _load_task_for_update(
+    session: AsyncSession,
+    *,
+    task_id: UUID,
+    tenant_id: UUID,
+    user_id: UUID | None,
+) -> Task:
+    """Lock the task row and read it as it is right now.
+
+    ``populate_existing`` because the deciding session may have loaded this task
+    earlier in the same request: a lock that returned the session's own cached,
+    possibly stale image would serialise the writers while still letting the
+    loser decide against a state that no longer exists.
+    """
+    result = await session.execute(
+        _task_scope(task_id, tenant_id=tenant_id, user_id=user_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    task = result.scalar_one_or_none()
+    if task is None:
+        raise TaskNotFoundError("task not found for tenant")
+    return task
+
+
 async def get_task(
     session: AsyncSession,
     *,
@@ -174,6 +199,14 @@ async def transition_task(
     budget on the failure -> retry path. Anything else raises
     :class:`InvalidTransition` and persists nothing.
 
+    The row is locked for the whole read-decide-write, so two writers cannot
+    both pass the machine on the same state. Without the lock this is a lost
+    update: a reader that never saw the approval pause moves
+    ``EXECUTING -> VERIFYING`` and overwrites the writer that moved
+    ``EXECUTING -> WAITING_APPROVAL``, so a task completes having never asked
+    its human. The loser of the race blocks, then re-reads and is judged
+    against the state the winner actually wrote.
+
     ``actor`` says who is asking. Only the runtime, which establishes these
     states from real evidence, may name the lifecycle ones
     (:data:`CLIENT_TRANSITION_TARGETS` is the rest); an external client asking
@@ -184,7 +217,7 @@ async def transition_task(
     answering 404, not turn into a 403 that would report on rows the caller
     cannot see.
     """
-    task = await _load_task(
+    task = await _load_task_for_update(
         session, task_id=task_id, tenant_id=tenant_id, user_id=user_id
     )
     if actor == EXTERNAL_ACTOR and target not in CLIENT_TRANSITION_TARGETS:

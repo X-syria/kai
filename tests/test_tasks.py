@@ -19,6 +19,7 @@ import httpx
 import pytest
 from pytest import LogCaptureFixture
 from sqlalchemy import inspect as sa_inspect
+from sqlalchemy import select
 
 from kai.auth.jwt import TokenClaims, decode_access_token
 from kai.db.engine import async_session_factory
@@ -1027,6 +1028,97 @@ async def _persist(**overrides: object) -> Task:
         await session.commit()
         await session.refresh(task)
         return task
+
+
+# ----------------------------------------------------------------------------------
+# Concurrency: two writers, one state machine
+# ----------------------------------------------------------------------------------
+
+
+async def test_a_transition_waits_for_one_already_in_flight() -> None:
+    """The loser of a race must block, not decide against a state nobody wrote.
+
+    ``EXECUTING`` is the state that makes the race worth taking: the runtime may
+    stop there for a human (``WAITING_APPROVAL``) and a reader that never saw
+    that pause may carry on to ``VERIFYING`` - both legal from ``EXECUTING``,
+    which is exactly why the machine cannot catch the loser on its own.
+    """
+    task = await _persist(state=EXECUTING)
+
+    async with async_session_factory() as holder:
+        # A transaction that is mid-decide on this row and has not committed.
+        locked = (
+            await holder.execute(
+                select(Task).where(Task.id == task.id).with_for_update()
+            )
+        ).scalar_one()
+        locked.state = WAITING_APPROVAL
+        await holder.flush()
+
+        async with async_session_factory() as other:
+            second = asyncio.create_task(
+                transition_task(
+                    other,
+                    task_id=task.id,
+                    tenant_id=task.tenant_id,
+                    user_id=task.user_id,
+                    target=VERIFYING,
+                )
+            )
+            await asyncio.sleep(0.3)
+            assert not second.done(), (
+                "the second transition was decided against EXECUTING while a "
+                "writer held the task: it would overwrite the approval pause"
+            )
+
+            await holder.commit()
+
+            # Unblocked, it is re-read and judged against what was really
+            # written - and WAITING_APPROVAL -> VERIFYING is not a machine edge.
+            with pytest.raises(InvalidTransition):
+                await asyncio.wait_for(second, timeout=10)
+
+    async with async_session_factory() as session:
+        final = await get_task(
+            session, task_id=task.id, tenant_id=task.tenant_id
+        )
+    assert final.state == WAITING_APPROVAL
+
+
+async def test_two_writers_cannot_both_move_a_task_off_the_same_state() -> None:
+    """Exactly one of two racing writers is allowed to believe it moved the task.
+
+    Without the row lock both read ``EXECUTING``, both pass the machine, and both
+    return their own state as if they had it: the caller that parked the task for
+    approval is told it did, while the row says otherwise.
+    """
+    task = await _persist(state=EXECUTING)
+
+    async def _move(target: str) -> str:
+        async with async_session_factory() as session:
+            try:
+                moved = await transition_task(
+                    session,
+                    task_id=task.id,
+                    tenant_id=task.tenant_id,
+                    user_id=task.user_id,
+                    target=target,
+                )
+            except InvalidTransition:
+                return "refused"
+            return moved.state
+
+    outcomes = await asyncio.gather(
+        _move(WAITING_APPROVAL), _move(VERIFYING)
+    )
+    winners = [outcome for outcome in outcomes if outcome != "refused"]
+    assert len(winners) == 1, f"both writers were told they won: {outcomes}"
+
+    async with async_session_factory() as session:
+        final = await get_task(
+            session, task_id=task.id, tenant_id=task.tenant_id
+        )
+    assert final.state == winners[0]
 
 
 def test_contract_validation_errors_use_ids_not_row_content() -> None:

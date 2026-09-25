@@ -479,9 +479,18 @@ class ApprovalService:
 
         Terminal approvals are immutable: DENIED/EXPIRED/APPROVED can never be
         re-decided; changing direction requires a brand-new approval.
+
+        The row is locked for the whole check-decide-write. An approve racing a
+        reject is not a harmless last-writer-wins: without the lock both read
+        PENDING, both pass the immutability check, and both answer 200 with
+        their own answer - while the approval the gateway later reads is
+        whichever one happened to commit last. The loser blocks, re-reads, and
+        is refused as the immutability check requires.
         """
         current = _as_utc(now)
-        approval = await self._load(session, approval_id, tenant_id, user_id)
+        approval = await self._load_for_update(
+            session, approval_id, tenant_id, user_id
+        )
         approval = await self._maybe_expire(session, approval, current)
         if approval.status != ApprovalStatus.PENDING.value:
             if approval.status == ApprovalStatus.EXPIRED.value:
@@ -700,6 +709,34 @@ class ApprovalService:
                 Approval.tenant_id == tenant_id,
                 Approval.user_id == user_id,
             )
+        )
+        approval = result.scalar_one_or_none()
+        if approval is None:
+            raise ApprovalNotFoundError("approval not found for tenant")
+        return approval
+
+    async def _load_for_update(
+        self,
+        session: AsyncSession,
+        approval_id: UUID,
+        tenant_id: UUID,
+        user_id: UUID,
+    ) -> Approval:
+        """Lock the approval row and read it as it is right now.
+
+        The deciding session may have read this approval earlier in the same
+        request, so ``populate_existing`` makes sure the lock hands back the
+        row's real state rather than the session's cached image of it.
+        """
+        result = await session.execute(
+            select(Approval)
+            .where(
+                Approval.id == approval_id,
+                Approval.tenant_id == tenant_id,
+                Approval.user_id == user_id,
+            )
+            .with_for_update()
+            .execution_options(populate_existing=True)
         )
         approval = result.scalar_one_or_none()
         if approval is None:
