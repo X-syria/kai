@@ -12,14 +12,14 @@ fallback are used for every task created through the runtime.
 
 from __future__ import annotations
 
-import hashlib
-import json
 import re
 from collections.abc import Mapping
 from datetime import date, datetime, time, timedelta
 from typing import Any, Literal
 from uuid import UUID
 
+from kai.ir.build import action_id_for
+from kai.ir.program import canonical_fingerprint
 from kai.memory.models import MemoryType
 from kai.memory.service import retrieve_memory
 from kai.runtime.schemas import MeetingWindow, UnderstandingOutput
@@ -53,7 +53,11 @@ SLICE_CAPABILITIES: frozenset[str] = frozenset(
     }
 )
 
-_CAPABILITY_TO_TOOL: dict[str, str] = {
+#: The slice's capability→tool table. Public because the IR is built from it and
+#: both must agree: an action names a capability, and this is the one place that
+#: decides which tool backs it. The IR is handed this table rather than keeping a
+#: copy, so the two can never disagree.
+CAPABILITY_TO_TOOL: dict[str, str] = {
     "resolve_contact": "contacts.match",
     "read_calendar": "calendar.read_slots",
     "create_calendar_event": "calendar.create_event",
@@ -87,14 +91,12 @@ def plan_fingerprint(plan_json: Mapping[str, Any]) -> str:
     is re-persisted from validated data only, so identical content always
     hashes identically and any difference in the steps is visible. Used to bind
     the execution cursor to the exact plan it is counting.
+
+    The canonical form itself belongs to the IR (§3), so this is a delegation
+    rather than a second implementation of "the bytes of this plan" — there is
+    one definition and both callers get the same digest.
     """
-    serialized = json.dumps(
-        plan_json,
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=False,
-    )
-    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+    return canonical_fingerprint(dict(plan_json))
 
 
 def request_id_for(
@@ -102,13 +104,18 @@ def request_id_for(
 ) -> str:
     """Deterministic, resume-stable id for exactly one tool invocation.
 
-    Built only from the task, the bound plan version, the step, and the
-    invocation's position inside that step — never from wall-clock time or
-    randomness. A resumed trigger re-issues the identical id for the same
-    action, so evidence records and the audit trail stay correlatable, and two
-    different plan versions can never produce the same id.
+    Kept as the runtime's name for the identity the IR calls an action id. The
+    IR owns the derivation (§5) — built only from the task, the bound plan
+    version, the step, and the invocation's position inside that step, never
+    from wall-clock time or randomness — and the value is unchanged, so evidence
+    records, approval intent hashes, and request correlation all keep working.
     """
-    return f"runtime-{task_id}-{plan_version}-{step_order}-{index}"
+    return action_id_for(
+        task_id=task_id,
+        plan_version=plan_version,
+        step_order=step_order,
+        index=index,
+    )
 
 
 def extract_first_email(text: str) -> str | None:
@@ -226,7 +233,7 @@ def create_intent_args(
 def capability_to_tool(action: str) -> str | None:
     """The registered tool name for a plan capability, or ``None`` when the
     slice cannot represent it (always fail closed)."""
-    return _CAPABILITY_TO_TOOL.get(action)
+    return CAPABILITY_TO_TOOL.get(action)
 
 
 def content_category_for(tool_name: str) -> str:
@@ -245,6 +252,7 @@ def scenario_from_row(payload: Any) -> UnderstandingOutput:
 
 
 __all__ = [
+    "CAPABILITY_TO_TOOL",
     "SLICE_ALLOWED_TOOLS",
     "SLICE_CAPABILITIES",
     "SLICE_FALLBACK",

@@ -416,6 +416,32 @@ async def test_happy_path_with_approval(
     # calendar insert: at most one event is ever created.
     assert len(backend.created_events) == 1
 
+    # Every durable record is now IR-linked, and the linkage is internally
+    # consistent: one action identity, one program, one fingerprint for the whole
+    # run — and the action identity is the request id the Gateway saw.
+    evidence = await _internal_evidence(task_id)
+    assert evidence, "the run produced no evidence"
+    programs = {entry["ir_program_id"] for entry in evidence}
+    fingerprints = {entry["ir_fingerprint"] for entry in evidence}
+    assert len(programs) == 1, programs
+    assert len(fingerprints) == 1, fingerprints
+    for entry in evidence:
+        assert entry["ir_action_id"] == entry["request_id"]
+        assert entry["ir_action_id"].startswith("runtime-")
+    # The public projection stays redacted: no IR internals cross the boundary.
+    assert all(
+        set(record) == {
+            "step_order",
+            "tool",
+            "outcome",
+            "ok",
+            "verified",
+            "error_code",
+            "request_id",
+        }
+        for record in done["evidence"]
+    )
+
 
 async def _approve(client: httpx.AsyncClient, token: str, approval_id: str) -> None:
     resp = await client.post(

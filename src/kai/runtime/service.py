@@ -8,8 +8,16 @@
              -> PLANNING   (existing PlannerService.create_plan)
              -> POLICY_CHECK -> EXECUTING
              -> WAITING_APPROVAL  (a mid-flight approval checkpoint)
-             -> execute plan steps as ToolIntents through the Tool Gateway
+             -> build the validated KAI-IR program for the bound plan
+             -> execute its actions as ToolIntents through the Tool Gateway
              -> VERIFYING -> COMPLETED  (or FAILED / REQUIRES_ATTENTION)
+
+The IR program is the description of *what* is being executed: a closed,
+fingerprinted, derived value built from the sealed task contract, the bound plan,
+and the saved progress. It grants nothing and decides nothing — every action
+still goes to the Tool Gateway, which remains the only authority on policy,
+content, approval, account, and verification, and every task state still goes
+through the Task Manager machine.
 
 The Task Manager machine is the only writer of ``Task.state``: every step above
 goes through :func:`kai.tasks.service.transition_task`, so the task itself
@@ -20,7 +28,8 @@ Guarantees kept here:
 
 * Every tool execution goes through the Tool Gateway (policy, content,
   approval, verification, account). The runtime never calls the calendar,
-  contacts, or any adapter directly.
+  contacts, or any adapter directly. The KAI-IR program describes the actions;
+  it does not reach a tool any other way.
 * All LLM output is data. Understanding and planning are gated on task state so
   a resume never re-runs the model; persistence (``RuntimeExecution``) carries
   scenario + identities + evidence + cursor for deterministic, LLM-free resume.
@@ -49,7 +58,6 @@ Guarantees kept here:
 from __future__ import annotations
 
 import asyncio
-import json
 from collections.abc import Sequence
 from contextlib import suppress
 from dataclasses import dataclass
@@ -68,6 +76,16 @@ from kai.db.models import GoogleAccount
 from kai.identity.models import IdentityStatus
 from kai.identity.schemas import IdentityQuery
 from kai.identity.service import IdentityResolver
+from kai.ir.adapter import (
+    action_for,
+    attach,
+    evidence_from_observation,
+    intent_from_action,
+    observation_from_result,
+)
+from kai.ir.build import allowed_capabilities_from_task, program_from_plan
+from kai.ir.errors import IrValidationError
+from kai.ir.program import KaiProgram
 from kai.logging import get_logger
 from kai.memory.models import MemoryType
 from kai.memory.service import retrieve_memory
@@ -84,6 +102,7 @@ from kai.planner.service import (
 from kai.runtime.models import RuntimeExecution
 from kai.runtime.schemas import GoalSubmission, UnderstandingOutput
 from kai.runtime.translator import (
+    CAPABILITY_TO_TOOL,
     build_slice_contract,
     candidate_days,
     capability_to_tool,
@@ -94,7 +113,6 @@ from kai.runtime.translator import (
     pick_slot,
     plan_fingerprint,
     read_intent_args,
-    request_id_for,
 )
 from kai.runtime.understanding import UnderstandingFailed, understand_scenario
 from kai.tasks.models import Task
@@ -115,8 +133,7 @@ from kai.tasks.state import (
 )
 from kai.tools.context import ToolContext
 from kai.tools.gateway import ToolGateway
-from kai.tools.intent import ToolIntent
-from kai.tools.result import ToolOutcome, ToolResult
+from kai.tools.result import ToolOutcome
 
 _RESUMABLE_STATES: frozenset[str] = frozenset(
     {
@@ -522,7 +539,7 @@ class AgentRuntime:
         # that changed underneath them can no longer be resumed from it, and
         # guessing would either skip the new plan's steps or re-run finished
         # ones (a duplicate calendar insert).
-        bound, plan_version = await self._bind_plan(session, row, plan, claim)
+        bound, plan_version, plan_hash = await self._bind_plan(session, row, plan, claim)
         if not bound:
             return await self._halt(
                 session,
@@ -582,6 +599,8 @@ class AgentRuntime:
             scenario=scenario,
             proposal=proposal,
             plan_version=plan_version,
+            plan_hash=plan_hash,
+            plan_status=plan.status,
             transport=transport,
             account=account,
             claim=claim,
@@ -664,6 +683,8 @@ class AgentRuntime:
         scenario: UnderstandingOutput,
         proposal: PlanProposal,
         plan_version: int,
+        plan_hash: str,
+        plan_status: str,
         transport: Any,
         account: GoogleAccount,
         claim: UUID,
@@ -677,7 +698,24 @@ class AgentRuntime:
         created_event_id = _created_event_id(evidence)
 
         try:
-            for step in proposal.steps:
+            # Stage 5b - the program this trigger is executing. Derived from the
+            # sealed contract, the bound plan, and the saved progress, so it is
+            # the same audited program on every resume; nothing about it is
+            # persisted as a new authority, because the cursor, the evidence, and
+            # the plan binding on ``RuntimeExecution`` remain what actually drive
+            # recovery. An unsupported or unbuildable plan is refused here and
+            # fails the task through the machine, exactly as an unsupported
+            # capability used to — validation runs before any tool is reached.
+            program = self._program_for(
+                task,
+                proposal=proposal,
+                plan_status=plan_status,
+                plan_version=plan_version,
+                plan_hash=plan_hash,
+                row=row,
+            )
+
+            for step in program.plan.steps:
                 if step.order <= cursor:
                     # Completed on an earlier trigger. Never re-run: re-running
                     # a finished calendar insert would create a duplicate event.
@@ -686,7 +724,7 @@ class AgentRuntime:
                     session, task_id=task.id, tenant_id=task.tenant_id, claim=claim
                 )
                 intents = self._intents_for(
-                    step.action,
+                    step.capability,
                     scenario=scenario,
                     identities=identities,
                     collected=collected,
@@ -695,18 +733,24 @@ class AgentRuntime:
                 )
                 for index, (tool_name, args, identity) in enumerate(intents):
                     steps_used += 1
-                    intent = ToolIntent(
-                        tool_name=tool_name,
+                    # The invocation is described as IR first and translated into
+                    # a ToolIntent second. Nothing else changes: the same Gateway,
+                    # the same fences, the same durable record, the same request
+                    # id — the IR sits between the plan and the call.
+                    action = action_for(
+                        step=step,
+                        index=index,
+                        capability=step.capability,
                         arguments=args,
+                        task_id=task.id,
+                        plan_version=plan_version,
+                    )
+                    intent = intent_from_action(
+                        action,
+                        tool_name=tool_name,
                         task_id=task.id,
                         tenant_id=task.tenant_id,
                         user_id=task.user_id,
-                        request_id=request_id_for(
-                            task_id=task.id,
-                            plan_version=plan_version,
-                            step_order=step.order,
-                            index=index,
-                        ),
                     )
                     context = ToolContext(
                         session=session,
@@ -730,7 +774,14 @@ class AgentRuntime:
                         claim=claim,
                     )
                     result = await self.gateway.execute(intent, context)
-                    evidence.append(_record(step.order, tool_name, args, result))
+                    observation = observation_from_result(
+                        action=action, step_order=step.order, result=result
+                    )
+                    attach(program, observation)
+                    record = evidence_from_observation(observation, tool_name=tool_name)
+                    record["ir_program_id"] = str(program.program_id)
+                    record["ir_fingerprint"] = program.fingerprint
+                    evidence.append(record)
                     row.evidence = list(evidence)
                     row.steps_used = steps_used
 
@@ -787,9 +838,7 @@ class AgentRuntime:
                         return TriggerOutcome(target, target, message, [], steps_used)
 
                     if tool_name == "calendar.read_slots":
-                        collected.extend(
-                            _read_slot_items([_record(step.order, tool_name, args, result)])
-                        )
+                        collected.extend(_read_slot_items([record]))
                     elif tool_name == "calendar.create_event":
                         event_id = (result.evidence or {}).get("event_id")
                         if event_id:
@@ -857,6 +906,51 @@ class AgentRuntime:
             "verified execution did not satisfy the task success criteria",
             steps_used=row.steps_used,
         )
+
+    def _program_for(
+        self,
+        task: Task,
+        *,
+        proposal: PlanProposal,
+        plan_status: str,
+        plan_version: int,
+        plan_hash: str,
+        row: RuntimeExecution,
+    ) -> KaiProgram:
+        """Build and validate the KAI-IR program for this task's current plan.
+
+        Refuses rather than repairs: an unbuildable program means the plan, the
+        contract, and the catalog disagree, and the only safe response is to stop
+        instead of executing a plan whose declared permissions cannot be trusted
+        (spec §2.1).
+        """
+        registry = getattr(self.gateway, "registry", None)
+        # An unsupported capability is refused here, before the program is built,
+        # with the runtime's own wording — the same refusal the runtime used to
+        # make mid-step, moved earlier so nothing can be reached first. The IR
+        # validates the same constraint as a backstop, but a plan the slice
+        # cannot execute is a runtime fact, not a validation detail.
+        allowed = set(allowed_capabilities_from_task(task, CAPABILITY_TO_TOOL))
+        for step in proposal.steps:
+            if step.action not in allowed:
+                raise RuntimeFatal(
+                    f"capability not supported by the agent runtime slice: "
+                    f"{step.action}"
+                )
+        try:
+            return program_from_plan(
+                task=task,
+                plan_version=plan_version,
+                plan_status=plan_status,
+                proposal=proposal,
+                plan_hash=plan_hash,
+                registry=registry,
+                capability_to_tool=CAPABILITY_TO_TOOL,
+                cursor=row.cursor,
+                steps_used=row.steps_used,
+            )
+        except IrValidationError as exc:
+            raise RuntimeFatal(f"plan is not valid KAI-IR: {exc}") from exc
 
     def _intents_for(
         self,
@@ -937,11 +1031,11 @@ class AgentRuntime:
     @staticmethod
     async def _bind_plan(
         session: AsyncSession, row: RuntimeExecution, plan: TaskPlan, claim: UUID
-    ) -> tuple[bool, int]:
+    ) -> tuple[bool, int, str]:
         """Bind the saved cursor to the plan version it counts, or refuse.
 
-        Returns ``(bound, plan_version)``. ``bound`` is False only when the row
-        is already counting a *different* plan and has work on record: the
+        Returns ``(bound, plan_version, plan_hash)``. ``bound`` is False only when
+        the row is already counting a *different* plan and has work on record: the
         cursor then describes steps that no longer exist, and reusing it would
         silently skip the current plan's steps or re-execute finished ones. In
         that case the trigger must stop instead of guessing.
@@ -949,13 +1043,17 @@ class AgentRuntime:
         Re-binding is allowed only while nothing has run yet (no cursor
         progress, no evidence, no step spent), which is the one case where the
         saved state cannot contradict a different plan.
+
+        The hash comes back because the IR program is bound to exactly this
+        plan content: the same digest that pins the cursor also pins the program,
+        so a program can never be executed against a plan it was not built from.
         """
         version = plan.version
         digest = plan_fingerprint(plan.plan_json)
         if row.plan_version == version and row.plan_hash == digest:
-            return True, version
+            return True, version, digest
         if row.cursor > 0 or row.evidence or row.steps_used > 0:
-            return False, version
+            return False, version, digest
         row.plan_version = version
         row.plan_hash = digest
         await AgentRuntime._fence_execution(
@@ -964,7 +1062,7 @@ class AgentRuntime:
             tenant_id=row.tenant_id,
             claim=claim,
         )
-        return True, version
+        return True, version, digest
 
     @staticmethod
     async def _claim_execution(
@@ -1227,38 +1325,6 @@ def _plan_diverged(bound_version: int | None, current_version: int) -> str:
         f"{bound_version}, current plan is v{current_version}); the saved cursor "
         "was not reused and no step was executed"
     )
-
-
-def _record(
-    step_order: int,
-    tool_name: str,
-    args: dict[str, Any],
-    result: ToolResult,
-) -> dict[str, Any]:
-    """One durable, JSON-safe evidence entry for a tool invocation."""
-    return {
-        "step_order": step_order,
-        "tool": tool_name,
-        "args": _json_safe(args),
-        "outcome": result.outcome.value,
-        "ok": bool(result.ok),
-        "verified": bool(result.verified),
-        "error_code": result.error_code,
-        "message": result.message,
-        "data": _json_safe(result.data),
-        "evidence": _json_safe(dict(result.evidence)),
-        "request_id": result.request_id,
-    }
-
-
-def _json_safe(value: Any) -> Any:
-    """Coerce a provider payload to JSON-safe values, dropping what is not."""
-    if value is None or isinstance(value, (str, int, float, bool)):
-        return value
-    try:
-        return json.loads(json.dumps(value, default=str))
-    except (TypeError, ValueError):
-        return None
 
 
 def _read_slot_items(
