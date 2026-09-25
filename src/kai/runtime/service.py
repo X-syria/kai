@@ -27,6 +27,10 @@ Guarantees kept here:
 * The cursor only advances past a step whose intents all succeeded, and
   completed steps are never re-executed — a stopped approval checkpoint or a
   transient network failure can never cause a duplicate calendar insert.
+* The cursor counts the steps of exactly one plan: it is bound to a plan
+  version and that version's content hash. A plan re-proposed after execution
+  started is refused, never silently resumed against the old cursor, and the
+  refusal rewinds nothing and re-executes nothing.
 * One trigger owns one execution at a time. The per-task claim
   (``RuntimeExecution.claim_token``) is claimed and released in short committed
   transactions and is *never* held across an external provider call, so a
@@ -56,6 +60,7 @@ from kai.identity.service import IdentityResolver
 from kai.memory.models import MemoryType
 from kai.memory.service import retrieve_memory
 from kai.planner.model import PlannerModel
+from kai.planner.models import TaskPlan
 from kai.planner.schemas import PlanProposal
 from kai.planner.service import (
     ModelUnavailableError,
@@ -75,7 +80,9 @@ from kai.runtime.translator import (
     memory_email_hint,
     parse_free_intervals,
     pick_slot,
+    plan_fingerprint,
     read_intent_args,
+    request_id_for,
 )
 from kai.runtime.understanding import UnderstandingFailed, understand_scenario
 from kai.tasks.models import Task
@@ -86,6 +93,7 @@ from kai.tasks.state import (
     FAILED,
     PLANNING,
     POLICY_CHECK,
+    REQUIRES_ATTENTION,
     UNDERSTANDING,
     VERIFYING,
     WAITING_APPROVAL,
@@ -361,6 +369,19 @@ class AgentRuntime:
         except PlanNotFoundError as exc:
             return await self._fail(session, task, str(exc))
 
+        # Stage 3b - bind the cursor to the plan it is counting on. The cursor
+        # and the persisted scenario/evidence describe *these* steps; a plan
+        # that changed underneath them can no longer be resumed from it, and
+        # guessing would either skip the new plan's steps or re-run finished
+        # ones (a duplicate calendar insert).
+        bound, plan_version = await self._bind_plan(session, row, plan)
+        if not bound:
+            return await self._halt(
+                session,
+                task,
+                _plan_diverged(row.plan_version, plan.version),
+            )
+
         # Stage 4 - promote through the machine. A task parked in
         # WAITING_APPROVAL whose approval is still pending is a no-op: it stays
         # in that real state instead of bouncing through EXECUTING.
@@ -408,6 +429,7 @@ class AgentRuntime:
             row=row,
             scenario=scenario,
             proposal=proposal,
+            plan_version=plan_version,
             transport=transport,
             account=account,
         )
@@ -488,6 +510,7 @@ class AgentRuntime:
         row: RuntimeExecution,
         scenario: UnderstandingOutput,
         proposal: PlanProposal,
+        plan_version: int,
         transport: Any,
         account: GoogleAccount,
     ) -> TriggerOutcome:
@@ -513,7 +536,7 @@ class AgentRuntime:
                     created_event_id=created_event_id,
                     timezone=row.timezone,
                 )
-                for tool_name, args, identity in intents:
+                for index, (tool_name, args, identity) in enumerate(intents):
                     steps_used += 1
                     intent = ToolIntent(
                         tool_name=tool_name,
@@ -521,7 +544,12 @@ class AgentRuntime:
                         task_id=task.id,
                         tenant_id=task.tenant_id,
                         user_id=task.user_id,
-                        request_id=f"runtime-{task.id}-{step.order}",
+                        request_id=request_id_for(
+                            task_id=task.id,
+                            plan_version=plan_version,
+                            step_order=step.order,
+                            index=index,
+                        ),
                     )
                     context = ToolContext(
                         session=session,
@@ -705,6 +733,33 @@ class AgentRuntime:
         return result.scalar_one_or_none()
 
     @staticmethod
+    async def _bind_plan(
+        session: AsyncSession, row: RuntimeExecution, plan: TaskPlan
+    ) -> tuple[bool, int]:
+        """Bind the saved cursor to the plan version it counts, or refuse.
+
+        Returns ``(bound, plan_version)``. ``bound`` is False only when the row
+        is already counting a *different* plan and has work on record: the
+        cursor then describes steps that no longer exist, and reusing it would
+        silently skip the current plan's steps or re-execute finished ones. In
+        that case the trigger must stop instead of guessing.
+
+        Re-binding is allowed only while nothing has run yet (no cursor
+        progress, no evidence, no step spent), which is the one case where the
+        saved state cannot contradict a different plan.
+        """
+        version = plan.version
+        digest = plan_fingerprint(plan.plan_json)
+        if row.plan_version == version and row.plan_hash == digest:
+            return True, version
+        if row.cursor > 0 or row.evidence or row.steps_used > 0:
+            return False, version
+        row.plan_version = version
+        row.plan_hash = digest
+        await session.commit()
+        return True, version
+
+    @staticmethod
     async def _claim_execution(
         session: AsyncSession, *, task_id: UUID, tenant_id: UUID
     ) -> UUID | None:
@@ -804,6 +859,39 @@ class AgentRuntime:
             fail_reason=reason,
         )
         return TriggerOutcome("FAILED", "FAILED", reason, [], 0)
+
+    @classmethod
+    async def _halt(
+        cls,
+        session: AsyncSession,
+        task: Task,
+        reason: str,
+    ) -> TriggerOutcome:
+        """Stop a task that has run, but cannot continue on its own.
+
+        ``REQUIRES_ATTENTION`` and not ``FAILED``: the work already happened, so
+        a human has to decide what the task means now. The saved cursor and its
+        evidence are left exactly as they are — nothing is rewound, nothing is
+        re-executed.
+        """
+        await transition_task(
+            session,
+            task_id=task.id,
+            tenant_id=task.tenant_id,
+            user_id=task.user_id,
+            target=REQUIRES_ATTENTION,
+            fail_reason=reason,
+        )
+        return TriggerOutcome("REQUIRES_ATTENTION", "REQUIRES_ATTENTION", reason, [], 0)
+
+
+def _plan_diverged(bound_version: int | None, current_version: int) -> str:
+    """Deterministic, non-sensitive reason for a refused resume."""
+    return (
+        f"plan changed after execution started (saved cursor is bound to plan v"
+        f"{bound_version}, current plan is v{current_version}); the saved cursor "
+        "was not reused and no step was executed"
+    )
 
 
 def _record(

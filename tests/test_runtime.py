@@ -9,6 +9,7 @@ Identity Resolver's contacts handling, and the state machine all stay real.
 from __future__ import annotations
 
 import asyncio
+import json
 import subprocess
 import sys
 from collections.abc import AsyncIterator, Iterator
@@ -307,6 +308,9 @@ async def test_submit_creates_sealed_contract(client: httpx.AsyncClient) -> None
         assert row.timezone == TIMEZONE
         assert row.cursor == 0
         assert row.steps_used == 0
+        # Nothing has planned yet, so the cursor is bound to nothing.
+        assert row.plan_version is None
+        assert row.plan_hash is None
 
     snapshot = await _inspect(client, token, task_id)
     assert snapshot["next_action"] == "EXECUTE"
@@ -358,7 +362,8 @@ async def test_happy_path_with_approval(
     assert snapshot["task_state"] == "WAITING_APPROVAL"
     assert snapshot["next_action"] == "APPROVE"
     assert snapshot["scenario"]["guests"] == [ATTENDEE_NAME]
-    assert snapshot["identities"][0]["email"] == ATTENDEE_EMAIL
+    # The public identity is masked; the resolved address stays internal.
+    assert snapshot["identities"][0]["email"] == "a***@example.com"
     assert snapshot["identities"][0]["status"] == "CONTACT_MATCH"
     assert snapshot["steps_used"] >= 5
 
@@ -464,6 +469,26 @@ async def _row(task_id: str) -> tuple[int, int, int, int]:
             )
         ).scalar_one()
         return row.cursor, row.steps_used, len(row.evidence), 0 if row.claim_token is None else 1
+
+
+async def _internal_row(task_id: str):
+    """The persisted execution envelope, read straight from the database."""
+    from kai.runtime.models import RuntimeExecution
+
+    async with async_session_factory() as session:
+        return (
+            await session.execute(
+                select(RuntimeExecution).where(
+                    RuntimeExecution.task_id == UUID(task_id)
+                )
+            )
+        ).scalar_one()
+
+
+async def _internal_evidence(task_id: str) -> list[dict]:
+    """The raw persisted evidence records, bypassing every projection."""
+    row = await _internal_row(task_id)
+    return list(row.evidence)
 
 
 def _create_attempts(snapshot: dict) -> list[dict]:
@@ -694,6 +719,436 @@ def datetime_parse(raw: str) -> datetime:
 
 
 # ----------------------------------------------------------------------------------
+# R1: the cursor is bound to the plan version it counts
+# ----------------------------------------------------------------------------------
+
+
+async def test_cursor_is_bound_to_the_plan_version_that_produced_it(
+    client: httpx.AsyncClient,
+    backend: GoogleBackend,
+) -> None:
+    """The cursor is only ever interpreted against the plan it belongs to."""
+    from kai.planner.models import TaskPlan
+    from kai.runtime.translator import plan_fingerprint
+
+    token, task_id, approval_id = await _ready_task(client, "khaled@example.com")
+
+    row = await _internal_row(task_id)
+    async with async_session_factory() as session:
+        plan = (
+            await session.execute(
+                select(TaskPlan).where(
+                    TaskPlan.task_id == UUID(task_id),
+                    TaskPlan.status == "ACCEPTED",
+                )
+            )
+        ).scalar_one()
+
+    assert plan.version == 1
+    assert row.plan_version == plan.version
+    assert row.plan_hash == plan_fingerprint(plan.plan_json)
+    assert row.cursor == 2
+    assert row.steps_used > 0
+
+    await _approve(client, token, approval_id)
+    done = await _trigger(client, token, task_id)
+    assert done["outcome"] == "COMPLETED", done
+
+    # The binding survives the resume unchanged: same plan, same hash.
+    after = await _internal_row(task_id)
+    assert after.plan_version == plan.version
+    assert after.plan_hash == plan_fingerprint(plan.plan_json)
+    assert after.cursor == 4
+
+
+async def test_replan_mid_flight_never_reuses_the_saved_cursor(
+    client: httpx.AsyncClient,
+    backend: GoogleBackend,
+) -> None:
+    """A different plan after steps have run stops the task; it never guesses."""
+    from kai.planner.models import TaskPlan
+
+    token, task_id, approval_id = await _ready_task(client, "khaled@example.com")
+    await _approve(client, token, approval_id)
+
+    before_row = await _internal_row(task_id)
+    before_evidence = list(before_row.evidence)
+    assert before_row.cursor > 0
+    assert before_row.steps_used > 0
+    events_before = len(backend.created_events)
+
+    # A re-plan lands: the same task now points at a *new* accepted version
+    # with a different step list, exactly as a re-planned task would.
+    async with async_session_factory() as session:
+        current = (
+            await session.execute(
+                select(TaskPlan).where(
+                    TaskPlan.task_id == UUID(task_id),
+                    TaskPlan.status == "ACCEPTED",
+                )
+            )
+        ).scalar_one()
+        replacement = _valid_plan(
+            steps=[
+                {
+                    "step_id": "s1",
+                    "order": 1,
+                    "action": "resolve_contact",
+                    "purpose": "find the attendee",
+                    "inputs": [ATTENDEE_NAME],
+                    "expected_output": "contact identity",
+                    "verification_hint": "exact email match",
+                },
+                {
+                    "step_id": "s2",
+                    "order": 2,
+                    "action": "verify_calendar_event",
+                    "purpose": "a completely different second step",
+                    "inputs": [],
+                    "expected_output": "nothing",
+                    "verification_hint": "nothing",
+                },
+            ]
+        )
+        current.status = "SUPERSEDED"
+        session.add(
+            TaskPlan(
+                tenant_id=current.tenant_id,
+                task_id=current.task_id,
+                version=current.version + 1,
+                status="ACCEPTED",
+                plan_json=replacement,
+                model_id=current.model_id,
+            )
+        )
+        await session.commit()
+
+    outcome = await _trigger(client, token, task_id)
+    assert outcome["task_state"] == "REQUIRES_ATTENTION", outcome
+    assert "plan changed after execution started" in outcome["message"]
+    assert f"v{before_row.plan_version}" in outcome["message"]
+
+    # The refusal executes nothing, rewinds nothing, and adds no record.
+    assert len(backend.created_events) == events_before
+    after_row = await _internal_row(task_id)
+    assert after_row.cursor == before_row.cursor
+    assert after_row.steps_used == before_row.steps_used
+    assert list(after_row.evidence) == before_evidence
+    # It stays bound to the plan it was actually counting.
+    assert after_row.plan_version == before_row.plan_version
+    assert after_row.plan_hash == before_row.plan_hash
+
+    # And the refusal is stable: replaying the trigger cannot slip through.
+    replay = await client.post(
+        f"{API_PREFIX}/runtime/tasks/{task_id}/trigger",
+        headers=_auth(token),
+    )
+    assert replay.status_code == 409, replay.text
+    assert (await _inspect(client, token, task_id))["task_state"] == "REQUIRES_ATTENTION"
+    assert len(backend.created_events) == events_before
+
+
+async def test_plan_rebind_is_allowed_before_any_step_has_run(
+    client: httpx.AsyncClient,
+    backend: GoogleBackend,
+) -> None:
+    """With no work on record, adopting a new plan is safe and must succeed."""
+    from kai.planner.models import TaskPlan
+    from kai.runtime.translator import plan_fingerprint
+
+    token, task_id, approval_id = await _ready_task(client, "khaled@example.com")
+    await _approve(client, token, approval_id)
+
+    # Wipe only the binding and the progress, keeping the task runnable: this
+    # is the "nothing has run yet" case the rebind exists for.
+    async with async_session_factory() as session:
+        from kai.runtime.models import RuntimeExecution
+
+        row = (
+            await session.execute(
+                select(RuntimeExecution).where(
+                    RuntimeExecution.task_id == UUID(task_id)
+                )
+            )
+        ).scalar_one()
+        row.plan_version = 99
+        row.plan_hash = "0" * 64
+        row.cursor = 0
+        row.steps_used = 0
+        row.evidence = []
+        await session.commit()
+        stale = row.plan_version
+
+    assert stale == 99
+    events_before = len(backend.created_events)
+
+    done = await _trigger(client, token, task_id)
+    assert done["task_state"] == "COMPLETED", done
+    assert len(backend.created_events) == events_before + 1
+
+    async with async_session_factory() as session:
+        plan = (
+            await session.execute(
+                select(TaskPlan).where(
+                    TaskPlan.task_id == UUID(task_id),
+                    TaskPlan.status == "ACCEPTED",
+                )
+            )
+        ).scalar_one()
+        assert plan.version == 1
+    row = await _internal_row(task_id)
+    assert row.plan_version == plan.version
+    assert row.plan_hash == plan_fingerprint(plan.plan_json)
+
+
+# ----------------------------------------------------------------------------------
+# R2: deterministic, version-scoped request ids
+# ----------------------------------------------------------------------------------
+
+
+async def test_request_id_is_deterministic_and_scoped_to_the_plan_version(
+    client: httpx.AsyncClient,
+    backend: GoogleBackend,
+) -> None:
+    """One logical action always yields the same id, and never across versions."""
+    from kai.runtime.translator import request_id_for
+
+    task = UUID("11111111-2222-3333-4444-555555555555")
+    for order in (1, 2, 3):
+        for index in (0, 1):
+            produced = request_id_for(
+                task_id=task, plan_version=1, step_order=order, index=index
+            )
+            assert produced == request_id_for(
+                task_id=task, plan_version=1, step_order=order, index=index
+            )
+            # A different plan version, step, or position is a different action.
+            assert produced != request_id_for(
+                task_id=task, plan_version=2, step_order=order, index=index
+            )
+            assert produced != request_id_for(
+                task_id=task, plan_version=1, step_order=order + 1, index=index
+            )
+            assert produced != request_id_for(
+                task_id=task, plan_version=1, step_order=order, index=index + 1
+            )
+
+    token, task_id, approval_id = await _ready_task(client, "khaled@example.com")
+    row = await _internal_row(task_id)
+    assert row.plan_version == 1
+
+    recorded = [entry["request_id"] for entry in row.evidence]
+    assert recorded, "the paused task must have recorded evidence"
+    for entry in row.evidence:
+        expected = request_id_for(
+            task_id=UUID(task_id),
+            plan_version=row.plan_version,
+            step_order=entry["step_order"],
+            index=0,
+        )
+        # The first trigger only ever issues index 0 per step.
+        assert entry["request_id"].startswith(expected[: -len("0")])
+    # The same step retried across a resume reuses its id; two different steps
+    # never share one.
+    assert len(set(recorded)) == len(recorded)
+
+
+async def test_resume_reissues_the_same_request_id_for_the_same_action(
+    client: httpx.AsyncClient,
+    backend: GoogleBackend,
+) -> None:
+    """Approving and resuming must not invent a new identity for the action."""
+    from kai.runtime.translator import request_id_for
+
+    token, task_id, approval_id = await _ready_task(client, "khaled@example.com")
+    paused = await _internal_evidence(task_id)
+    create_before = [
+        entry
+        for entry in paused
+        if entry["tool"] == "calendar.create_event"
+    ]
+    assert create_before, "the create step must have been attempted before approval"
+
+    await _approve(client, token, approval_id)
+    done = await _trigger(client, token, task_id)
+    assert done["outcome"] == "COMPLETED", done
+
+    finished = await _internal_evidence(task_id)
+    create_after = [
+        entry
+        for entry in finished
+        if entry["tool"] == "calendar.create_event"
+    ]
+    # The blocked attempt and the successful one are the *same* action, so they
+    # carry the same deterministic id.
+    assert {entry["request_id"] for entry in create_after} == {
+        request_id_for(
+            task_id=UUID(task_id), plan_version=1, step_order=3, index=0
+        )
+    }
+    assert len(create_after) >= 2
+    assert sum(1 for entry in create_after if entry["ok"]) == 1
+    assert len(backend.created_events) == 1
+
+
+# ----------------------------------------------------------------------------------
+# R3: the public snapshot is a redacted projection
+# ----------------------------------------------------------------------------------
+
+
+async def test_public_snapshot_never_exposes_raw_evidence_or_attendee_data(
+    client: httpx.AsyncClient,
+    backend: GoogleBackend,
+) -> None:
+    """No arguments, no provider payload, no unmasked address crosses the API."""
+    token, task_id, approval_id = await _ready_task(client, "khaled@example.com")
+    await _approve(client, token, approval_id)
+    assert (await _trigger(client, token, task_id))["outcome"] == "COMPLETED"
+
+    snapshot = await _inspect(client, token, task_id)
+    body = json.dumps(snapshot, ensure_ascii=False)
+
+    # The attendee address is nowhere in the response, in any form.
+    assert ATTENDEE_EMAIL not in body
+    assert "ahmed@example.com" not in body
+    assert snapshot["identities"][0]["email"] == "a***@example.com"
+
+    # Every published record is exactly the redacted shape: no arguments, no
+    # provider payload, no verification evidence, no free-text message.
+    allowed = {
+        "step_order",
+        "tool",
+        "outcome",
+        "ok",
+        "verified",
+        "error_code",
+        "request_id",
+    }
+    assert snapshot["evidence"]
+    for entry in snapshot["evidence"]:
+        assert set(entry) == allowed
+        # The content those removed keys held is nowhere in the publication.
+        for leaked in ("args", "data", "message", "attendees", "title"):
+            assert leaked not in entry
+    published = json.dumps(
+        {"evidence": snapshot["evidence"], "identities": snapshot["identities"]},
+        ensure_ascii=False,
+    )
+    # The name is the user's own input and is kept; the meeting title that the
+    # tool built from it is not published.
+    assert snapshot["identities"][0]["name"] == ATTENDEE_NAME
+    assert "اجتماع" not in published
+
+    # And the identity projection carries only the redacted fields.
+    assert set(snapshot["identities"][0]) == {
+        "name",
+        "status",
+        "confidence",
+        "email",
+    }
+
+
+async def test_redaction_is_presentation_only_and_internal_evidence_is_intact(
+    client: httpx.AsyncClient,
+    backend: GoogleBackend,
+) -> None:
+    """Resume and verification still read the full, unredacted record."""
+    token, task_id, approval_id = await _ready_task(client, "khaled@example.com")
+    await _approve(client, token, approval_id)
+    assert (await _trigger(client, token, task_id))["outcome"] == "COMPLETED"
+
+    stored = await _internal_evidence(task_id)
+    assert stored, "the durable evidence must survive"
+    created = [entry for entry in stored if entry["tool"] == "calendar.create_event"]
+    assert created
+    successful = [entry for entry in created if entry["ok"]]
+    assert len(successful) == 1
+    # Everything the redaction removed is still on the row, and it is what the
+    # verification step read to prove the meeting really was created.
+    record = successful[0]
+    assert record["args"]["attendees"] == [ATTENDEE_EMAIL]
+    assert record["args"]["title"] == "اجتماع مع " + ATTENDEE_NAME
+    assert record["verified"] is True
+    assert record["evidence"]["event_id"]
+    assert record["data"]["event_id"] == record["evidence"]["event_id"]
+    assert record["data"]["title"] == record["args"]["title"]
+
+    verify_call = [
+        entry
+        for entry in stored
+        if entry["tool"] == "calendar.get_event" and entry["ok"]
+    ]
+    assert verify_call, "the read-back verification call is still recorded"
+
+
+async def test_redaction_never_widens_on_unexpected_stored_shapes() -> None:
+    """A record this projection cannot parse is dropped, not passed through."""
+    from kai.runtime.schemas import redact_evidence, redact_identities
+
+    published = redact_evidence([{"step_order": 1, "tool": "t", "outcome": "o"}])
+    assert len(published) == 1
+    assert published[0].ok is False
+    assert published[0].verified is False
+    assert published[0].error_code is None
+    assert published[0].request_id is None
+    # Malformed entries vanish; nothing unexpected is echoed.
+    assert redact_evidence(
+        [
+            "not a dict",
+            {"step_order": "one", "tool": "t", "outcome": "o"},
+            {"tool": "t", "outcome": "o"},
+            {"step_order": 1, "outcome": "o"},
+        ]
+    ) == []
+    assert redact_identities(
+        [
+            "nope",
+            {"name": 1, "status": "CONTACT_MATCH"},
+            {"status": "CONTACT_MATCH"},
+        ]
+    ) == []
+
+    # A record carrying unexpected sensitive keys still publishes only the
+    # allow-listed ones.
+    published = redact_evidence(
+        [
+            {
+                "step_order": 2,
+                "tool": "calendar.create_event",
+                "outcome": "EXECUTION_SUCCEEDED",
+                "ok": True,
+                "verified": True,
+                "args": {"attendees": ["secret@example.com"]},
+                "data": {"access_token": "tok"},
+                "evidence": {"event_id": "e-1"},
+                "message": "provider said hello",
+            }
+        ]
+    )
+    assert len(published) == 1
+    assert set(published[0].model_dump()) == {
+        "step_order",
+        "tool",
+        "outcome",
+        "ok",
+        "verified",
+        "error_code",
+        "request_id",
+    }
+    assert "secret@example.com" not in json.dumps(
+        [entry.model_dump() for entry in published]
+    )
+
+    # A malformed address is masked away, never echoed.
+    assert redact_identities(
+        [{"name": "A", "status": "CONTACT_MATCH", "confidence": 1.0, "email": "not-an-email"}]
+    )[0].email is None
+    assert redact_identities(
+        [{"name": "A", "status": "CONTACT_MATCH", "confidence": "x", "email": "a@b.com"}]
+    )[0].confidence == 0.0
+
+
+# ----------------------------------------------------------------------------------
 # Failure paths
 # ----------------------------------------------------------------------------------
 
@@ -914,7 +1369,7 @@ async def test_trigger_rejects_unknown_task(client: httpx.AsyncClient) -> None:
 # ----------------------------------------------------------------------------------
 
 REVISION_PREV = "d1a2b3c4e5f6"
-REVISION_HEAD = "f1e2d3c4b5a6"
+REVISION_HEAD = "b3d5f7a9c1e2"
 
 
 def _alembic(*args: str) -> subprocess.CompletedProcess[str]:

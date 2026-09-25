@@ -12,9 +12,13 @@ fallback are used for every task created through the runtime.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
+from collections.abc import Mapping
 from datetime import date, datetime, time, timedelta
 from typing import Any, Literal
+from uuid import UUID
 
 from kai.memory.models import MemoryType
 from kai.memory.service import retrieve_memory
@@ -74,6 +78,37 @@ def build_slice_contract(goal: str) -> TaskContractInput:
         verification_method=SLICE_VERIFICATION_METHOD,
         fallback=SLICE_FALLBACK,
     )
+
+
+def plan_fingerprint(plan_json: Mapping[str, Any]) -> str:
+    """Stable SHA-256 hex digest of one persisted plan's canonical form.
+
+    The digest pins the *content* of a plan version, not just its number: a row
+    is re-persisted from validated data only, so identical content always
+    hashes identically and any difference in the steps is visible. Used to bind
+    the execution cursor to the exact plan it is counting.
+    """
+    serialized = json.dumps(
+        plan_json,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def request_id_for(
+    *, task_id: UUID, plan_version: int, step_order: int, index: int
+) -> str:
+    """Deterministic, resume-stable id for exactly one tool invocation.
+
+    Built only from the task, the bound plan version, the step, and the
+    invocation's position inside that step — never from wall-clock time or
+    randomness. A resumed trigger re-issues the identical id for the same
+    action, so evidence records and the audit trail stay correlatable, and two
+    different plan versions can never produce the same id.
+    """
+    return f"runtime-{task_id}-{plan_version}-{step_order}-{index}"
 
 
 def extract_first_email(text: str) -> str | None:
@@ -226,6 +261,8 @@ __all__ = [
     "memory_email_hint",
     "parse_free_intervals",
     "pick_slot",
+    "plan_fingerprint",
     "read_intent_args",
+    "request_id_for",
     "scenario_from_row",
 ]

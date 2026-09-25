@@ -7,6 +7,13 @@ human approval checkpoint and resume later without re-running the model or
 re-executing completed steps, and so a re-trigger can never create a duplicate
 calendar event.
 
+``plan_version``/``plan_hash`` are what the ``cursor`` is bound to. The cursor
+counts the steps of exactly one plan, so the row records that plan's version and
+a content hash of its steps: a re-plan after execution started can never be
+resumed against the old cursor (which would silently skip the new plan's steps
+or re-run finished ones). Both stay ``None`` until the first trigger adopts a
+plan, and are only re-bound when no step has run yet.
+
 ``claim_token``/``claimed_at`` are the runtime's per-task execution claim: the
 single-trigger lease that makes a concurrent or duplicate resume a no-op instead
 of a second writer racing the owner into a different final state. It is a
@@ -61,6 +68,11 @@ class RuntimeExecution(PKMixin, TenantMixin, TimestampMixin, Base):
     evidence: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
     cursor: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     steps_used: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+    #: What the cursor above is counting: one plan version plus the hash of its
+    #: steps. Nullable until the first trigger binds it.
+    plan_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    plan_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
     claim_token: Mapped[UUID | None] = mapped_column(
         PG_UUID(as_uuid=True), nullable=True, index=True

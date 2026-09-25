@@ -12,6 +12,11 @@ Two layered boundaries, both strict:
 
 Every check here is deterministic application code; nothing consults the LLM
 and nothing talks to the database.
+
+The public progress snapshot is a *projection*, never the stored state: tool
+arguments, provider payloads, verification evidence, and unmasked attendee
+addresses stay inside the runtime (see :func:`redact_evidence` and
+:func:`redact_identities`).
 """
 
 from __future__ import annotations
@@ -132,14 +137,123 @@ class TriggerResponse(BaseModel):
     steps_used: int = 0
 
 
+class RuntimeEvidenceEntry(BaseModel):
+    """Redacted public projection of one persisted tool-run record.
+
+    The durable record kept for resume and verification is far richer: it also
+    holds the tool arguments, the provider payload, and the verification
+    evidence. None of that crosses this boundary. Only the run's identity
+    (which step, which tool, which request) and its verdict are published, so
+    a client can follow *what ran and how it went* without receiving the
+    arguments it passed, the provider's response, or the attendee addresses it
+    carried. ``message`` is deliberately absent: an adapter can surface raw
+    provider text in it, and ``error_code`` is a stable application string.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    step_order: int
+    tool: str
+    outcome: str
+    ok: bool
+    verified: bool
+    error_code: str | None = None
+    request_id: str | None = None
+
+
+class RuntimeIdentity(BaseModel):
+    """Redacted public projection of one resolved attendee identity.
+
+    The local part of the address is masked: resolving who an attendee is, and
+    proving it, stays inside the runtime and the identity resolver. The status
+    and confidence are published because they are what makes a step auditable.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    status: str
+    confidence: float
+    email: str | None = None
+
+
+def _mask_email(value: object) -> str | None:
+    """``ahmed@example.com`` -> ``a***@example.com``; anything else -> None."""
+    if not isinstance(value, str):
+        return None
+    local, separator, domain = value.strip().partition("@")
+    if not separator or not local or not domain:
+        return None
+    return f"{local[:1]}***@{domain}"
+
+
+def redact_evidence(records: list) -> list[RuntimeEvidenceEntry]:
+    """Project persisted tool-run records onto the public, redacted shape.
+
+    Every field is re-read defensively: a record this projection cannot make
+    sense of is dropped rather than passed through, so a schema drift can never
+    widen what the public API exposes.
+    """
+    published: list[RuntimeEvidenceEntry] = []
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        step_order = record.get("step_order")
+        tool = record.get("tool")
+        outcome = record.get("outcome")
+        if not isinstance(step_order, int) or not isinstance(tool, str):
+            continue
+        if not isinstance(outcome, str):
+            continue
+        error_code = record.get("error_code")
+        request_id = record.get("request_id")
+        published.append(
+            RuntimeEvidenceEntry(
+                step_order=step_order,
+                tool=tool,
+                outcome=outcome,
+                ok=bool(record.get("ok")),
+                verified=bool(record.get("verified")),
+                error_code=error_code if isinstance(error_code, str) else None,
+                request_id=request_id if isinstance(request_id, str) else None,
+            )
+        )
+    return published
+
+
+def redact_identities(resolved: list) -> list[RuntimeIdentity]:
+    """Project resolved attendee identities onto the public, masked shape."""
+    published: list[RuntimeIdentity] = []
+    for item in resolved:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("name")
+        status = item.get("status")
+        if not isinstance(name, str) or not isinstance(status, str):
+            continue
+        try:
+            confidence = float(item.get("confidence", 0.0))
+        except (TypeError, ValueError):
+            confidence = 0.0
+        published.append(
+            RuntimeIdentity(
+                name=name,
+                status=status,
+                confidence=confidence,
+                email=_mask_email(item.get("email")),
+            )
+        )
+    return published
+
+
 class RuntimeTaskResponse(BaseModel):
     task_id: str
     task_state: str
     goal: str
     timezone: str | None = None
     scenario: UnderstandingOutput | None = None
-    identities: list[dict] = Field(default_factory=list)
-    evidence: list[dict] = Field(default_factory=list)
+    identities: list[RuntimeIdentity] = Field(default_factory=list)
+    evidence: list[RuntimeEvidenceEntry] = Field(default_factory=list)
     cursor: int = 0
     steps_used: int = 0
     next_action: str
@@ -150,8 +264,12 @@ class RuntimeTaskResponse(BaseModel):
 __all__ = [
     "GoalSubmission",
     "MeetingWindow",
+    "RuntimeEvidenceEntry",
+    "RuntimeIdentity",
     "RuntimeTaskResponse",
     "SubmitResponse",
     "TriggerResponse",
     "UnderstandingOutput",
+    "redact_evidence",
+    "redact_identities",
 ]

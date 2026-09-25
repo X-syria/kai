@@ -2,7 +2,9 @@
 
 - ``POST /runtime/tasks`` submits a goal + timezone, creates a ``CREATED`` task
   with the sealed slice contract, and persists its execution envelope.
-- ``GET /runtime/tasks/{task_id}`` inspects the task's runtime progress.
+- ``GET /runtime/tasks/{task_id}`` inspects the task's runtime progress. It is
+  a redacted projection: tool arguments, provider payloads, and unmasked
+  attendee addresses are never returned.
 - ``POST /runtime/tasks/{task_id}/trigger`` drives the task forward one call
   and reports where it stopped and why.
 
@@ -27,6 +29,8 @@ from kai.runtime.schemas import (
     SubmitResponse,
     TriggerResponse,
     UnderstandingOutput,
+    redact_evidence,
+    redact_identities,
 )
 from kai.runtime.service import (
     AgentRuntime,
@@ -101,8 +105,8 @@ async def runtime_get(
             if row.scenario is not None
             else None
         ),
-        identities=list(row.identities),
-        evidence=list(row.evidence),
+        identities=redact_identities(list(row.identities)),
+        evidence=redact_evidence(list(row.evidence)),
         cursor=row.cursor,
         steps_used=row.steps_used,
         next_action=next_action,
