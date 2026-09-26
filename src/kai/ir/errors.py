@@ -69,10 +69,30 @@ class IrValidationError(ValueError):
     """
 
 
+class IrConditionError(IrValidationError):
+    """A condition is malformed, unsupported, or cannot be evaluated.
+
+    Distinct from a graph-structure problem on purpose: a bad condition is a
+    mistake in the *predicate*, and naming it separately means a caller can tell
+    "this program is wrong" from "this program asked a question nothing can
+    answer" (spec §16).
+    """
+
+
+class IrControlFlowError(IrValidationError):
+    """The control-flow graph is structurally invalid or cannot be traversed.
+
+    Covers an edge that references a missing node, a node with no way forward, a
+    graph with no single entry, and a walk that exceeded the graph's own bounds.
+    """
+
+
 __all__ = [
     "CLASS_BY_OUTCOME",
     "RESPONSE_BY_CLASS",
     "ErrorClass",
     "ErrorResponse",
+    "IrConditionError",
+    "IrControlFlowError",
     "IrValidationError",
 ]

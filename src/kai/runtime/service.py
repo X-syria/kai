@@ -81,10 +81,13 @@ from kai.ir.adapter import (
     attach,
     evidence_from_observation,
     intent_from_action,
+    observation_from_evidence,
     observation_from_result,
 )
 from kai.ir.build import allowed_capabilities_from_task, program_from_plan
-from kai.ir.errors import IrValidationError
+from kai.ir.control import ControlFacts, next_step
+from kai.ir.errors import IrConditionError, IrControlFlowError, IrValidationError
+from kai.ir.nodes import ObservationNode
 from kai.ir.program import KaiProgram
 from kai.logging import get_logger
 from kai.memory.models import MemoryType
@@ -715,11 +718,29 @@ class AgentRuntime:
                 row=row,
             )
 
-            for step in program.plan.steps:
-                if step.order <= cursor:
-                    # Completed on an earlier trigger. Never re-run: re-running
-                    # a finished calendar insert would create a duplicate event.
-                    continue
+            # Which step runs next is the program's answer, not this loop's. The
+            # IR declares the control flow and the runtime asks it, handing over
+            # only the facts the execution row already holds. A plan with no
+            # branches walks as the ordered chain it is, so the sequence is
+            # unchanged — but the sequence now lives in the program, and a step
+            # finished on an earlier trigger is skipped on the IR's word rather
+            # than this loop's arithmetic, which is the same guarantee the
+            # comparison made: never re-run a step, or a finished calendar insert
+            # would be inserted twice. Each pass walks from the program's entry,
+            # so a resume derives its position from durable facts instead of
+            # inheriting one.
+            while True:
+                step = next_step(
+                    program,
+                    _control_facts(
+                        cursor=cursor,
+                        task_state=task.state,
+                        steps_used=steps_used,
+                        evidence=evidence,
+                    ),
+                )
+                if step is None:
+                    break
                 await self._fence_execution(
                     session, task_id=task.id, tenant_id=task.tenant_id, claim=claim
                 )
@@ -844,6 +865,7 @@ class AgentRuntime:
                         if event_id:
                             created_event_id = event_id
 
+                cursor = step.order
                 row.cursor = step.order
                 row.evidence = list(evidence)
                 row.steps_used = steps_used
@@ -864,6 +886,12 @@ class AgentRuntime:
             return await self._settle_verification(
                 session, task=task, row=row, scenario=scenario, claim=claim
             )
+        except (IrConditionError, IrControlFlowError) as exc:
+            # A graph the runtime cannot walk is a fault in the program, not a
+            # tool failure and not something to retry: the branch structure does
+            # not match the facts, and the only safe reading of a control-flow
+            # decision this program cannot make is to make none of them.
+            return await self._fail(session, task, f"control flow is not traversable: {exc}")
         except RuntimeFatal as exc:
             return await self._fail(session, task, str(exc))
 
@@ -1324,6 +1352,31 @@ def _plan_diverged(bound_version: int | None, current_version: int) -> str:
         f"plan changed after execution started (saved cursor is bound to plan v"
         f"{bound_version}, current plan is v{current_version}); the saved cursor "
         "was not reused and no step was executed"
+    )
+
+
+def _control_facts(
+    *, cursor: int, task_state: str, steps_used: int, evidence: list[dict[str, Any]]
+) -> ControlFacts:
+    """The durable facts a KAI-IR condition may read, rebuilt from the row.
+
+    Assembled from what is already persisted — the cursor, the step count, the
+    evidence log — so a branch taken after a resume is decided by the same facts
+    it would have been before the crash, and no new column is needed to know where
+    the program is. Evidence rows that are not observations are skipped rather
+    than guessed at: a condition reading a step with no observation is refused by
+    the IR, not satisfied by a record that happens to be nearby.
+    """
+    observations: list[ObservationNode] = []
+    for record in evidence:
+        observation = observation_from_evidence(record)
+        if observation is not None:
+            observations.append(observation)
+    return ControlFacts(
+        cursor=cursor,
+        task_state=task_state,
+        steps_used=steps_used,
+        observations=tuple(observations),
     )
 
 

@@ -443,6 +443,118 @@ async def test_happy_path_with_approval(
     )
 
 
+async def test_the_runtime_follows_the_programs_control_flow(
+    client: httpx.AsyncClient,
+    backend: GoogleBackend,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Which step runs next is the program's call, and the runtime takes it.
+
+    The program is rewritten so that resolving the contact branches straight to
+    the end, skipping the two steps that create and then verify the event. The
+    runtime asks the program for the next step rather than walking the plan, so
+    those two steps are never reached: no event is created, the flow ends, and
+    the task fails its success criteria on what it actually did. Iterating the
+    plan instead would have created an event and asked for approval.
+    """
+    from kai.ir import (
+        ConditionNode,
+        ConditionOperator,
+        ConditionSubject,
+        ControlEdge,
+        ControlNode,
+        ControlNodeKind,
+        FactKind,
+        require_valid,
+    )
+    from kai.runtime import service as runtime_service
+    from kai.tools.result import ToolOutcome
+
+    build_program = runtime_service.program_from_plan
+
+    def branching_program(**kwargs: object) -> object:
+        program = build_program(**kwargs)  # type: ignore[arg-type]
+        resolved = ConditionNode(
+            condition_id="contact-resolved",
+            subject=ConditionSubject(
+                kind=FactKind.OBSERVATION, step_order=1, field="outcome"
+            ),
+            operator=ConditionOperator.EQ,
+            value=ToolOutcome.EXECUTION_SUCCEEDED.value,
+        )
+        unresolved = resolved.model_copy(
+            update={"condition_id": "contact-unresolved", "negate": True}
+        )
+        # The default plan is resolve → read → create → verify. This graph forks
+        # after the first step: on success it goes straight to the end, and the
+        # create/verify steps are only reachable down the unresolved branch.
+        nodes = [
+            ControlNode(node_id="action-1", kind=ControlNodeKind.ACTION, step_order=1),
+            ControlNode(
+                node_id="cond-1", kind=ControlNodeKind.CONDITION, condition=resolved
+            ),
+            *[
+                ControlNode(
+                    node_id=f"action-{order}",
+                    kind=ControlNodeKind.ACTION,
+                    step_order=order,
+                )
+                for order in (2, 3, 4)
+            ],
+            ControlNode(node_id="result", kind=ControlNodeKind.RESULT, result="COMPLETED"),
+        ]
+        edges = [
+            ControlEdge(from_node="action-1", to_node="cond-1"),
+            ControlEdge(from_node="cond-1", to_node="action-2", when=resolved),
+            ControlEdge(from_node="cond-1", to_node="action-3", when=unresolved),
+            ControlEdge(from_node="action-2", to_node="result"),
+            ControlEdge(from_node="action-3", to_node="action-4"),
+            ControlEdge(from_node="action-4", to_node="result"),
+        ]
+        return require_valid(
+            program.model_copy(
+                update={"nodes": nodes, "edges": edges, "fingerprint": ""}
+            ).seal()
+        )
+
+    monkeypatch.setattr(runtime_service, "program_from_plan", branching_program)
+
+    token = await _register(client, "khaled@example.com")
+    tenant_id, user_id = await _user_scope("khaled@example.com")
+    await insert_account(
+        tenant_id=tenant_id,
+        user_id=user_id,
+        email="khaled@example.com",
+        scopes=(
+            "openid email "
+            "https://www.googleapis.com/auth/calendar.events "
+            "https://www.googleapis.com/auth/contacts.readonly"
+        ),
+    )
+    await _seed_attendee_memory(tenant_id, user_id)
+
+    task_id, _ = await _submit(client, token)
+    outcome = await _trigger(client, token, task_id)
+
+    # The contact resolved, so the true branch ran: the first two steps and then
+    # the flow was over.
+    assert outcome["task_state"] == FAILED, outcome
+    assert outcome["approval_ids"] == []
+    assert backend.created_events == {}, "the skipped create step must not run"
+
+    evidence = await _internal_evidence(task_id)
+    assert {entry["step_order"] for entry in evidence} == {1, 2}, (evidence, outcome)
+    assert all(
+        entry["tool"] not in {"calendar.create_event", "calendar.get_event"}
+        for entry in evidence
+    )
+
+    # And the run stopped on its own evidence: the flow finished without the
+    # event the success criteria ask for.
+    snapshot = await _inspect(client, token, task_id)
+    assert snapshot["task_state"] == FAILED
+
+
 async def _approve(client: httpx.AsyncClient, token: str, approval_id: str) -> None:
     resp = await client.post(
         f"{API_PREFIX}/approvals/{approval_id}/approve",

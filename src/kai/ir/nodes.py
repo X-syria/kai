@@ -4,17 +4,17 @@ Every model is ``extra="forbid"`` (spec §2.2: the contract is closed — unknow
 fields are rejected, never ignored) and none of them can carry executable code,
 a prompt, or a credential (spec §2.1: data, not instructions).
 
-Ten of the fourteen primitives are here. The four that are not — ``ConditionNode``
-and ``ControlEdge`` (branching, which the task state machine must stay
-authoritative for), ``MemoryOpNode`` (memory is context today, not a planned
-operation), and ``ApprovalNode`` (the Tool Gateway already owns approval, and a
-second node describing it would be a second source of permission truth) — are
-deliberately deferred to a later slice rather than stubbed.
+Twelve of the fourteen primitives are here. The two that are not —
+``MemoryOpNode`` (memory is context today, not a planned operation) and
+``ApprovalNode`` (the Tool Gateway already owns approval, and a second node
+describing it would be a second source of permission truth) — are deliberately
+deferred to a later slice rather than stubbed.
 """
 
 from __future__ import annotations
 
 from datetime import datetime
+from enum import StrEnum
 from typing import Any, Self
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -44,6 +44,8 @@ _MAX_TEXT = 1000
 _MAX_CRITERIA = 50
 _MAX_STEPS = 1000
 _MAX_ARGS = 200
+_MAX_NODE_ID = 64
+_MAX_PREDICATE_VALUES = 50
 
 
 class _IrNode(BaseModel):
@@ -311,12 +313,281 @@ class ResultNode(_IrNode):
         return value
 
 
+class FactKind(StrEnum):
+    """The only sources a ``ConditionNode`` may read (spec §4.4).
+
+    A closed set of already-durable runtime facts. There is no "read an
+    environment variable", no "call a tool", and no "ask the model": a condition
+    is a comparison over what the runtime already knows, so evaluating one can
+    never acquire a new capability or take an action.
+    """
+
+    OBSERVATION = "observation"
+    CURSOR = "cursor"
+    STEPS_USED = "steps_used"
+    TASK_STATE = "task_state"
+
+
+class ConditionOperator(StrEnum):
+    """The complete comparison vocabulary (spec §4.4).
+
+    No arithmetic, no boolean algebra, no function calls. A branch is a
+    comparison, and that is the whole of it.
+    """
+
+    EQ = "eq"
+    NEQ = "neq"
+    GT = "gt"
+    GTE = "gte"
+    LT = "lt"
+    LTE = "lte"
+    IN = "in"
+    NOT_IN = "not_in"
+
+
+#: Comparison operators that are meaningless on an ordered domain, kept as data
+#: so the compatibility table and the validator cannot disagree.
+_ORDERED_OPERATORS: frozenset[ConditionOperator] = frozenset(
+    {ConditionOperator.GT, ConditionOperator.GTE, ConditionOperator.LT, ConditionOperator.LTE}
+)
+_SET_OPERATORS: frozenset[ConditionOperator] = frozenset(
+    {ConditionOperator.IN, ConditionOperator.NOT_IN}
+)
+
+#: The Python type each observable field actually has. The condition's operand
+#: must match it exactly, which is what lets a "verified == 'yes'" condition be
+#: refused at build time instead of silently never matching at run time.
+OBSERVATION_FACT_TYPES: dict[str, type] = {
+    "outcome": str,
+    "ok": bool,
+    "verified": bool,
+    "error_code": str,
+}
+
+#: Fields an ``OBSERVATION`` condition may read. Not a path expression: an
+#: allow-list of scalars, so a condition cannot reach into a provider payload.
+FACT_TYPE_BY_KIND: dict[FactKind, type] = {
+    FactKind.CURSOR: int,
+    FactKind.STEPS_USED: int,
+    FactKind.TASK_STATE: str,
+}
+
+
+class ConditionSubject(_IrNode):
+    """One observable fact, named exactly, with no way to compute a new one."""
+
+    kind: FactKind
+    step_order: int | None = Field(default=None, ge=1)
+    field: str | None = Field(default=None, max_length=_MAX_TEXT)
+
+    @model_validator(mode="after")
+    def _fields_match_kind(self) -> Self:
+        if self.kind is FactKind.OBSERVATION:
+            if self.step_order is None or self.field is None:
+                raise ValueError(
+                    "an observation condition needs both step_order and field"
+                )
+            if self.field not in OBSERVATION_FACT_TYPES:
+                raise ValueError(
+                    f"observation field must be one of "
+                    f"{sorted(OBSERVATION_FACT_TYPES)}"
+                )
+        elif self.step_order is not None or self.field is not None:
+            raise ValueError(
+                f"a {self.kind.value} condition reads a single fact and must not "
+                f"name a step or a field"
+            )
+        return self
+
+    def value_type(self) -> type:
+        """The type of the fact this subject names."""
+        if self.kind is FactKind.OBSERVATION:
+            assert self.field is not None  # guaranteed by _fields_match_kind
+            return OBSERVATION_FACT_TYPES[self.field]
+        return FACT_TYPE_BY_KIND[self.kind]
+
+
+#: The operand shape. Single-typed lists (not mixed) so a membership test has one
+#: unambiguous meaning; the value's type is then checked against the fact's.
+PredicateValue = bool | int | str | list[bool] | list[int] | list[str]
+
+
+class ConditionNode(_IrNode):
+    """A deterministic predicate over runtime facts, used to choose an edge.
+
+    Conditions are *data*, never code: the operator and the operands are checked
+    against each other when the program is built, and the evaluation itself is a
+    single comparison performed by ``kai.ir.control``. A condition can therefore
+    never become a place to smuggle in behaviour (spec §2.1).
+
+    ``negate`` exists instead of a ``not`` operator so the canonical form keeps a
+    predicate in one flat object: a condition and its complement differ by one
+    boolean rather than by a nested subtree. That is what lets the graph
+    validator prove a branch is exhaustive.
+    """
+
+    condition_id: str = Field(min_length=1, max_length=_MAX_NODE_ID)
+    subject: ConditionSubject
+    operator: ConditionOperator
+    value: PredicateValue
+    negate: bool = False
+
+    @field_validator("condition_id")
+    @classmethod
+    def _id_not_blank(cls, value: str) -> str:
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("condition_id must not be blank")
+        return stripped
+
+    @model_validator(mode="after")
+    def _operand_matches_fact(self) -> Self:
+        expected = self.subject.value_type()
+        operand = self.value
+
+        if self.operator in _SET_OPERATORS:
+            if not isinstance(operand, list):
+                raise ValueError(f"{self.operator.value} needs a list operand")
+            if not operand:
+                raise ValueError(f"{self.operator.value} needs a non-empty list operand")
+            if len(operand) > _MAX_PREDICATE_VALUES:
+                raise ValueError("a membership operand carries too many values")
+            for item in operand:
+                if type(item) is not expected:
+                    raise ValueError(
+                        f"{self.operator.value} operand must hold {expected.__name__} "
+                        f"values to match {self.subject.kind.value}"
+                    )
+            return self
+
+        if isinstance(operand, list):
+            raise ValueError(f"{self.operator.value} needs a single operand")
+        if type(operand) is not expected:
+            raise ValueError(
+                f"{self.operator.value} operand must be {expected.__name__} to match "
+                f"a {self.subject.kind.value} fact"
+            )
+        if self.operator in _ORDERED_OPERATORS and expected is str:
+            raise ValueError(f"{self.operator.value} is undefined for a text fact")
+        return self
+
+    def is_negation_of(self, other: ConditionNode) -> bool:
+        """True when exactly one of these two is true for any given fact value.
+
+        Structural, not semantic: same fact, same comparison, opposite polarity.
+        It is enough to prove a two-way branch is exhaustive, and it is
+        conservative — a branch can be valid for reasons this does not detect,
+        but is only ever *proven* invalid when it really is.
+        """
+        return (
+            self.subject == other.subject
+            and self.operator == other.operator
+            and self.value == other.value
+            and self.negate is not other.negate
+        )
+
+
+class ControlNodeKind(StrEnum):
+    ACTION = "action"
+    CONDITION = "condition"
+    RESULT = "result"
+
+
+class ControlNode(_IrNode):
+    """A vertex of the control-flow graph.
+
+    These are the graph's *static* vertices, deliberately not the execution
+    artifacts they lead to. An ``action`` vertex names the plan step that runs
+    there; the ``ActionNode`` with its concrete arguments is still built at
+    execution time, because its arguments depend on what earlier observations
+    established. Referring to a step instead of copying one keeps runtime-filled
+    data out of the hashed control structure — the fingerprint stays a function
+    of the declared flow and nothing that happened while running it.
+    """
+
+    node_id: str = Field(min_length=1, max_length=_MAX_NODE_ID)
+    kind: ControlNodeKind
+    step_order: int | None = Field(default=None, ge=1)
+    condition: ConditionNode | None = None
+    result: str | None = None
+
+    @field_validator("node_id")
+    @classmethod
+    def _id_not_blank(cls, value: str) -> str:
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("node_id must not be blank")
+        return stripped
+
+    @model_validator(mode="after")
+    def _carries_exactly_its_own_payload(self) -> Self:
+        if self.kind is ControlNodeKind.ACTION:
+            if self.step_order is None:
+                raise ValueError("an action node must name the step it executes")
+            unexpected = self.condition is not None or self.result is not None
+        elif self.kind is ControlNodeKind.CONDITION:
+            if self.condition is None:
+                raise ValueError("a condition node must carry its condition")
+            unexpected = self.step_order is not None or self.result is not None
+        else:
+            if self.result is None:
+                raise ValueError("a result node must declare the outcome it ends on")
+            if self.result not in ALL_STATES or self.result not in RESULT_STATES:
+                raise ValueError(
+                    f"result must be one of the reportable task states "
+                    f"{sorted(RESULT_STATES)}"
+                )
+            unexpected = self.step_order is not None or self.condition is not None
+        if unexpected:
+            raise ValueError(f"a {self.kind.value} node must not carry another kind's fields")
+        return self
+
+
+class ControlEdge(_IrNode):
+    """One way from one node to the next, with the guard that permits it.
+
+    An edge with no ``when`` is unconditional, and a node may have at most one of
+    those — two would be a choice the program never made. Guarded edges are
+    selected purely by evaluating their condition against durable facts, so which
+    edge is taken is a function of what already happened, never of a fresh
+    decision made mid-run.
+    """
+
+    from_node: str = Field(min_length=1, max_length=_MAX_NODE_ID)
+    to_node: str = Field(min_length=1, max_length=_MAX_NODE_ID)
+    when: ConditionNode | None = None
+
+    @field_validator("from_node", "to_node")
+    @classmethod
+    def _endpoints_not_blank(cls, value: str) -> str:
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("edge endpoints must not be blank")
+        return stripped
+
+    @model_validator(mode="after")
+    def _no_self_loop(self) -> Self:
+        # A self-loop is a one-node cycle, and a cycle is refused outright.
+        if self.from_node == self.to_node:
+            raise ValueError("a control edge must not target its own source")
+        return self
+
+
 __all__ = [
+    "FACT_TYPE_BY_KIND",
     "IR_VERSION",
+    "OBSERVATION_FACT_TYPES",
     "PLAN_STATUSES",
     "RESULT_STATES",
     "ActionNode",
+    "ConditionNode",
+    "ConditionOperator",
+    "ConditionSubject",
+    "ControlEdge",
+    "ControlNode",
+    "ControlNodeKind",
     "ErrorNode",
+    "FactKind",
     "IntentNode",
     "ObservationNode",
     "PermissionNode",

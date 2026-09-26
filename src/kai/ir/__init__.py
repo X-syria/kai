@@ -1,20 +1,26 @@
 """KAI-IR: the Intermediate Representation KAI's reasoning layer produces.
 
-This package owns the *content* of a program — the intent, the plan, the
-constraints, the declared permissions, the observations, the result — and
-nothing about how it is carried out. The Agent Runtime still owns claims,
-lifecycle, durability, and recovery; the Tool Gateway still owns policy, content,
-approval, account, and verification. An IR program is the audited, deterministic,
-validated description of what the runtime intends to do, and the two authorities
-are unchanged by it.
+This package owns the *content* of a program — the intent, the plan, the declared
+control flow, the constraints, the declared permissions, the observations, the
+result — and nothing about how it is carried out. The Agent Runtime still owns
+claims, lifecycle, durability, and recovery; the Tool Gateway still owns policy,
+content, approval, account, and verification. An IR program is the audited,
+deterministic, validated description of what the runtime intends to do, and the
+two authorities are unchanged by it.
+
+A program may say which of its steps is eligible to run next given what has
+already been observed, and the runtime may ask it. It may not decide anything:
+branching is a comparison over facts the runtime already has durable, and the
+first thing a branch can do is name a step for the runtime to run through the
+same Gateway path as any other.
 
 Spec: ``docs/kai-ir-spec-v0.md``.
 
-Scope of this first slice: ten of the fourteen primitives, translation of
-persisted planning output, and the Gateway boundary. ``ConditionNode``,
-``ControlEdge``, ``MemoryOpNode``, and ``ApprovalNode`` are deliberately absent —
-the first two would have to duplicate the task state machine's control, and the
-last two would duplicate the Gateway's own authority over memory and approval.
+Scope of this slice: twelve of the fourteen primitives, translation of persisted
+planning output, deterministic control-flow traversal, and the Gateway boundary.
+``MemoryOpNode`` and ``ApprovalNode`` are deliberately absent — the first would
+duplicate a memory subsystem, and the second would duplicate the Gateway's own
+authority over approval.
 """
 
 from kai.ir.adapter import (
@@ -35,11 +41,31 @@ from kai.ir.build import (
     program_id_for,
     tools_by_capability,
 )
-from kai.ir.errors import ErrorClass, ErrorResponse, IrValidationError
+from kai.ir.control import (
+    ControlFacts,
+    evaluate,
+    linear_graph,
+    next_node,
+    next_step,
+)
+from kai.ir.errors import (
+    ErrorClass,
+    ErrorResponse,
+    IrConditionError,
+    IrControlFlowError,
+    IrValidationError,
+)
 from kai.ir.nodes import (
     IR_VERSION,
     ActionNode,
+    ConditionNode,
+    ConditionOperator,
+    ConditionSubject,
+    ControlEdge,
+    ControlNode,
+    ControlNodeKind,
     ErrorNode,
+    FactKind,
     IntentNode,
     ObservationNode,
     PermissionNode,
@@ -58,10 +84,20 @@ from kai.ir.program import (
 __all__ = [
     "IR_VERSION",
     "ActionNode",
+    "ConditionNode",
+    "ConditionOperator",
+    "ConditionSubject",
+    "ControlEdge",
+    "ControlFacts",
+    "ControlNode",
+    "ControlNodeKind",
     "ErrorClass",
     "ErrorNode",
     "ErrorResponse",
+    "FactKind",
     "IntentNode",
+    "IrConditionError",
+    "IrControlFlowError",
     "IrValidationError",
     "KaiProgram",
     "ObservationNode",
@@ -77,8 +113,12 @@ __all__ = [
     "canonical_fingerprint",
     "canonical_json",
     "error_from_observation",
+    "evaluate",
     "evidence_from_observation",
     "intent_from_action",
+    "linear_graph",
+    "next_node",
+    "next_step",
     "observation_from_evidence",
     "observation_from_result",
     "program_from_plan",

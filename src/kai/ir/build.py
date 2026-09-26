@@ -19,6 +19,7 @@ from datetime import datetime
 from typing import Any
 from uuid import NAMESPACE_URL, UUID, uuid5
 
+from kai.ir.control import linear_graph
 from kai.ir.errors import IrValidationError
 from kai.ir.nodes import (
     IR_VERSION,
@@ -194,11 +195,18 @@ def program_from_plan(
     tool index is derived from that one pair — so a program can never be built
     from a capability that means one thing to the mapping and another to the
     catalog, which would let a permission be declared for the wrong tool.
+
+    A persisted plan declares an ordered list of steps and no branches, so the
+    program is given the control flow that actually describes it: one action node
+    per step, chained, ending at a result node. That is a real graph, validated
+    and walked exactly like a branching one — a branch is a later change to this
+    chain, not a separate execution mode.
     """
     risk_cap = risk_from_policy(task.risk_policy)
     tools = tools_by_capability(registry, capability_to_tool)
     steps = steps_from_plan(proposal)
     capabilities = list(dict.fromkeys(step.capability for step in steps))
+    nodes, edges = linear_graph(steps)
 
     program = KaiProgram(
         ir_version=IR_VERSION,
@@ -212,6 +220,8 @@ def program_from_plan(
             status=plan_status,
             steps=steps,
         ),
+        nodes=nodes,
+        edges=edges,
         constraints=constraints_from_task(
             task, capability_to_tool=capability_to_tool
         ),
