@@ -591,6 +591,7 @@ __all__ = [
     "IntentNode",
     "ObservationNode",
     "PermissionNode",
+    "PredicateValue",
     "PlanNode",
     "PolicyConstraintsNode",
     "StateSnapshotNode",

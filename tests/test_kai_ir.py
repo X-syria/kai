@@ -21,6 +21,7 @@ from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
 import pytest
+from pydantic import ValidationError
 
 from kai.ir import (
     IR_VERSION,
@@ -45,6 +46,7 @@ from kai.ir import (
     StepNode,
     action_for,
     action_id_for,
+    condition_from_plan,
     error_from_observation,
     evaluate,
     evidence_from_observation,
@@ -65,7 +67,7 @@ from kai.ir.build import (
     permission_for,
     risk_from_policy,
 )
-from kai.planner.schemas import PlanProposal
+from kai.planner.schemas import PlanBranch, PlanCondition, PlanProposal
 from kai.policy.engine import PolicyEngine
 from kai.runtime.translator import CAPABILITY_TO_TOOL, capability_to_tool
 from kai.tools.catalog import default_registry
@@ -1687,7 +1689,7 @@ def test_observations_stay_out_of_the_program_identity() -> None:
 
 
 def test_a_program_with_no_conditions_never_asks_the_runtime_to_choose() -> None:
-    """Branching is opt-in: the current slice's plans walk straight through."""
+    """A plan that declared no branch is opted out of all of this."""
     program = _base()
     seen: list[str] = []
     cursor = 0
@@ -1695,3 +1697,401 @@ def test_a_program_with_no_conditions_never_asks_the_runtime_to_choose() -> None
         seen.append(node.node_id)
         cursor = node.step_order  # type: ignore[assignment]
     assert seen == ["action-1", "action-2", "action-3"]
+
+
+# --------------------------------------------------------------------------- #
+# Planner-declared branches: intent in, control flow out
+# --------------------------------------------------------------------------- #
+
+_CAPABILITIES = (
+    "resolve_contact",
+    "read_calendar",
+    "create_calendar_event",
+    "verify_calendar_event",
+)
+
+
+def _declared(*, steps: int, branches: list[dict] | None = None) -> PlanProposal:
+    """A plan of ``steps`` steps over the capabilities the task already allows."""
+    return PlanProposal.model_validate(
+        {
+            "goal": "schedule a meeting",
+            "success_criteria": ["calendar event created"],
+            "steps": [
+                {
+                    "step_id": f"s{order}",
+                    "order": order,
+                    "action": _CAPABILITIES[(order - 1) % len(_CAPABILITIES)],
+                    "purpose": f"work {order}",
+                }
+                for order in range(1, steps + 1)
+            ],
+            "branches": branches or [],
+            "assumptions": [],
+        }
+    )
+
+
+def _branch(**overrides: object) -> dict:
+    """A declared fork after step 1, on the outcome step 1 recorded.
+
+    Override any part of it to build the malformed cases.
+    """
+    declaration: dict = {
+        "after_step": 1,
+        "condition": {
+            "kind": "observation",
+            "step_order": 1,
+            "field": "outcome",
+            "operator": "eq",
+            "value": ToolOutcome.EXECUTION_SUCCEEDED.value,
+        },
+        "then_step": 2,
+        "else_step": 3,
+    }
+    declaration.update(overrides)
+    return declaration
+
+
+def _forked(**overrides: object) -> KaiProgram:
+    kwargs: dict = {
+        "task": _task(),
+        "plan_version": 1,
+        "plan_status": "ACCEPTED",
+        "proposal": _declared(steps=3, branches=[_branch()]),
+        "plan_hash": "a" * 64,
+        "registry": default_registry(),
+        "capability_to_tool": CAPABILITY_TO_TOOL,
+    }
+    kwargs.update(overrides)
+    return program_from_plan(**kwargs)
+
+
+def _run(program: KaiProgram, outcome: ToolOutcome) -> list[int]:
+    """Walk the program the way the runtime does, recording the steps that run."""
+    facts = _facts(cursor=0)
+    ran: list[int] = []
+    while (step := next_step(program, facts)) is not None:
+        ran.append(step.order)
+        facts = _facts(
+            cursor=step.order,
+            observations=facts.observations + (_recorded(step.order, outcome),),
+        )
+    return ran
+
+
+def test_a_plan_that_declares_no_branch_compiles_to_the_chain_it_always_did() -> None:
+    """The whole promise of an optional field: identical program, identical identity."""
+    without = _base()
+    stated = _three_step_proposal().model_dump(mode="json")
+    stated["branches"] = []
+    explicit = _base(proposal=PlanProposal.model_validate(stated))
+
+    assert explicit.canonical_form() == without.canonical_form()
+    assert explicit.fingerprint == without.fingerprint
+    assert [node.node_id for node in explicit.nodes] == [
+        "action-1",
+        "action-2",
+        "action-3",
+        "result",
+    ]
+    # A plan persisted before branching existed still loads, and still branches
+    # not at all.
+    legacy = _declared(steps=3).model_dump(mode="json")
+    del legacy["branches"]
+    assert PlanProposal.model_validate(legacy).branches == []
+
+
+def test_a_declared_branch_becomes_one_condition_node_and_two_guarded_edges() -> None:
+    """The whole of the translation, stated as a graph: nothing is invented."""
+    program = _forked()
+
+    assert [(node.node_id, node.kind.value) for node in program.nodes] == [
+        ("action-1", "action"),
+        ("action-2", "action"),
+        ("action-3", "action"),
+        ("condition-1", "condition"),
+        ("result-2", "result"),
+        ("result-3", "result"),
+    ]
+    assert [(edge.from_node, edge.to_node) for edge in program.edges] == [
+        ("action-1", "condition-1"),
+        ("condition-1", "action-2"),
+        ("condition-1", "action-3"),
+        ("action-2", "result-2"),
+        ("action-3", "result-3"),
+    ]
+    assert program.entry_node_id() == "action-1"
+
+    # Two ways out of the condition and no third: the declared comparison on one
+    # edge, the very same comparison negated on the other. That is the only
+    # two-way shape the validator can prove covers every value of the fact.
+    guards = program.edges_from("condition-1")
+    assert all(edge.when is not None for edge in guards)
+    taken, other = (edge.when for edge in guards)
+    assert taken is not None and other is not None
+    assert taken.is_negation_of(other)
+    assert taken.subject == other.subject
+    assert taken.value == ToolOutcome.EXECUTION_SUCCEEDED.value
+    assert not taken.negate and other.negate
+
+
+def test_the_plan_says_where_each_outcome_goes_and_the_fact_says_which_one_happens() -> None:
+    program = _forked()
+
+    resolved = next_step(program, _facts(cursor=1, observations=(_recorded(1),)))
+    unresolved = next_step(
+        program,
+        _facts(cursor=1, observations=(_recorded(1, ToolOutcome.EXECUTION_FAILED),)),
+    )
+
+    assert resolved is not None and resolved.order == 2
+    assert unresolved is not None and unresolved.order == 3
+
+
+def test_only_the_chosen_path_of_a_declared_branch_ever_runs() -> None:
+    """One fork, two paths, and each run walks exactly one of them to its end."""
+    program = _forked()
+
+    assert _run(program, ToolOutcome.EXECUTION_SUCCEEDED) == [1, 2]
+    assert _run(program, ToolOutcome.EXECUTION_FAILED) == [1, 3]
+
+
+def test_a_declared_condition_is_the_irs_own_vocabulary_and_adds_nothing_to_it() -> None:
+    """The plan does not get a looser condition language than the IR has."""
+    declared = PlanCondition.model_validate(
+        {
+            "kind": "observation",
+            "step_order": 1,
+            "field": "outcome",
+            "operator": "eq",
+            "value": ToolOutcome.EXECUTION_SUCCEEDED.value,
+        }
+    )
+
+    assert condition_from_plan(declared, condition_id="c") == _condition("c")
+
+
+@pytest.mark.parametrize(
+    "declaration, refused",
+    [
+        pytest.param(
+            {
+                "kind": "cursor",
+                "operator": "gt",
+                "value": 1,
+                "step_order": 2,
+            },
+            "must not name a step or a field",
+            id="a-fact-that-is-not-observation-names-a-step",
+        ),
+        pytest.param(
+            {
+                "kind": "observation",
+                "step_order": 1,
+                "field": "payload.email",
+                "operator": "eq",
+                "value": "sara@example.com",
+            },
+            "observation field must be one of",
+            id="a-payload-path-is-not-a-fact",
+        ),
+        pytest.param(
+            {
+                "kind": "observation",
+                "step_order": 1,
+                "field": "outcome",
+                "operator": "eq",
+                "value": True,
+            },
+            "operand must be str",
+            id="the-operand-type-must-match-the-fact",
+        ),
+        pytest.param(
+            {
+                "kind": "observation",
+                "step_order": 1,
+                "field": "outcome",
+                "operator": "gt",
+                "value": "EXECUTION_SUCCEEDED",
+            },
+            "undefined for a text fact",
+            id="no-ordering-on-a-text-fact",
+        ),
+        pytest.param(
+            {
+                "kind": "observation",
+                "step_order": 1,
+                "field": "outcome",
+                "operator": "in",
+                "value": "EXECUTION_SUCCEEDED",
+            },
+            "needs a list operand",
+            id="membership-needs-a-list",
+        ),
+    ],
+)
+def test_a_condition_the_ir_cannot_represent_is_refused(
+    declaration: dict, refused: str
+) -> None:
+    with pytest.raises(ValidationError, match=refused):
+        condition_from_plan(PlanCondition.model_validate(declaration))
+
+
+@pytest.mark.parametrize(
+    "branches, refused",
+    [
+        pytest.param(
+            [_branch(then_step=3, else_step=3)],
+            "then_step and else_step are the same step",
+            id="both-outcomes-lead-to-one-step",
+        ),
+        pytest.param(
+            [_branch(then_step=3, else_step=4)],
+            "must be step 2",
+            id="neither-outcome-continues-the-chain",
+        ),
+        pytest.param(
+            [_branch(then_step=2, else_step=9)],
+            "else_step 9 is not a step in this plan",
+            id="an-outcome-names-a-step-that-does-not-exist",
+        ),
+        pytest.param(
+            [_branch(), _branch(then_step=2, else_step=4)],
+            "a step carries only one branch",
+            id="one-step-cannot-carry-two-forks",
+        ),
+        pytest.param(
+            [_branch(after_step=3, then_step=4, else_step=4)],
+            "then_step and else_step are the same step",
+            id="a-fork-after-the-final-step",
+        ),
+    ],
+)
+def test_a_declaration_that_cannot_become_a_graph_is_refused(
+    branches: list[dict], refused: str
+) -> None:
+    with pytest.raises(IrValidationError, match=refused):
+        _forked(proposal=_declared(steps=4, branches=branches))
+
+
+def test_a_branch_may_not_read_a_fact_its_own_path_has_not_produced_yet() -> None:
+    """A forward reference is refused, not left to fail at run time."""
+    with pytest.raises(IrConditionError, match="the fact cannot exist yet"):
+        _forked(
+            proposal=_declared(
+                steps=3,
+                branches=[
+                    _branch(
+                        condition={
+                            "kind": "observation",
+                            "step_order": 3,
+                            "field": "outcome",
+                            "operator": "eq",
+                            "value": ToolOutcome.EXECUTION_SUCCEEDED.value,
+                        }
+                    )
+                ],
+            )
+        )
+
+
+def _second_fork(*, step_order: int) -> dict:
+    return _branch(after_step=4, then_step=5, else_step=6, condition={
+        "kind": "observation",
+        "step_order": step_order,
+        "field": "outcome",
+        "operator": "eq",
+        "value": ToolOutcome.EXECUTION_SUCCEEDED.value,
+    })
+
+
+def test_a_condition_must_exist_on_every_path_that_can_reach_the_branch() -> None:
+    """Not *some* path ran it — every path, or the branch is unanswerable.
+
+    The first fork skips step 2 down its other outcome, so a later branch reading
+    step 2 would be reached by a path where step 2 never ran. The step both paths
+    share is fine, which is what makes this a check and not a blanket refusal.
+    """
+    forked = _declared(
+        steps=6, branches=[_branch(else_step=4), _second_fork(step_order=2)]
+    )
+    with pytest.raises(IrConditionError, match="not upstream of node"):
+        _base(proposal=forked)
+
+    shared = _declared(
+        steps=6, branches=[_branch(else_step=4), _second_fork(step_order=1)]
+    )
+    program = _base(proposal=shared)
+
+    assert program.entry_node_id() == "action-1"
+    assert [node.node_id for node in program.nodes if node.kind.value == "condition"] == [
+        "condition-1",
+        "condition-4",
+    ]
+
+
+def test_the_branch_a_plan_declares_is_part_of_the_program_it_compiles_to() -> None:
+    straight = _base()
+    forked = _forked()
+
+    assert forked.fingerprint != straight.fingerprint
+    assert _forked().fingerprint == forked.fingerprint
+
+
+def test_the_order_branches_were_declared_in_is_not_part_of_the_program() -> None:
+    """Two plans that declare the same forks are the same plan."""
+    first_fork = _branch(else_step=4)
+    second_fork = _second_fork(step_order=1)
+
+    forward = _base(
+        proposal=_declared(steps=6, branches=[first_fork, second_fork])
+    )
+    reversed_ = _base(
+        proposal=_declared(steps=6, branches=[second_fork, first_fork])
+    )
+
+    assert forward.fingerprint == reversed_.fingerprint
+    assert forward.canonical_form() == reversed_.canonical_form()
+
+
+def test_a_step_a_declared_branch_routes_to_keeps_the_action_id_it_always_had() -> None:
+    """A branch decides which step runs next; it never renames what that step does."""
+    branched = _forked()
+    step_three = branched.step(3)
+    linear_three = _base().step(3)
+    assert step_three is not None and linear_three is not None
+
+    def identity(step: StepNode) -> str:
+        return action_for(
+            step=step,
+            index=0,
+            capability=step.capability,
+            arguments={},
+            task_id=TASK_ID,
+            plan_version=1,
+        ).action_id
+
+    assert identity(step_three) == identity(linear_three) == action_id_for(
+        task_id=TASK_ID, plan_version=1, step_order=3, index=0
+    )
+
+
+def test_a_plan_cannot_smuggle_anything_into_a_branch() -> None:
+    """The branch is a closed declaration, like every other part of the plan."""
+    for smuggled in (
+        {"goto": 3},
+        {"then_step": 2, "else_step": 3, "loop": True},
+        {"then_step": 2, "else_step": 3, "risk_policy": "LOW"},
+    ):
+        with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+            PlanBranch.model_validate(_branch(**smuggled))
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        PlanCondition.model_validate(
+            {
+                "kind": "cursor",
+                "operator": "gte",
+                "value": 1,
+                "expression": "1 + 1",
+            }
+        )

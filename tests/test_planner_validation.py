@@ -238,3 +238,141 @@ def test_plan_json_never_includes_contract_overrides() -> None:
     assert "allowed_tools" not in serialized
     assert "model" not in serialized
     assert "execution" not in serialized
+
+
+# --- branches --------------------------------------------------------------
+
+def _branch(**overrides: object) -> dict:
+    """A declared fork after step 1, on the outcome step 1 recorded."""
+    declaration: dict = {
+        "after_step": 1,
+        "condition": {
+            "kind": "observation",
+            "step_order": 1,
+            "field": "outcome",
+            "operator": "eq",
+            "value": "EXECUTION_SUCCEEDED",
+        },
+        "then_step": 2,
+        "else_step": 3,
+    }
+    declaration.update(overrides)
+    return declaration
+
+
+def _errors(branches: list[dict], **overrides: object) -> list[str]:
+    proposal = PlanProposal.model_validate(_plan(branches=branches, **overrides))
+    return domain_errors(
+        proposal, task=_task(), allowed_capabilities=CAPABILITIES
+    )
+
+
+def test_a_plan_may_declare_a_branch_and_a_plan_may_not_declare_one() -> None:
+    assert _errors([]) == []
+    assert _errors([_branch()]) == []
+
+
+def test_branches_are_absent_from_the_plan_when_the_model_declares_none() -> None:
+    """An absent key and an empty list are the same plan, not two of them."""
+    without = PlanProposal.model_validate(_plan())
+    stated = _plan(branches=[])
+    stated["branches"] = []
+    with_empty = PlanProposal.model_validate(stated)
+
+    assert without.branches == with_empty.branches == []
+    assert plan_json(without) == plan_json(with_empty)
+
+
+def test_a_plan_with_a_branch_still_roundtrips_through_the_stored_contract() -> None:
+    proposal = PlanProposal.model_validate(_plan(branches=[_branch()]))
+
+    reloaded = PlanProposal.model_validate(plan_json(proposal))
+
+    assert reloaded == proposal
+    assert plan_json(reloaded)["branches"] == [
+        {
+            "after_step": 1,
+            "condition": {
+                "kind": "observation",
+                "step_order": 1,
+                "field": "outcome",
+                "operator": "eq",
+                "value": "EXECUTION_SUCCEEDED",
+                "negate": False,
+            },
+            "then_step": 2,
+            "else_step": 3,
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    "branches, refused",
+    [
+        pytest.param(
+            [_branch(then_step=3, else_step=3)],
+            "then_step and else_step are the same step",
+            id="both-outcomes-lead-to-one-step",
+        ),
+        pytest.param(
+            [_branch(then_step=2, else_step=9)],
+            "else_step 9 is not a step in this plan",
+            id="an-outcome-names-a-step-that-does-not-exist",
+        ),
+        pytest.param(
+            [_branch(then_step=3, else_step=4)],
+            "must be step 2",
+            id="neither-outcome-continues-the-chain",
+        ),
+        pytest.param(
+            [_branch(), _branch(then_step=2, else_step=4)],
+            "a step carries only one branch",
+            id="one-step-cannot-carry-two-forks",
+        ),
+    ],
+)
+def test_a_declaration_that_is_not_a_graph_is_refused_at_the_planner_gate(
+    branches: list[dict], refused: str
+) -> None:
+    """Refused when the plan is offered, not discovered while a task is running."""
+    errors = _errors(branches)
+
+    assert any(refused in error for error in errors), errors
+
+
+def test_a_condition_the_ir_cannot_represent_is_refused_at_the_planner_gate() -> None:
+    errors = _errors(
+        [
+            _branch(
+                condition={
+                    "kind": "observation",
+                    "step_order": 1,
+                    "field": "outcome",
+                    "operator": "eq",
+                    "value": True,
+                }
+            )
+        ]
+    )
+
+    assert any("operand must be str" in error for error in errors), errors
+    assert all(error.startswith("branch after step 1") for error in errors), errors
+
+
+def test_a_branch_cannot_carry_a_permission_or_a_loop() -> None:
+    """The plan still has no way to express permission, risk, or repetition."""
+    for smuggled in (
+        {"loop": True},
+        {"goto": 3},
+        {"requires_approval": True},
+    ):
+        with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+            PlanProposal.model_validate(_plan(branches=[_branch(**smuggled)]))
+
+
+def test_branches_are_bounded() -> None:
+    """A branch per step at most, so a plan cannot smuggle a graph by volume."""
+    with pytest.raises(ValidationError):
+        PlanProposal.model_validate(
+            _plan(branches=[_branch(after_step=1) for _ in range(51)])
+        )

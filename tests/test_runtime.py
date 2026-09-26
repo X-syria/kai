@@ -555,6 +555,121 @@ async def test_the_runtime_follows_the_programs_control_flow(
     assert snapshot["task_state"] == FAILED
 
 
+def _fork(
+    *, after_step: int, reads: int, then_step: int, else_step: int
+) -> dict:
+    """A branch as the planner declares it: on the outcome one step recorded."""
+    return {
+        "after_step": after_step,
+        "condition": {
+            "kind": "observation",
+            "step_order": reads,
+            "field": "outcome",
+            "operator": "eq",
+            "value": "EXECUTION_SUCCEEDED",
+        },
+        "then_step": then_step,
+        "else_step": else_step,
+    }
+
+
+async def _branching_task(
+    client: httpx.AsyncClient, stub: RuntimeStubModel, branch: dict
+) -> tuple[str, str]:
+    """Register, seed, and submit a task whose plan declares one branch.
+
+    The declaration goes in through the planner's own output, so everything after
+    it is the real pipeline: the plan is validated, persisted, compiled into a
+    program, and walked by the runtime.
+    """
+    stub.plan = _valid_plan(branches=[branch])
+    token = await _register(client, "khaled@example.com")
+    tenant_id, user_id = await _user_scope("khaled@example.com")
+    await insert_account(
+        tenant_id=tenant_id,
+        user_id=user_id,
+        email="khaled@example.com",
+        scopes=(
+            "openid email "
+            "https://www.googleapis.com/auth/calendar.events "
+            "https://www.googleapis.com/auth/contacts.readonly"
+        ),
+    )
+    await _seed_attendee_memory(tenant_id, user_id)
+    task_id, _ = await _submit(client, token)
+    return token, task_id
+
+
+async def test_a_branch_the_planner_declared_is_the_branch_the_runtime_takes(
+    client: httpx.AsyncClient,
+    backend: GoogleBackend,
+    stub: RuntimeStubModel,
+) -> None:
+    """The declaration travels plan → IR → runtime, and nothing re-decides it.
+
+    The planner asks for one fork: if resolving the contact succeeded, read the
+    calendar and stop there; otherwise go on to the booking step. The contact
+    resolves, so the declared path is the read — and the run ends there without
+    ever reaching the two steps the other outcome would have run. No approval was
+    asked for and no event was created, because the runtime executed the steps the
+    program named and invented none.
+    """
+    token, task_id = await _branching_task(
+        client, stub, _fork(after_step=1, reads=1, then_step=2, else_step=3)
+    )
+
+    outcome = await _trigger(client, token, task_id)
+
+    assert outcome["approval_ids"] == []
+    assert backend.created_events == {}, "the step only the other path reaches ran"
+    assert outcome["task_state"] == FAILED, outcome
+
+    evidence = await _internal_evidence(task_id)
+    assert sorted({entry["step_order"] for entry in evidence}) == [1, 2], evidence
+    assert {entry["tool"] for entry in evidence} == {
+        "contacts.match",
+        "calendar.read_slots",
+    }
+
+
+async def test_a_resume_re_derives_the_declared_branch_instead_of_asking_again(
+    client: httpx.AsyncClient,
+    backend: GoogleBackend,
+    stub: RuntimeStubModel,
+) -> None:
+    """The branch is re-decided from durable evidence, and nothing runs twice.
+
+    The fork follows the availability check: on success book the slot, otherwise
+    go straight to the verification step. The first trigger runs the booking step
+    as far as its approval checkpoint, which parks the task — a real boundary,
+    with the next trigger a new claim. That trigger re-walks the program from its
+    entry, reads the outcome step 2 recorded, and takes the same branch: the
+    booking step, not the step only its other outcome could have reached.
+    """
+    token, task_id = await _branching_task(
+        client, stub, _fork(after_step=2, reads=2, then_step=3, else_step=4)
+    )
+
+    first = await _trigger(client, token, task_id)
+    assert first["outcome"] == "WAITING_APPROVAL", first
+    assert (await _row(task_id))[0] == 2, "the cursor counts the step the fork follows"
+
+    await _approve(client, token, first["approval_ids"][0])
+    await _trigger(client, token, task_id)
+
+    evidence = await _internal_evidence(task_id)
+    assert sorted({entry["step_order"] for entry in evidence}) == [1, 2, 3], evidence
+    # The booking step ran twice and inserted once: the attempt that needed
+    # approval is on record as denied, and the approved one is the only insert.
+    creates = [entry for entry in evidence if entry["tool"] == "calendar.create_event"]
+    assert [entry["ok"] for entry in creates] == [False, True], creates
+    assert len(backend.created_events) == 1
+    # One program, one fingerprint, across both claims: the branch was re-derived
+    # from the same program, not rebuilt around a new decision.
+    assert len({entry["ir_program_id"] for entry in evidence}) == 1
+    assert len({entry["ir_fingerprint"] for entry in evidence}) == 1
+
+
 async def _approve(client: httpx.AsyncClient, token: str, approval_id: str) -> None:
     resp = await client.post(
         f"{API_PREFIX}/approvals/{approval_id}/approve",

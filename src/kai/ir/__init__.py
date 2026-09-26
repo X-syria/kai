@@ -17,7 +17,8 @@ same Gateway path as any other.
 Spec: ``docs/kai-ir-spec-v0.md``.
 
 Scope of this slice: twelve of the fourteen primitives, translation of persisted
-planning output, deterministic control-flow traversal, and the Gateway boundary.
+planning output — including the branches a plan declares — deterministic
+control-flow traversal, and the Gateway boundary.
 ``MemoryOpNode`` and ``ApprovalNode`` are deliberately absent — the first would
 duplicate a memory subsystem, and the second would duplicate the Gateway's own
 authority over approval.
@@ -37,6 +38,9 @@ from kai.ir.adapter import (
 from kai.ir.build import (
     action_id_for,
     allowed_capabilities_from_task,
+    branch_errors,
+    condition_from_plan,
+    graph_from_plan,
     program_from_plan,
     program_id_for,
     tools_by_capability,
@@ -104,17 +108,21 @@ __all__ = [
     "PermissionNode",
     "PlanNode",
     "PolicyConstraintsNode",
+    "PredicateValue",
     "StateSnapshotNode",
     "StepNode",
     "action_for",
     "action_id_for",
     "allowed_capabilities_from_task",
     "attach",
+    "branch_errors",
     "canonical_fingerprint",
     "canonical_json",
+    "condition_from_plan",
     "error_from_observation",
     "evaluate",
     "evidence_from_observation",
+    "graph_from_plan",
     "intent_from_action",
     "linear_graph",
     "next_node",

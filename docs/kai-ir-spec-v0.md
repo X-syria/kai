@@ -53,8 +53,8 @@ Three rows need their reasoning stated rather than left to inference:
   representation-level addition described in §12.2, and it introduced no new
   authority.
 - **"Implemented" does not imply reachable.** `ConditionNode` and `ControlNode`
-  are fully live — the Runtime walks them on every step — but the production
-  Planner emits no branches, so only linear graphs are built today (§8.9).
+  are fully live: the Planner declares branches, `program_from_plan()` compiles
+  them, and the Runtime walks them on every step (§8.9).
 
 ## 1. Scope and non-goals
 
@@ -708,26 +708,81 @@ same Gateway, under the same policy checks, with the same approval handling.
 
 #### 8.9 Planner boundary
 
-The production Planner emits an ordered `PlanProposal`, and `program_from_plan()`
-builds the corresponding control graph from it:
+The production Planner emits a `PlanProposal` whose `branches` field is an
+**optional** array of two-way forks, and `program_from_plan()` builds the
+corresponding control graph from it:
 
 ```
 Planner
   ↓
-ordered PlanProposal (no branches)
+PlanProposal { steps[1..n], branches[] }        branches[] omitted → no forks
   ↓
-KAI-IR linear control graph:  action-1 -> action-2 -> ... -> result
+KAI-IR control graph
 ```
 
-The Planner does not emit branches, and does not need to know that it does not:
-a plan with no branching still gets a real graph, validated and walked exactly
-like a branching one. Branching is introduced by replacing a section of that
-chain with condition nodes — not by adding a second execution path the Runtime
-would have to learn about separately.
+The Planner is asked for a fork only when the step that comes next genuinely
+depends on a fact that is already known. It does not describe a graph, and it
+cannot: the declaration has four fields and no vocabulary for anything else.
 
-The representation and the Runtime already support a branching graph when one is
-supplied. What does not exist is a Planner that produces them: planner-emitted
-branching is deferred (§13), and no Planner API for it is specified here.
+**A declared branch** (`PlanBranch`) is:
+
+| Field | Meaning |
+| --- | --- |
+| `after_step` | the step the fork follows, by `order` |
+| `condition` | one `PlanCondition` (§4.4's vocabulary, unchanged) |
+| `then_step` | the step the condition being *true* leads to |
+| `else_step` | the step the condition being *false* leads to |
+
+`condition` carries `kind`, `operator`, `value`, `negate`, and — for
+`kind: "observation"` — `step_order` and `field`. These are the same closed sets
+a `ConditionNode` accepts, used directly: **the Planner gets no looser condition
+language than the IR has**, and a declaration the IR cannot represent is refused
+by `ConditionNode`'s own validation rather than translated into something wider.
+
+**The partition rule.** Exactly one of `then_step`/`else_step` must be
+`after_step + 1`; the other must be a later step, and those are the only two that
+may run. This is not a style rule. A fork that skipped nothing is not a fork, and
+a fork that skipped a step in the middle would leave that step on no path at all
+— dead structure, which §8.3 refuses. Requiring one target to be the natural
+continuation is exactly the condition under which every declared step stays on
+exactly one acyclic path.
+
+**Translation** (`graph_from_plan()`) is therefore mechanical and adds nothing:
+
+- a plan with no branches gets `linear_graph(steps)` — the identical graph, and
+  the identical `program_id` and fingerprint, it has always produced;
+- each branch becomes one `ControlNode` of kind `condition` carrying the
+  declared `ConditionNode`, reached from `action-{after_step}` by an
+  unconditional edge;
+- its two outgoing edges carry the declared condition and **the same condition
+  negated** — the only two-way shape §8.4 can prove covers every value of the
+  fact. The Planner names where each outcome *goes*; the predicate decides
+  nothing more than that;
+- a step whose successor is a branch target ends its chain there and runs into a
+  `result` node, so each path has exactly one end.
+
+**Two gates, one rule set.** A declaration that cannot become a graph is refused
+where it is offered: `domain_errors()` calls `branch_errors()` and compiles each
+condition, so a malformed branch is rejected when the plan is *accepted* rather
+than surfacing as an unexecutable program mid-task. The program is then built and
+validated anyway (§8.3, §8.5), because the same rule failing twice is cheaper
+than a plan that was accepted and could not run. There is no weaker
+Planner-specific check to drift out of step with the IR's own.
+
+**What the Planner still cannot say.** No `else`/`end`/`goto`/`loop`, no free-form
+graph, no cycles (§8.13), and no way to express permission, risk, capability, or
+tool choice: those remain absent from `PlanBranch` by construction, exactly as
+they are absent from every other part of the plan.
+
+**Honest limit of this slice.** The Runtime stops a run at the first step whose
+outcome is not `EXECUTION_SUCCEEDED`, so a branch that would read a *failed*
+step is not reachable in production today — a plan that declares one is valid and
+simply never fires. The facts that do vary mid-run are `cursor`, `steps_used`,
+and `task_state`; the observation facts are constant on every path that reaches a
+fork, so today a declared branch selects *which planned steps run* rather than
+reacting to a failure. Both polarities of a branch are exercised at program level
+in `tests/test_kai_ir.py`; the end-to-end tests in `tests/test_runtime.py` prove
+the production path end to end.
 
 #### 8.10 Action identity under branching
 
@@ -862,10 +917,11 @@ reach therefore fails when it reaches that case, not at build time.
   maps directly onto schemas that already exist. `ApprovalNode` and
   `MemoryOpNode` remain deferred as IR nodes, though the underlying system
   capabilities they would name already exist (§13).
-- `ConditionNode`, `ControlNode`, and `ControlEdge` are implemented and are
-  walked by the Runtime. Branching is a *second* control-flow model, at step
-  granularity, and it does not replace the task state machine: that machine
-  remains authoritative for task state (§8.7).
+- `ConditionNode`, `ControlNode`, and `ControlEdge` are implemented, declared by
+  the Planner (§8.9), compiled by `program_from_plan()`, and walked by the
+  Runtime. Branching is a *second* control-flow model, at step granularity, and it
+  does not replace the task state machine: that machine remains authoritative for
+  task state (§8.7).
 - `ErrorNode` is implemented as a validated model, while the error classes
   execution still derives from `error_code` + task state.
 - The Tool Gateway is unaffected: IR references capabilities, and the Gateway
@@ -962,7 +1018,7 @@ commitment to a particular design.
 | --- | --- | --- |
 | `ApprovalNode` (§4.12) | approvals are requested by the Gateway during execution, not named in advance by a plan | the `Approval` model and its single-use consume |
 | `MemoryOpNode` (§4.10) | memory is context for a step, not a step of its own | `MemoryService` (retrieve / create) |
-| Planner-generated branching (§8.9) | the Planner emits an ordered `PlanProposal`; emitting a graph is a Planner change | the IR representation, and a Runtime that walks branches |
+| A branch on a *failed* step (§8.9) | the Runtime stops a run at the first non-successful step, so such a branch can never fire | branches on `cursor` / `steps_used` / `task_state` and on the outcomes of steps that succeeded |
 | Exhaustive guard partition validation (§8.14) | it is a decision procedure, not a structural check | run-time "exactly one eligible edge" (§8.4) |
 | Cycles / loops (§8.13) | a cycle breaks action-id exactly-once and current recovery assumptions | acyclicity enforcement |
 | Execution-time dispatch of `ErrorNode` (§4.9) | error routing is still the task state machine's | the validated `ErrorNode` model |
