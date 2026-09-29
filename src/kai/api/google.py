@@ -8,8 +8,6 @@ identity to the user/tenant that started it. ``/accounts`` never surfaces
 tokens or encrypted blobs.
 """
 
-from datetime import UTC, datetime, timedelta
-
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select
@@ -22,7 +20,6 @@ from kai.db.models import GoogleAccount, User
 from kai.db.scoping import get_user_for_tenant
 from kai.google import client
 from kai.google.client import GoogleOAuthError, build_authorization_url
-from kai.google.crypto import encrypt_credentials
 from kai.google.deps import get_google_http_client
 from kai.google.service import (
     GoogleAccountConflictError,
@@ -116,13 +113,9 @@ async def google_callback(
             google_sub=info.sub,
             email=info.email,
             scopes=settings.google_oauth_scopes,
-            credentials_encrypted=encrypt_credentials(
-                {
-                    "access_token": token.access_token,
-                    "refresh_token": token.refresh_token,
-                }
-            ),
-            token_expires_at=datetime.now(UTC) + timedelta(seconds=token.expires_in),
+            access_token=token.access_token,
+            refresh_token=token.refresh_token,
+            expires_in=token.expires_in,
         )
     except GoogleAccountConflictError as exc:
         raise HTTPException(

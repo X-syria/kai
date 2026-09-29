@@ -27,8 +27,7 @@ from kai.calendar.client import (
 from kai.calendar.models import CalendarEvent
 from kai.calendar.service_models import CreateEventOutcome, CreateEventRequest, FieldMismatch
 from kai.db.models import GoogleAccount
-from kai.google.client import GoogleOAuthError
-from kai.google.crypto import decrypt_credentials
+from kai.google.service import usable_access_token
 
 
 class AccountNotFoundError(ValueError):
@@ -50,14 +49,6 @@ async def _load_account(
     return account
 
 
-def _access_token(account: GoogleAccount) -> str:
-    credentials = decrypt_credentials(account.credentials_encrypted)
-    token = credentials.get("access_token")
-    if not isinstance(token, str) or not token:
-        raise GoogleOAuthError("google account has no stored access token")
-    return token
-
-
 async def list_events(
     session: AsyncSession,
     transport: httpx.AsyncClient,
@@ -71,7 +62,7 @@ async def list_events(
     account = await _load_account(session, account_id=account_id, tenant_id=tenant_id)
     return await client.fetch_events(
         transport,
-        access_token=_access_token(account),
+        access_token=await usable_access_token(session, transport, account=account),
         start=start,
         end=end,
     )
@@ -88,7 +79,9 @@ async def get_event(
     """Read one timed event, scoped to ``(account_id, tenant_id)``."""
     account = await _load_account(session, account_id=account_id, tenant_id=tenant_id)
     return await fetch_event(
-        transport, access_token=_access_token(account), event_id=event_id
+        transport,
+        access_token=await usable_access_token(session, transport, account=account),
+        event_id=event_id,
     )
 
 
@@ -208,7 +201,7 @@ async def create_and_verify_event(
     explicitly not verified.
     """
     account = await _load_account(session, account_id=account_id, tenant_id=tenant_id)
-    token = _access_token(account)
+    token = await usable_access_token(session, transport, account=account)
     created = await client.create_event(transport, access_token=token, req=req)
     try:
         readback = await fetch_event(

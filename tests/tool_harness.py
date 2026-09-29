@@ -13,6 +13,7 @@ import uuid
 from collections import deque
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from urllib.parse import urlparse
 
@@ -281,6 +282,7 @@ async def insert_account(
             email=email,
             scopes=scopes,
             credentials_encrypted=encrypt_credentials({"access_token": ACCESS_TOKEN}),
+            token_expires_at=datetime.now(UTC) + timedelta(hours=1),
         )
         session.add(account)
         await session.commit()
@@ -310,6 +312,7 @@ async def make_task(
         {
             "goal": "Assist the user",
             "success_criteria": ["done"],
+            "fulfillment_profile": "calendar_meeting",
             "allowed_tools": allowed_tools or [],
             "risk_policy": risk_policy,
             "deadline": deadline,

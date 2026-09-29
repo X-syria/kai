@@ -23,6 +23,7 @@ def _task(**overrides: object) -> Task:
     params: dict[str, object] = {
         "goal": GOAL,
         "success_criteria": list(CRITERIA),
+        "fulfillment_profile": "calendar_meeting",
         "max_steps": 5,
     }
     params.update(overrides)
@@ -101,6 +102,19 @@ def test_extra_top_level_fields_rejected() -> None:
         PlanProposal.model_validate(
             _plan(permissions=["delete-emails"], allowed_tools=["admin"])
         )
+
+
+def test_a_plan_cannot_name_its_own_fulfillment_profile() -> None:
+    """The evaluator is bound by the sealed contract, not chosen by the model.
+
+    ``fulfillment_profile`` is the field that says which evaluator answers a
+    task's ``success_criteria``. A plan that could set it would be choosing the
+    standard it is later judged against, so the field is absent from the
+    proposal schema and ``extra="forbid"`` refuses it.
+    """
+    with pytest.raises(ValidationError) as exc_info:
+        PlanProposal.model_validate(_plan(fulfillment_profile="calendar_meeting"))
+    assert "fulfillment_profile" in str(exc_info.value)
 
 
 def test_step_without_action_rejected() -> None:

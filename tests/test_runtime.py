@@ -21,6 +21,7 @@ from uuid import UUID, uuid4
 
 import httpx
 import pytest
+from pydantic import ValidationError
 from sqlalchemy import event, select
 from sqlalchemy import inspect as sa_inspect
 
@@ -32,8 +33,21 @@ from kai.memory.models import MemoryType
 from kai.memory.service import create_memory
 from kai.planner.deps import get_planner_model
 from kai.planner.model import PLANNER_SYSTEM_PROMPT
+from kai.runtime.fulfillment import (
+    CALENDAR_MEETING_EVALUATOR_VERSION,
+    FulfillmentOutcome,
+    FulfillmentVerdict,
+    SuccessCriteria,
+    calendar_meeting_criteria,
+)
 from kai.runtime.models import RuntimeExecution
-from kai.runtime.service import next_action_for
+from kai.runtime.schemas import UnderstandingOutput
+from kai.runtime.service import (
+    RuntimeFatal,
+    _fulfillment_outcome,
+    next_action_for,
+)
+from kai.runtime.translator import SLICE_SUCCESS_CRITERIA
 from kai.runtime.understanding import UNDERSTANDING_SYSTEM_PROMPT
 from kai.tasks.models import Task
 from kai.tasks.state import (
@@ -555,6 +569,88 @@ async def test_the_runtime_follows_the_programs_control_flow(
     assert snapshot["task_state"] == FAILED
 
 
+async def test_a_live_run_only_records_observations_its_program_accepts(
+    client: httpx.AsyncClient,
+    backend: GoogleBackend,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The Runtime fills a program's observation log after it was validated.
+
+    A program is built and validated with an empty log, so the IR's observation
+    rules have nothing to say at construction; they are decided later, at the
+    writer, while the run is recording. This drives a real task to completion
+    and asks the question the invariant actually asks: does the program the
+    Runtime executed still pass its own ``validate_executable`` once the Runtime
+    has finished writing to it? A run that admitted an observation the program
+    would refuse could not.
+
+    The spy delegates to the real builder, so the program under test is exactly
+    the one production built — only the reference to it is kept.
+    """
+    from kai.runtime import service as runtime_service
+
+    build_program = runtime_service.program_from_plan
+    built: list = []
+
+    def capturing_program(**kwargs: object) -> object:
+        program = build_program(**kwargs)  # type: ignore[arg-type]
+        built.append(program)
+        return program
+
+    monkeypatch.setattr(runtime_service, "program_from_plan", capturing_program)
+
+    token = await _register(client, "khaled@example.com")
+    tenant_id, user_id = await _user_scope("khaled@example.com")
+    await insert_account(
+        tenant_id=tenant_id,
+        user_id=user_id,
+        email="khaled@example.com",
+        scopes=(
+            "openid email "
+            "https://www.googleapis.com/auth/calendar.events "
+            "https://www.googleapis.com/auth/contacts.readonly"
+        ),
+    )
+    await _seed_attendee_memory(tenant_id, user_id)
+
+    task_id, _ = await _submit(client, token)
+    first = await _trigger(client, token, task_id)
+    assert first["task_state"] == WAITING_APPROVAL, first
+    await client.post(
+        f"{API_PREFIX}/approvals/{first['approval_ids'][0]}/approve",
+        json={"reason": "yes, book it"},
+        headers=_auth(token),
+    )
+    second = await _trigger(client, token, task_id)
+    assert second["task_state"] == COMPLETED, second
+    assert len(backend.created_events) == 1
+
+    # Both triggers built a program, and the runtime recorded into it.
+    assert len(built) == 2, built
+    recorded = [program for program in built if program.observations]
+    assert recorded, "no program recorded an observation"
+
+    for program in built:
+        # Every program was valid the moment it was built...
+        assert program.fingerprint == program.computed_fingerprint()
+        # ...and is still valid after the runtime recorded into it. That is the
+        # whole invariant: recording never leaves a program the IR would refuse.
+        assert program.validate_executable() is program
+
+    # And the log the run left is the one its own result reports, with one
+    # record per action and no record for a step the plan does not declare.
+    finished = recorded[-1]
+    planned = {step.order for step in finished.plan.steps}
+    assert finished.result is not None
+    assert finished.result.final_observation_ids == [
+        observation.action_id for observation in finished.observations
+    ]
+    assert len(set(finished.result.final_observation_ids)) == len(
+        finished.result.final_observation_ids
+    )
+    assert {observation.step_order for observation in finished.observations} <= planned
+
+
 def _fork(
     *, after_step: int, reads: int, then_step: int, else_step: int
 ) -> dict:
@@ -838,7 +934,7 @@ async def test_a_task_parked_in_verifying_is_settled_not_re_executed(
     def _explode(*_args: object, **_kwargs: object) -> bool:
         raise RuntimeError("worker died mid-verification")
 
-    monkeypatch.setattr("kai.runtime.service._fulfilled", _explode)
+    monkeypatch.setattr("kai.runtime.service._fulfillment_outcome", _explode)
 
     with pytest.raises(RuntimeError, match="mid-verification"):
         await _trigger(client, token, task_id)
@@ -879,7 +975,7 @@ async def test_a_task_parked_in_verifying_fails_the_same_way_when_evidence_is_sh
     def _explode(*_args: object, **_kwargs: object) -> bool:
         raise RuntimeError("worker died mid-verification")
 
-    monkeypatch.setattr("kai.runtime.service._fulfilled", _explode)
+    monkeypatch.setattr("kai.runtime.service._fulfillment_outcome", _explode)
     with pytest.raises(RuntimeError):
         await _trigger(client, token, task_id)
     monkeypatch.undo()
@@ -901,6 +997,653 @@ async def test_a_task_parked_in_verifying_fails_the_same_way_when_evidence_is_sh
     assert settled["outcome"] == "FAILED", settled
     assert "success criteria" in settled["message"]
     assert len(backend.created_events) == 1
+
+
+async def test_an_indeterminate_verdict_stops_for_a_human_not_a_failure(
+    client: httpx.AsyncClient,
+    backend: GoogleBackend,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``INDETERMINATE`` is its own answer, and it settles differently.
+
+    The calendar evaluator cannot produce this verdict — every check it makes is
+    decidable over durable scalars. What is under test here is the part that has
+    to hold for *every* profile: the three values route to three different
+    states. Folding uncertainty into failure would report a run that actually
+    worked as though it had not, so the outcome is ``REQUIRES_ATTENTION``.
+    """
+    token, task_id, approval_id = await _ready_task(client, "khaled@example.com")
+    await _approve(client, token, approval_id)
+
+    def _undecided(
+        *_args: object, **_kwargs: object
+    ) -> FulfillmentOutcome:
+        return FulfillmentOutcome(
+            profile="calendar_meeting",
+            version=CALENDAR_MEETING_EVALUATOR_VERSION,
+            verdict=FulfillmentVerdict.INDETERMINATE,
+        )
+
+    monkeypatch.setattr("kai.runtime.service._fulfillment_outcome", _undecided)
+
+    settled = await _trigger(client, token, task_id)
+    assert settled["outcome"] == "REQUIRES_ATTENTION", settled
+    assert "INDETERMINATE" in settled["message"]
+    assert (await _inspect(client, token, task_id))["task_state"] == "REQUIRES_ATTENTION"
+    # The work that already happened is not undone, and the event is not deleted.
+    assert len(backend.created_events) == 1
+
+
+async def test_settlement_dispatches_on_the_persisted_contract_not_the_run(
+    client: httpx.AsyncClient,
+    backend: GoogleBackend,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The evaluator is chosen by the sealed contract, and nothing else.
+
+    ``_fulfillment_outcome`` is given the task row, the persisted scenario, and
+    the durable log. There is no parameter a model, a planner proposal, or a
+    resumed run could use to point it at a different evaluator, and a row whose
+    profile names no evaluator is refused rather than guessed at.
+    """
+    token, task_id, approval_id = await _ready_task(client, "khaled@example.com")
+    await _approve(client, token, approval_id)
+
+    seen: list[str] = []
+
+    def _record_profile(task: Task, **_kwargs: object) -> FulfillmentOutcome:
+        seen.append(task.fulfillment_profile)
+        return FulfillmentOutcome(
+            profile="calendar_meeting",
+            version=CALENDAR_MEETING_EVALUATOR_VERSION,
+            verdict=FulfillmentVerdict.INDETERMINATE,
+        )
+
+    monkeypatch.setattr("kai.runtime.service._fulfillment_outcome", _record_profile)
+    await _trigger(client, token, task_id)
+    assert seen == ["calendar_meeting"]
+    monkeypatch.undo()
+
+    # A profile outside the sealed vocabulary has no evaluator, and the runtime
+    # says so instead of quietly running the calendar one.
+    async with async_session_factory() as session:
+        task = await session.get(Task, UUID(task_id))
+        row = await session.scalar(
+            select(RuntimeExecution).where(RuntimeExecution.task_id == UUID(task_id))
+        )
+        assert task is not None and row is not None
+        assert task.fulfillment_profile == "calendar_meeting"
+        task.fulfillment_profile = "invoice_paid"  # type: ignore[assignment]
+        with pytest.raises(RuntimeFatal, match="no fulfillment evaluator"):
+            _fulfillment_outcome(
+                task,
+                scenario=UnderstandingOutput.model_validate(row.scenario),
+                identities=list(row.identities),
+                evidence=list(row.evidence),
+            )
+
+
+# ----------------------------------------------------------------------------------
+# The audit triple: what decided the verdict, recorded and never obeyed
+# ----------------------------------------------------------------------------------
+
+
+async def _audit_row(task_id: UUID) -> tuple[str | None, str | None, str | None]:
+    """Re-read the triple from the database, on a fresh session.
+
+    Deliberately not the in-memory object: what matters is that the record
+    survived the commit, not that an attribute was set on a live ORM instance.
+    """
+    async with async_session_factory() as session:
+        row = await session.scalar(
+            select(RuntimeExecution).where(RuntimeExecution.task_id == task_id)
+        )
+        assert row is not None
+        return row.fulfillment_profile, row.evaluator_version, row.fulfillment_verdict
+
+
+async def test_a_successful_run_records_the_profile_the_version_and_the_verdict(
+    client: httpx.AsyncClient,
+) -> None:
+    """The whole of the decision, readable later without re-running anything.
+
+    All three, from the one settlement: which sealed profile was evaluated,
+    which version of that evaluator's semantics judged the evidence, and the
+    verdict it reached. A reader six months from now can answer "was this
+    actually fulfilled, and by what" from this row.
+    """
+    token, task_id, approval_id = await _ready_task(client, "khaled@example.com")
+    await _approve(client, token, approval_id)
+
+    settled = await _trigger(client, token, task_id)
+    assert settled["outcome"] == "COMPLETED", settled
+
+    assert await _audit_row(task_id) == (
+        "calendar_meeting",
+        CALENDAR_MEETING_EVALUATOR_VERSION,
+        "FULFILLED",
+    )
+    assert (await _inspect(client, token, task_id))["task_state"] == "COMPLETED"
+
+
+async def test_a_failed_run_records_the_verdict_that_failed_it(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failure is as auditable as a success, and names the same evaluator."""
+    token, task_id, approval_id = await _ready_task(client, "khaled@example.com")
+    await _approve(client, token, approval_id)
+
+    def _explode(*_args: object, **_kwargs: object) -> bool:
+        raise RuntimeError("worker died mid-verification")
+
+    monkeypatch.setattr("kai.runtime.service._fulfillment_outcome", _explode)
+    with pytest.raises(RuntimeError):
+        await _trigger(client, token, task_id)
+    monkeypatch.undo()
+
+    async with async_session_factory() as session:
+        row = await session.scalar(
+            select(RuntimeExecution).where(RuntimeExecution.task_id == task_id)
+        )
+        assert row is not None
+        row.evidence = [
+            entry for entry in row.evidence if entry["tool"] != "calendar.create_event"
+        ]
+        await session.commit()
+
+    settled = await _trigger(client, token, task_id)
+    assert settled["outcome"] == "FAILED", settled
+
+    assert await _audit_row(task_id) == (
+        "calendar_meeting",
+        CALENDAR_MEETING_EVALUATOR_VERSION,
+        "NOT_FULFILLED",
+    )
+
+
+async def test_an_indeterminate_run_records_its_own_verdict(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The triple records the verdict that was actually reached, not the common one."""
+    token, task_id, approval_id = await _ready_task(client, "khaled@example.com")
+    await _approve(client, token, approval_id)
+
+    def _undecided(*_args: object, **_kwargs: object) -> FulfillmentOutcome:
+        return FulfillmentOutcome(
+            profile="calendar_meeting",
+            version=CALENDAR_MEETING_EVALUATOR_VERSION,
+            verdict=FulfillmentVerdict.INDETERMINATE,
+        )
+
+    monkeypatch.setattr("kai.runtime.service._fulfillment_outcome", _undecided)
+    settled = await _trigger(client, token, task_id)
+    assert settled["outcome"] == "REQUIRES_ATTENTION", settled
+
+    assert await _audit_row(task_id) == (
+        "calendar_meeting",
+        CALENDAR_MEETING_EVALUATOR_VERSION,
+        "INDETERMINATE",
+    )
+
+
+async def test_the_recorded_profile_is_the_sealed_contract_not_a_copy_the_model_could_edit(
+    client: httpx.AsyncClient,
+) -> None:
+    """The recorded profile came from the contract, so it cannot be redirected.
+
+    Provenance matters here: a profile that was inferred from the goal or the
+    tools would be a second thing to trust, and one that could disagree with the
+    contract without the contract's knowledge.
+    """
+    token, task_id, approval_id = await _ready_task(client, "khaled@example.com")
+    await _approve(client, token, approval_id)
+    await _trigger(client, token, task_id)
+
+    async with async_session_factory() as session:
+        task = await session.get(Task, task_id)
+        assert task is not None
+        assert task.fulfillment_profile == "calendar_meeting"
+    assert (await _audit_row(task_id))[0] == task.fulfillment_profile
+
+
+async def test_recovery_records_the_same_triple_the_live_path_would(
+    client: httpx.AsyncClient,
+    backend: GoogleBackend,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Crashing before the transition must not change what gets recorded.
+
+    The worker dies between evaluating and settling, so the row is written by the
+    resume instead. Same profile, same version, same verdict as a run that never
+    crashed — which is the point of both paths sharing one settlement function.
+    """
+    token, task_id, approval_id = await _ready_task(client, "khaled@example.com")
+    await _approve(client, token, approval_id)
+
+    def _explode(*_args: object, **_kwargs: object) -> bool:
+        raise RuntimeError("worker died mid-verification")
+
+    monkeypatch.setattr("kai.runtime.service._fulfillment_outcome", _explode)
+    with pytest.raises(RuntimeError):
+        await _trigger(client, token, task_id)
+    monkeypatch.undo()
+
+    # Nothing was committed by the crashed attempt.
+    assert await _audit_row(task_id) == (None, None, None)
+
+    settled = await _trigger(client, token, task_id)
+    assert settled["outcome"] == "COMPLETED", settled
+    assert await _audit_row(task_id) == (
+        "calendar_meeting",
+        CALENDAR_MEETING_EVALUATOR_VERSION,
+        "FULFILLED",
+    )
+    assert len(backend.created_events) == 1, "the work was not repeated"
+
+
+async def test_the_recorded_verdict_is_never_read_back_as_the_answer(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A record that contradicted the evidence would be corrected, not obeyed.
+
+    The sharpest statement of the authority boundary: tamper with the stored
+    verdict, settle again, and watch the freshly derived answer win. If this
+    ever fails, the audit trail has quietly become a second source of truth.
+    """
+    token, task_id, approval_id = await _ready_task(client, "khaled@example.com")
+    await _approve(client, token, approval_id)
+
+    def _explode(*_args: object, **_kwargs: object) -> bool:
+        raise RuntimeError("worker died mid-verification")
+
+    monkeypatch.setattr("kai.runtime.service._fulfillment_outcome", _explode)
+    with pytest.raises(RuntimeError):
+        await _trigger(client, token, task_id)
+    monkeypatch.undo()
+
+    # A verdict the evidence does not support, planted before any settlement.
+    async with async_session_factory() as session:
+        row = await session.scalar(
+            select(RuntimeExecution).where(RuntimeExecution.task_id == task_id)
+        )
+        assert row is not None
+        assert row.fulfillment_verdict is None
+        row.fulfillment_verdict = "NOT_FULFILLED"
+        row.evaluator_version = "calendar_meeting:v0-imaginary"
+        await session.commit()
+
+    settled = await _trigger(client, token, task_id)
+    # The evidence supports FULFILLED, so FULFILLED is what the task gets...
+    assert settled["outcome"] == "COMPLETED", settled
+    assert (await _inspect(client, token, task_id))["task_state"] == "COMPLETED"
+    # ...and the row now describes that decision, overwriting the planted values.
+    assert await _audit_row(task_id) == (
+        "calendar_meeting",
+        CALENDAR_MEETING_EVALUATOR_VERSION,
+        "FULFILLED",
+    )
+
+
+async def test_an_execution_that_never_reached_verification_keeps_a_null_triple(
+    client: httpx.AsyncClient,
+) -> None:
+    """A run that stopped early has no identity to claim, and is not given one.
+
+    Submitted and approved but never triggered: an execution row exists, the
+    evaluator never ran, so all three stay NULL. NULL here means "not recorded",
+    never "nothing was decided".
+    """
+    token, task_id, _approval_id = await _ready_task(client, "khaled@example.com")
+    assert (await _inspect(client, token, task_id))["task_state"] == "WAITING_APPROVAL"
+    assert await _audit_row(task_id) == (None, None, None)
+
+
+async def test_settling_twice_records_the_same_triple_and_moves_nothing(
+    client: httpx.AsyncClient,
+) -> None:
+    """The triple is idempotent, because the decision it describes is.
+
+    A task past its terminal state has nothing left to settle, so a repeated
+    trigger is a no-op rather than a second settlement. The record stays put
+    instead of drifting.
+    """
+    token, task_id, approval_id = await _ready_task(client, "khaled@example.com")
+    await _approve(client, token, approval_id)
+    await _trigger(client, token, task_id)
+    first = await _audit_row(task_id)
+
+    again = await _trigger(client, token, task_id)
+    assert again["outcome"] != "COMPLETED", again
+    assert await _audit_row(task_id) == first
+
+
+# ----------------------------------------------------------------------------------
+# Sealed Success Criteria: the typed authority, and the prose that is not it
+# ----------------------------------------------------------------------------------
+
+
+async def test_the_sealed_contract_carries_the_prose_and_the_profile_not_a_criteria(
+    client: httpx.AsyncClient,
+) -> None:
+    """At submission there is prose and a profile, and no typed criteria.
+
+    Worth stating because it is a real ordering fact, not an omission: the contract
+    is sealed at submit, before understanding has produced a window, so there is
+    nothing typed to seal yet. The criteria are sealed when their own inputs are —
+    the scenario and the identities, both committed before any tool runs.
+    """
+    token, task_id, _approval_id = await _ready_task(client, "khaled@example.com")
+    async with async_session_factory() as session:
+        task = await session.get(Task, task_id)
+        assert task is not None
+        assert task.success_criteria == list(SLICE_SUCCESS_CRITERIA)
+        assert task.fulfillment_profile == "calendar_meeting"
+    # And the prose is the planner's verbatim contract, which is why it stays.
+    assert (await _inspect(client, token, task_id))["task_state"] == "WAITING_APPROVAL"
+
+
+async def test_the_prose_criteria_survive_submission_verbatim_for_the_planner(
+    client: httpx.AsyncClient,
+) -> None:
+    """The description is a real contract surface — it is simply not the authority.
+
+    ``PlanProposal`` must reproduce these three strings exactly or be rejected, so
+    the prose is load-bearing for plan validation. That is a reason to keep it
+    precisely, and not a reason to let it decide fulfillment.
+    """
+    from kai.planner.schemas import PlanProposal, domain_errors
+
+    token, task_id, _approval_id = await _ready_task(client, "khaled@example.com")
+    async with async_session_factory() as session:
+        task = await session.get(Task, task_id)
+        assert task is not None
+        step = {
+            "step_id": "s1",
+            "order": 1,
+            "action": "resolve_contact",
+            "purpose": "find the guest",
+        }
+        plan = PlanProposal.model_validate(
+            {
+                "goal": task.goal,
+                "success_criteria": list(task.success_criteria),
+                "steps": [step],
+                "assumptions": [],
+                "unresolved_questions": [],
+            }
+        )
+        assert domain_errors(plan, task=task) == []
+        # A paraphrase is rejected as a contract mismatch, not silently accepted.
+        paraphrased = PlanProposal.model_validate(
+            {
+                "goal": task.goal,
+                "success_criteria": ["the meeting happened somehow"],
+                "steps": [step],
+                "assumptions": [],
+                "unresolved_questions": [],
+            }
+        )
+        assert domain_errors(paraphrased, task=task) != []
+
+
+async def test_rewriting_the_sealed_prose_changes_no_verdict(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The human-readable text is not an input to fulfillment.
+
+    A sealed contract whose description was rewritten — after approval, by anyone —
+    still gets the verdict the typed criteria imply. If this ever fails, prose has
+    become an input to the evaluator, which is the thing this phase removed.
+    """
+    token, task_id, approval_id = await _ready_task(client, "khaled@example.com")
+    await _approve(client, token, approval_id)
+
+    async with async_session_factory() as session:
+        task = await session.get(Task, task_id)
+        assert task is not None
+        task.success_criteria = [
+            "a meeting was definitely never created",
+            "the attendee must be a stranger",
+            "the event must be outside every possible window",
+        ]
+        await session.commit()
+
+    settled = await _trigger(client, token, task_id)
+    assert settled["outcome"] == "COMPLETED", settled
+    assert await _audit_row(task_id) == (
+        "calendar_meeting",
+        CALENDAR_MEETING_EVALUATOR_VERSION,
+        "FULFILLED",
+    )
+
+
+async def test_the_runtime_cannot_be_handed_criteria_by_the_planner(
+    client: httpx.AsyncClient,
+) -> None:
+    """No path from a plan to the criteria, because the plan has no such field.
+
+    ``extra="forbid"`` on the plan means a proposal carrying success criteria in
+    any other shape is rejected outright, and the settlement path takes its inputs
+    from the task row and the execution row — never from a plan.
+    """
+    from kai.planner.schemas import PlanProposal
+
+    with pytest.raises(ValidationError):
+        PlanProposal.model_validate(
+            {
+                "goal": "schedule a meeting",
+                "success_criteria": list(SLICE_SUCCESS_CRITERIA),
+                "steps": [
+                    {
+                        "step_id": "s1",
+                        "order": 1,
+                        "action": "create_calendar_event",
+                        "purpose": "book it",
+                    }
+                ],
+                "assumptions": [],
+                "unresolved_questions": [],
+                "fulfillment_profile": "invoice_paid",
+            }
+        )
+    with pytest.raises(ValidationError):
+        PlanProposal.model_validate(
+            {
+                "goal": "schedule a meeting",
+                "success_criteria": list(SLICE_SUCCESS_CRITERIA),
+                "steps": [
+                    {
+                        "step_id": "s1",
+                        "order": 1,
+                        "action": "create_calendar_event",
+                        "purpose": "book it",
+                    }
+                ],
+                "assumptions": [],
+                "unresolved_questions": [],
+                "criteria": {"window": {}, "required_attendees": []},
+            }
+        )
+
+
+async def test_a_malformed_sealed_window_is_refused_before_it_reaches_a_check(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A bad window fails at the sealing boundary, not inside a comparison.
+
+    The window is sealed through ``MeetingWindow``, and the criteria are built from
+    that sealed value. Corrupting the persisted scenario so it no longer validates
+    makes the settlement path refuse it outright — deterministically, and before any
+    date is compared against ``args["date"]``.
+    """
+    token, task_id, approval_id = await _ready_task(client, "khaled@example.com")
+    await _approve(client, token, approval_id)
+
+    def _explode(*_args: object, **_kwargs: object) -> bool:
+        raise RuntimeError("worker died mid-verification")
+
+    monkeypatch.setattr("kai.runtime.service._fulfillment_outcome", _explode)
+    with pytest.raises(RuntimeError):
+        await _trigger(client, token, task_id)
+    monkeypatch.undo()
+
+    # An end date before the start date: no valid window, so no sealed criteria.
+    async with async_session_factory() as session:
+        row = await session.scalar(
+            select(RuntimeExecution).where(RuntimeExecution.task_id == task_id)
+        )
+        assert row is not None
+        scenario = dict(row.scenario or {})
+        window = dict(scenario["window"])
+        window["end_date"] = "2026-01-01"
+        scenario["window"] = window
+        row.scenario = scenario
+        await session.commit()
+
+    with pytest.raises(ValidationError):
+        await _trigger(client, token, task_id)
+
+
+async def test_recovery_evaluates_the_same_criteria_the_live_run_would(
+    client: httpx.AsyncClient,
+    backend: GoogleBackend,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same sealed rows in, same criteria and same verdict out, after a crash.
+
+    The crashed attempt wrote nothing, so the resume rebuilds the criteria from the
+    committed scenario and identities. Were the criteria anything other than a
+    function of those rows, this verdict could differ from the live one.
+    """
+    token, task_id, approval_id = await _ready_task(client, "khaled@example.com")
+    await _approve(client, token, approval_id)
+
+    def _explode(*_args: object, **_kwargs: object) -> bool:
+        raise RuntimeError("worker died mid-verification")
+
+    monkeypatch.setattr("kai.runtime.service._fulfillment_outcome", _explode)
+    with pytest.raises(RuntimeError):
+        await _trigger(client, token, task_id)
+    monkeypatch.undo()
+
+    # The criteria the crashed attempt would have applied, rebuilt from the rows
+    # that are already durable — the same value the resume will rebuild.
+    sealed = await _sealed_criteria_for(task_id)
+    assert sealed.profile == "calendar_meeting"
+    assert sealed.for_calendar_meeting().required_attendees
+
+    settled = await _trigger(client, token, task_id)
+    assert settled["outcome"] == "COMPLETED", settled
+    assert await _sealed_criteria_for(task_id) == sealed
+    assert await _audit_row(task_id) == (
+        "calendar_meeting",
+        CALENDAR_MEETING_EVALUATOR_VERSION,
+        "FULFILLED",
+    )
+    assert len(backend.created_events) == 1, "the work was not repeated"
+
+
+async def _sealed_criteria_for(task_id: UUID) -> SuccessCriteria:
+    """Rebuild the criteria the settlement path would seal, from the durable rows.
+
+    Goes through the runtime's own dispatch inputs rather than through the
+    evaluator, so a test cannot accidentally re-implement the derivation it is
+    checking.
+    """
+    async with async_session_factory() as session:
+        row = await session.scalar(
+            select(RuntimeExecution).where(RuntimeExecution.task_id == task_id)
+        )
+        task = await session.get(Task, task_id)
+        assert row is not None and task is not None
+        scenario = UnderstandingOutput.model_validate(row.scenario)
+        return calendar_meeting_criteria(
+            profile=task.fulfillment_profile,  # type: ignore[arg-type]
+            window=scenario.window,
+            identities=list(row.identities),
+        )
+
+
+async def test_the_criteria_are_a_function_of_the_sealed_rows_and_nothing_else(
+    client: httpx.AsyncClient,
+) -> None:
+    """The property, on real persisted state.
+
+    Same scenario and same identities => the same criteria value, whatever the log
+    says and whatever the contract's prose says. Both of those are varied here.
+    """
+    token, task_id, approval_id = await _ready_task(client, "khaled@example.com")
+    await _approve(client, token, approval_id)
+    first = await _sealed_criteria_for(task_id)
+
+    async with async_session_factory() as session:
+        task = await session.get(Task, task_id)
+        row = await session.scalar(
+            select(RuntimeExecution).where(RuntimeExecution.task_id == task_id)
+        )
+        assert task is not None and row is not None
+        task.success_criteria = ["rewritten description"]
+        row.evidence = [*list(row.evidence), {"tool": "gmail.send", "ok": True}]
+        await session.commit()
+
+    assert await _sealed_criteria_for(task_id) == first
+
+
+async def test_a_criteria_cannot_redirect_the_evaluator_on_a_live_run(
+    client: httpx.AsyncClient,
+) -> None:
+    """The sealed profile selects the evaluator; nothing else can reach it.
+
+    Even with the contract's profile rewritten to an unknown value *after* sealing,
+    the run stops rather than falling back to the calendar evaluator — and the
+    recorded identity names the profile the dispatch actually used.
+    """
+    token, task_id, approval_id = await _ready_task(client, "khaled@example.com")
+    await _approve(client, token, approval_id)
+
+    async with async_session_factory() as session:
+        task = await session.get(Task, task_id)
+        assert task is not None
+        task.fulfillment_profile = "invoice_paid"
+        await session.commit()
+
+    settled = await _trigger(client, token, task_id)
+    assert settled["outcome"] == "FAILED", settled
+    assert "no fulfillment evaluator" in settled["message"]
+    # Nothing was recorded for an evaluation that did not happen.
+    assert await _audit_row(task_id) == (None, None, None)
+
+
+async def test_the_sealed_criteria_never_reach_a_new_evaluator_through_the_tool_list(
+    client: httpx.AsyncClient,
+) -> None:
+    """Widening ``allowed_tools`` after sealing does not widen what counts as proof.
+
+    The criteria name the conditions; the tool list names what may be *called*. A
+    contract that gains a tool still proves fulfillment on the calendar conditions
+    alone, so the same evidence gives the same verdict either way.
+    """
+    token, task_id, approval_id = await _ready_task(client, "khaled@example.com")
+    await _approve(client, token, approval_id)
+
+    async with async_session_factory() as session:
+        task = await session.get(Task, task_id)
+        assert task is not None
+        task.allowed_tools = [*list(task.allowed_tools), "gmail.send", "drive.upload"]
+        await session.commit()
+
+    settled = await _trigger(client, token, task_id)
+    assert settled["outcome"] == "COMPLETED", settled
+    assert await _audit_row(task_id) == (
+        "calendar_meeting",
+        CALENDAR_MEETING_EVALUATOR_VERSION,
+        "FULFILLED",
+    )
 
 
 # ----------------------------------------------------------------------------------
@@ -1888,6 +2631,54 @@ async def test_provider_failure_fails(
     assert backend.created_events == {}
 
 
+async def test_the_program_records_the_failure_it_was_going_to_report_anyway(
+    client: httpx.AsyncClient,
+    backend: GoogleBackend,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """E3 is reached on a real run, and the run is unchanged by saying so.
+
+    The spy delegates to the real functions, so this observes the wiring rather
+    than replacing it. The same trigger is asserted to end in the same terminal
+    state with the same side effects as ``test_provider_failure_fails`` — which is
+    the point: the record is a consequence of a decision that was already being
+    made, not a new step in making it.
+    """
+    from kai.runtime import service as runtime_service
+
+    recorded: list[tuple[str, str]] = []
+    real_error, real_result = runtime_service.record_error, runtime_service.record_result
+
+    def spy_error(program: object, observation: object) -> object:
+        error = real_error(program, observation)  # type: ignore[arg-type]
+        if error is not None:
+            recorded.append(("error", error.error_code))
+        return error
+
+    def spy_result(program: object, *, result: str, reason: str) -> object:
+        recorded.append(("result", result))
+        return real_result(program, result=result, reason=reason)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(runtime_service, "record_error", spy_error)
+    monkeypatch.setattr(runtime_service, "record_result", spy_result)
+
+    token = await _register(client, "khaled@example.com")
+    tenant_id, user_id = await _user_scope("khaled@example.com")
+    await insert_account(tenant_id=tenant_id, user_id=user_id, email="khaled@example.com")
+    await _seed_attendee_memory(tenant_id, user_id)
+    backend.calendar_list_status = 500
+
+    task_id, _ = await _submit(client, token)
+    outcome = await _trigger(client, token, task_id)
+
+    # Unchanged behaviour.
+    assert outcome["task_state"] == "FAILED"
+    assert backend.created_events == {}
+    # And the program said the same thing the task did.
+    assert ("result", "FAILED") in recorded
+    assert any(kind == "error" for kind, _ in recorded)
+
+
 async def test_unverified_create_requires_attention(
     client: httpx.AsyncClient,
     backend: GoogleBackend,
@@ -2019,7 +2810,7 @@ async def test_trigger_rejects_unknown_task(client: httpx.AsyncClient) -> None:
 # ----------------------------------------------------------------------------------
 
 REVISION_PREV = "d1a2b3c4e5f6"
-REVISION_HEAD = "b3d5f7a9c1e2"
+REVISION_HEAD = "c8e1f3a5b7d9"
 
 
 def _alembic(*args: str) -> subprocess.CompletedProcess[str]:
@@ -2063,3 +2854,80 @@ def test_migration_is_rollbackable_and_forward() -> None:
         assert REVISION_HEAD in _alembic("current").stdout
     finally:
         _alembic("upgrade", "head")
+
+
+REVISION_BEFORE_AUDIT = "a4c7e2b9d1f3"
+AUDIT_COLUMNS = ("fulfillment_profile", "evaluator_version", "fulfillment_verdict")
+
+
+def _runtime_execution_columns() -> set[str]:
+    from sqlalchemy import inspect as sa_inspect
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    from kai.config import get_settings
+
+    async def _cols() -> set[str]:
+        eng = create_async_engine(get_settings().database_url)
+        try:
+            async with eng.connect() as conn:
+                return set(
+                    await conn.run_sync(
+                        lambda sync: {
+                            c["name"]
+                            for c in sa_inspect(sync).get_columns("runtime_executions")
+                        }
+                    )
+                )
+        finally:
+            await eng.dispose()
+
+    return asyncio.run(_cols())
+
+
+def test_the_audit_triple_is_added_and_removed_as_one_migration() -> None:
+    """One revision adds all three, and rolling it back takes all three away.
+
+    They are one fact, so they arrive together: a row with a verdict but no
+    evaluator version would be a record of an answer with no provenance, which
+    is the exact shape this change exists to prevent.
+    """
+    try:
+        assert _alembic("downgrade", REVISION_BEFORE_AUDIT).returncode == 0
+        assert not set(AUDIT_COLUMNS) & _runtime_execution_columns()
+
+        assert _alembic("upgrade", "head").returncode == 0
+        assert set(AUDIT_COLUMNS) <= _runtime_execution_columns()
+    finally:
+        _alembic("upgrade", "head")
+    assert set(AUDIT_COLUMNS) <= _runtime_execution_columns()
+
+
+def test_the_audit_columns_are_nullable_so_history_is_left_unclaimed() -> None:
+    """No NOT NULL, and no default: an old row stays honestly unknown.
+
+    A backfilled version would claim a provenance nobody recorded — and for the
+    rows that predate this revision it would be wrong, since the semantics that
+    ran then were the earlier first-witness ones. NULL is the truthful value.
+    """
+    from sqlalchemy import inspect as sa_inspect
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    from kai.config import get_settings
+
+    async def _nullable() -> dict[str, bool]:
+        eng = create_async_engine(get_settings().database_url)
+        try:
+            async with eng.connect() as conn:
+                return await conn.run_sync(
+                    lambda sync: {
+                        c["name"]: bool(c.get("nullable", True))
+                        for c in sa_inspect(sync).get_columns("runtime_executions")
+                        if c["name"] in AUDIT_COLUMNS
+                    }
+                )
+        finally:
+            await eng.dispose()
+
+    nullable = asyncio.run(_nullable())
+    assert set(nullable) == set(AUDIT_COLUMNS), nullable
+    assert all(nullable.values()), nullable

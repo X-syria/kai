@@ -23,7 +23,7 @@ from kai.ir.program import canonical_fingerprint
 from kai.memory.models import MemoryType
 from kai.memory.service import retrieve_memory
 from kai.runtime.schemas import MeetingWindow, UnderstandingOutput
-from kai.tasks.schemas import TaskContractInput
+from kai.tasks.schemas import FulfillmentProfile, TaskContractInput
 
 # --- the sealed slice contract ------------------------------------------- #
 SLICE_ALLOWED_TOOLS: list[str] = [
@@ -36,11 +36,21 @@ SLICE_RISK_POLICY: Literal["LOW", "MEDIUM", "HIGH", "CRITICAL"] = "MEDIUM"
 SLICE_MAX_STEPS = 10
 SLICE_VERIFICATION_METHOD: Literal["automatic", "manual", "ai_review"] = "automatic"
 SLICE_FALLBACK = "ask the user to choose a different time"
+#: The success criteria *as prose*: a description for humans and for the planner's
+#: verbatim contract check, never read by an evaluator. What fulfillment is
+#: actually decided on is the typed ``SuccessCriteria`` built from the sealed
+#: window and identities, so a model reproducing this text differently cannot
+#: change a verdict.
 SLICE_SUCCESS_CRITERIA: list[str] = [
     "calendar event created",
     "attendee is the requested contact",
     "event fits the requested time window",
 ]
+#: Which question is asked, and therefore which evaluator answers. Sealed with the
+#: contract, so the fulfillment decision on a resumed run comes from the task row
+#: and never from a mutable runtime or model value. It selects the evaluator; it
+#: does not state the criteria, and the criteria cannot select it.
+SLICE_FULFILLMENT_PROFILE: FulfillmentProfile = "calendar_meeting"
 
 #: Capabilities the slice may plan with; anything else is refused at runtime
 #: even if the planner's own vocabulary would accept it.
@@ -76,6 +86,7 @@ def build_slice_contract(goal: str) -> TaskContractInput:
     return TaskContractInput(
         goal=goal,
         success_criteria=list(SLICE_SUCCESS_CRITERIA),
+        fulfillment_profile=SLICE_FULFILLMENT_PROFILE,
         allowed_tools=list(SLICE_ALLOWED_TOOLS),
         risk_policy=SLICE_RISK_POLICY,
         max_steps=SLICE_MAX_STEPS,

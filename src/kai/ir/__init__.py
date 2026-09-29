@@ -32,6 +32,8 @@ from kai.ir.adapter import (
     intent_from_action,
     observation_from_evidence,
     observation_from_result,
+    record_error,
+    record_result,
     result_for,
     tool_name_for,
 )
@@ -61,6 +63,8 @@ from kai.ir.errors import (
 )
 from kai.ir.nodes import (
     IR_VERSION,
+    NULLABLE_OBSERVATION_FACT_FIELDS,
+    OBSERVATION_FACT_TYPES,
     ActionNode,
     ConditionNode,
     ConditionOperator,
@@ -87,6 +91,8 @@ from kai.ir.program import (
 
 __all__ = [
     "IR_VERSION",
+    "NULLABLE_OBSERVATION_FACT_FIELDS",
+    "OBSERVATION_FACT_TYPES",
     "ActionNode",
     "ConditionNode",
     "ConditionOperator",
@@ -131,6 +137,8 @@ __all__ = [
     "observation_from_result",
     "program_from_plan",
     "program_id_for",
+    "record_error",
+    "record_result",
     "require_valid",
     "result_for",
     "tool_name_for",

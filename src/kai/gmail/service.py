@@ -26,8 +26,7 @@ from kai.gmail.client import (
     GoogleRateLimitError,
 )
 from kai.gmail.models import GmailMessage, MessageRef
-from kai.google.client import GoogleOAuthError
-from kai.google.crypto import decrypt_credentials
+from kai.google.service import usable_access_token
 
 
 class AccountNotFoundError(ValueError):
@@ -49,14 +48,6 @@ async def _load_account(
     return account
 
 
-def _access_token(account: GoogleAccount) -> str:
-    credentials = decrypt_credentials(account.credentials_encrypted)
-    token = credentials.get("access_token")
-    if not isinstance(token, str) or not token:
-        raise GoogleOAuthError("google account has no stored access token")
-    return token
-
-
 async def search_messages(
     session: AsyncSession,
     transport: httpx.AsyncClient,
@@ -69,7 +60,7 @@ async def search_messages(
     account = await _load_account(session, account_id=account_id, tenant_id=tenant_id)
     return await client.search_messages(
         transport,
-        access_token=_access_token(account),
+        access_token=await usable_access_token(session, transport, account=account),
         query=query,
         max_results=max_results,
     )
@@ -85,7 +76,9 @@ async def get_message(
 ) -> GmailMessage:
     account = await _load_account(session, account_id=account_id, tenant_id=tenant_id)
     return await client.get_message(
-        transport, access_token=_access_token(account), message_id=message_id
+        transport,
+        access_token=await usable_access_token(session, transport, account=account),
+        message_id=message_id,
     )
 
 
@@ -186,7 +179,7 @@ async def send_and_verify(
     """
     account = await _load_account(session, account_id=account_id, tenant_id=tenant_id)
     sender_email = account.email
-    token = _access_token(account)
+    token = await usable_access_token(session, transport, account=account)
     raw = build_raw_message(
         sender_email=sender_email, to=req.to, subject=req.subject, body=req.body
     )

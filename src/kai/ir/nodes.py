@@ -47,6 +47,15 @@ _MAX_ARGS = 200
 _MAX_NODE_ID = 64
 _MAX_PREDICATE_VALUES = 50
 
+#: An action list is bounded by steps times the most tool calls one step can
+#: issue, not by steps alone. Bounding a list of *actions* by the step budget
+#: would be a category error that happens to hold only while every capability
+#: issues at most one call per step — and the moment one does not, recording what
+#: an execution did would start raising on runs that are otherwise fine. The
+#: multiplier is today's worst case: ``calendar.read_slots`` issues one intent per
+#: candidate day, capped at four.
+_MAX_ACTIONS = _MAX_STEPS * 4
+
 
 class _IrNode(BaseModel):
     """Base for every primitive: closed, bounded, never executable."""
@@ -249,6 +258,20 @@ class ObservationNode(_IrNode):
     ``recorded_at`` is wall-clock on purpose and is why an observation is never
     part of the program's fingerprint: a deterministic plan must not hash
     differently because it ran twice.
+
+    **One action, one observation.** The unit is the *action*, not the step: a
+    step that issues several tool calls produces one observation per call, all
+    carrying the same ``step_order``. A condition therefore cannot address an
+    individual call — it reads the step, and the step's outcome is the *last*
+    observation recorded for it. That rule is a contract on the Runtime, which
+    stops a step at its first non-successful intent; it is stated in full in
+    ``kai.ir.control`` and in spec §4.4.1 and §7.1, and a change to the Runtime's
+    per-step stop policy must revise it explicitly.
+
+    ``error_code`` is ``str | None`` and ``None`` is the normal, meaningful
+    value: it means this action recorded no error code. ``None`` is a fact about
+    the value, distinct from a step having no observation at all — see
+    ``NULLABLE_OBSERVATION_FACT_FIELDS`` for how a condition may test it.
     """
 
     action_id: str = Field(min_length=1, max_length=128)
@@ -294,11 +317,17 @@ class ErrorNode(_IrNode):
 
 
 class ResultNode(_IrNode):
-    """How the program ended, and which observations decided it."""
+    """How the program ended, and which observations decided it.
+
+    Populated by the Runtime when a run actually terminates, and derived from
+    the program's own observations rather than stored — so it is a record of what
+    happened, never an input to anything. It is outside the fingerprint (spec
+    §8.11): a program that failed hashes exactly as the program that has not run.
+    """
 
     result: str = Field(min_length=1)
     reason: str = ""
-    final_observation_ids: list[str] = Field(default_factory=list, max_length=_MAX_STEPS)
+    final_observation_ids: list[str] = Field(default_factory=list, max_length=_MAX_ACTIONS)
 
     @field_validator("result")
     @classmethod
@@ -354,6 +383,13 @@ _SET_OPERATORS: frozenset[ConditionOperator] = frozenset(
     {ConditionOperator.IN, ConditionOperator.NOT_IN}
 )
 
+#: The only operators a null operand may be used with. ``eq``/``neq`` ask whether
+#: the fact holds a value; ordering or enumerating "nothing" has no meaning, so
+#: those combinations are refused where the condition is written.
+_NULL_COMPARISON_OPERATORS: frozenset[ConditionOperator] = frozenset(
+    {ConditionOperator.EQ, ConditionOperator.NEQ}
+)
+
 #: The Python type each observable field actually has. The condition's operand
 #: must match it exactly, which is what lets a "verified == 'yes'" condition be
 #: refused at build time instead of silently never matching at run time.
@@ -363,6 +399,19 @@ OBSERVATION_FACT_TYPES: dict[str, type] = {
     "verified": bool,
     "error_code": str,
 }
+
+#: Fields whose fact may legitimately hold *no* value, so a ``None`` operand is
+#: a question about the fact rather than a type error.
+#:
+#: ``error_code`` is the only one: an action that recorded no error code has a
+#: null ``error_code``, and saying so is a real, decidable fact about a
+#: successful action. The distinction it keeps is between a *null value* and a
+#: *missing observation* — reading a step with no observation at all is still
+#: refused outright, because that is an absent fact rather than an empty one.
+#:
+#: A field being listed here says nothing about its type when it does hold a
+#: value: ``error_code`` is still ``str`` (see ``OBSERVATION_FACT_TYPES``).
+NULLABLE_OBSERVATION_FACT_FIELDS: frozenset[str] = frozenset({"error_code"})
 
 #: Fields an ``OBSERVATION`` condition may read. Not a path expression: an
 #: allow-list of scalars, so a condition cannot reach into a provider payload.
@@ -406,10 +455,24 @@ class ConditionSubject(_IrNode):
             return OBSERVATION_FACT_TYPES[self.field]
         return FACT_TYPE_BY_KIND[self.kind]
 
+    def allows_null(self) -> bool:
+        """Whether this subject's fact may legitimately hold no value at all.
+
+        Only an observation field can, and only the ones
+        ``NULLABLE_OBSERVATION_FACT_FIELDS`` lists. The run counters and the task
+        state always have a value, so ``None`` against them stays a type error.
+        """
+        return (
+            self.kind is FactKind.OBSERVATION
+            and self.field in NULLABLE_OBSERVATION_FACT_FIELDS
+        )
+
 
 #: The operand shape. Single-typed lists (not mixed) so a membership test has one
 #: unambiguous meaning; the value's type is then checked against the fact's.
-PredicateValue = bool | int | str | list[bool] | list[int] | list[str]
+#: ``None`` is here only so a nullable fact can be tested for having no value —
+#: ``ConditionNode`` refuses it everywhere else.
+PredicateValue = bool | int | str | list[bool] | list[int] | list[str] | None
 
 
 class ConditionNode(_IrNode):
@@ -424,6 +487,13 @@ class ConditionNode(_IrNode):
     predicate in one flat object: a condition and its complement differ by one
     boolean rather than by a nested subtree. That is what lets the graph
     validator prove a branch is exhaustive.
+
+    A ``value`` of ``None`` is accepted only against a nullable observation field
+    (``NULLABLE_OBSERVATION_FACT_FIELDS``) and only with ``eq`` or ``neq``, so
+    "this step recorded no error code" is expressible without a second way of
+    spelling absence. It is never inferred: a field the program does not name is
+    not silently null, and a step with no observation at all is still refused at
+    evaluation time.
     """
 
     condition_id: str = Field(min_length=1, max_length=_MAX_NODE_ID)
@@ -444,6 +514,22 @@ class ConditionNode(_IrNode):
     def _operand_matches_fact(self) -> Self:
         expected = self.subject.value_type()
         operand = self.value
+
+        # A null operand asks whether the fact holds a value, so it is answered
+        # before any type check: ``type(None)`` matches nothing in the table, and
+        # the question is only meaningful on a field that can be empty.
+        if operand is None:
+            if not self.subject.allows_null():
+                raise ValueError(
+                    f"a {self.subject.kind.value} fact always has a value, so it "
+                    f"cannot be compared with null"
+                )
+            if self.operator not in _NULL_COMPARISON_OPERATORS:
+                raise ValueError(
+                    f"{self.operator.value} is undefined for a null operand; use eq or "
+                    f"neq to ask whether {self.subject.field!r} holds a value"
+                )
+            return self
 
         if self.operator in _SET_OPERATORS:
             if not isinstance(operand, list):
@@ -576,6 +662,7 @@ class ControlEdge(_IrNode):
 __all__ = [
     "FACT_TYPE_BY_KIND",
     "IR_VERSION",
+    "NULLABLE_OBSERVATION_FACT_FIELDS",
     "OBSERVATION_FACT_TYPES",
     "PLAN_STATUSES",
     "RESULT_STATES",

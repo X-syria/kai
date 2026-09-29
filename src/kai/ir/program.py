@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Sequence
 from typing import Any, Self
 from uuid import UUID
 
@@ -24,12 +25,14 @@ from kai.ir.nodes import (
     ControlEdge,
     ControlNode,
     ControlNodeKind,
+    ErrorNode,
     FactKind,
     IntentNode,
     ObservationNode,
     PermissionNode,
     PlanNode,
     PolicyConstraintsNode,
+    ResultNode,
     StateSnapshotNode,
     StepNode,
 )
@@ -68,9 +71,23 @@ class KaiProgram(BaseModel):
     They are static: the graph says which step may run next given what has
     already been observed, and it never carries the result of running it.
 
-    ``observations``, ``result``, and ``snapshot`` are populated as execution
-    proceeds. They are excluded from the fingerprint on purpose — a program's
-    identity is what it intends to do, not what happened when it ran.
+    ``observations``, ``errors``, ``result``, and ``snapshot`` are populated as
+    execution proceeds. They are excluded from the fingerprint on purpose — a
+    program's identity is what it intends to do, not what happened when it ran.
+
+    ``observations``, ``errors``, and ``result`` are a *record of what this
+    execution did*, filled in by the Runtime through ``kai.ir.adapter``. They are
+    bookkeeping: nothing in control flow reads them, and they are derived rather
+    than stored, so a rebuild from the same durable evidence produces the same
+    record. They exist so the IR can state plainly what happened instead of
+    leaving the answer in Runtime code.
+
+    The observation log is the one part of that record the IR does hold to a
+    rule — append-only, one record per action id, each naming a step of this
+    plan — and that rule is enforced by the writer (:meth:`record`) rather than
+    by :meth:`validate_executable`. A program is validated once, when it is built
+    with an empty log, so validating there never sees an observation at all; the
+    log is filled in afterwards and never re-validated. See :meth:`record`.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -85,6 +102,8 @@ class KaiProgram(BaseModel):
     permissions: list[PermissionNode] = Field(default_factory=list)
     snapshot: StateSnapshotNode | None = None
     observations: list[ObservationNode] = Field(default_factory=list)
+    errors: list[ErrorNode] = Field(default_factory=list)
+    result: ResultNode | None = None
     fingerprint: str = Field(default="", max_length=64)
 
     @model_validator(mode="after")
@@ -104,6 +123,13 @@ class KaiProgram(BaseModel):
         declared and not re-sorted here. The graph is included whole: changing
         which branch a program can take changes what it intends to do, and must
         change its identity.
+
+        The execution record is *not* here, and the omission is deliberate rather
+        than incidental: ``observations``, ``errors``, ``result``, ``snapshot``,
+        and ``fingerprint`` are all absent, so a program that has run, failed, or
+        resumed hashes exactly as the program that has not run at all. Adding a
+        field to the program therefore never changes a fingerprint unless it is
+        added here too.
         """
         return {
             "ir_version": self.ir_version,
@@ -192,6 +218,26 @@ class KaiProgram(BaseModel):
                 f"{len(self.plan.steps)}-step plan"
             )
 
+    def _observation_refusal(
+        self, observation: ObservationNode, recorded: Sequence[ObservationNode]
+    ) -> str | None:
+        """Why ``observation`` may not join ``recorded``, or ``None`` if it may.
+
+        One definition of the rule, used by both the writer and the validator, so
+        the two cannot drift into disagreeing about what a valid log is.
+        """
+        if any(item.action_id == observation.action_id for item in recorded):
+            return (
+                f"duplicate observation for action {observation.action_id}; "
+                "the log is append-only"
+            )
+        if observation.step_order > len(self.plan.steps):
+            return (
+                f"observation for step {observation.step_order} does not exist in "
+                "this plan"
+            )
+        return None
+
     def _validate_observations(self) -> None:
         """The observation log is append-only: one record per action id.
 
@@ -200,19 +246,11 @@ class KaiProgram(BaseModel):
         """
         if not self.observations:
             return
-        seen: set[str] = set()
+        recorded: list[ObservationNode] = []
         for observation in self.observations:
-            if observation.action_id in seen:
-                raise IrValidationError(
-                    f"duplicate observation for action {observation.action_id}; "
-                    "the log is append-only"
-                )
-            seen.add(observation.action_id)
-            if observation.step_order > len(self.plan.steps):
-                raise IrValidationError(
-                    f"observation for step {observation.step_order} does not exist in "
-                    "this plan"
-                )
+            if (refusal := self._observation_refusal(observation, recorded)) is not None:
+                raise IrValidationError(refusal)
+            recorded.append(observation)
 
     def step(self, order: int) -> StepNode | None:
         """The step at ``order``, or ``None`` if the program has no such step."""
@@ -278,6 +316,7 @@ class KaiProgram(BaseModel):
         self._validate_acyclic()
         self._validate_guards()
         self._validate_action_nodes()
+        self._validate_action_monotonicity()
         self._validate_condition_sources()
 
     def _validate_node_identity(self) -> None:
@@ -440,12 +479,56 @@ class KaiProgram(BaseModel):
                 f"{planned}; the graph must account for every step exactly once"
             )
 
+    def _validate_action_monotonicity(self) -> None:
+        """A step's continuation may only ever be a *later* step.
+
+        :meth:`~kai.ir.control.next_node` treats the runtime cursor as a
+        watermark: it steps past an action node once ``step.order <= cursor``. A
+        watermark cannot move backwards, so that walk is only sound while the
+        graph is monotone in ``step_order``.
+
+        Acyclicity is not the same property, and acyclicity alone is not enough.
+        ``action-1 -> action-3 -> action-2 -> result`` is acyclic, declares every
+        planned step exactly once, and reaches every node — and the walk still
+        executes ``[1, 3]``, because by the time control could arrive at step 2
+        the cursor already reads 3. Step 2 is declared, reachable, never run, and
+        never observed, and the flow ends as though it had.
+
+        So the property the walker actually depends on is checked here instead of
+        being assumed, and the refusal says what is wrong rather than only that
+        something is.
+
+        Scoped deliberately to action-to-action edges. An edge into a condition
+        node is the fork itself and carries no step of its own; what a condition
+        routes to is bounded by the builder's partition rule
+        (``kai.ir.build.branch_errors`` requires one target to be
+        ``after_step + 1``), so no plan-declared branch can step backwards
+        through a condition either. A builder that ever relaxes that rule must
+        extend this check to the condition's own targets in the same change.
+        """
+        order_by_node = {
+            node.node_id: node.step_order
+            for node in self.nodes
+            if node.kind is ControlNodeKind.ACTION
+        }
+        for edge in self.edges:
+            source = order_by_node.get(edge.from_node)
+            target = order_by_node.get(edge.to_node)
+            if source is None or target is None or target > source:
+                continue
+            raise IrControlFlowError(
+                f"control edge {edge.from_node!r} -> {edge.to_node!r} returns from "
+                f"step {source} to step {target}; the runtime cursor is a watermark "
+                f"and only moves forward, so step {target} could never run"
+            )
+
     def _validate_condition_sources(self) -> None:
         """A condition may only read a fact that already exists where it is read.
 
         ``cursor``, ``steps_used``, and ``task_state`` are always available. An
         observation is not: it exists only once its step has run, so a condition
-        that reads one has to sit downstream of the step that produces it.
+        that reads one has to sit downstream of the step that produces it on
+        *every* path that reaches the condition.
         """
         for node in self.nodes:
             if node.condition is None or node.condition.subject.kind is not FactKind.OBSERVATION:
@@ -463,31 +546,41 @@ class KaiProgram(BaseModel):
                 )
             source = self.action_node_for_step(step_order)
             assert source is not None  # guaranteed by _validate_action_nodes
-            if not self._reaches(source.node_id, node.node_id):
+            if not self._dominates(source.node_id, node.node_id):
                 raise IrConditionError(
                     f"condition {node.condition.condition_id!r} reads the observation "
                     f"for step {step_order}, which is not upstream of node "
-                    f"{node.node_id!r}; the fact cannot exist yet"
+                    f"{node.node_id!r} on every path; the fact cannot exist yet on a "
+                    f"path that reached the condition without the step, so it could "
+                    f"only exist because a different path happened to run it"
                 )
 
-    def _reaches(self, source: str, target: str) -> bool:
-        """Whether ``target`` is downstream of ``source``, searching backwards.
+    def _dominates(self, source: str, target: str) -> bool:
+        """Whether every path to ``target`` from the entry passes through ``source``.
 
-        A backward search from the reader is what makes the check honest: it asks
-        whether every path to the condition passed through the step, rather than
-        whether *some* path did.
+        Reaching ``target`` from ``source`` is not enough. A second path could
+        arrive at the condition without the step ever having run, and the only
+        reason the fact would exist there is that the other path recorded it
+        earlier — the same evidence read across two arms of a branch. So the
+        question is whether ``target`` is still reachable from the entry once
+        ``source`` is taken out of the graph: if it is, some path arrives
+        without the step, and ``source`` does not dominate ``target``.
         """
-        seen = {target}
-        frontier = [target]
+        entry = self.entry_node_id()
+        if entry is None:  # pragma: no cover - _validate_reachable guarantees one
+            return True
+        if source in {entry, target}:
+            return True
+        seen = {entry}
+        frontier = [entry]
         while frontier:
             current = frontier.pop()
-            if current == source:
-                return True
-            for edge in self.edges:
-                if edge.to_node == current and edge.from_node not in seen:
-                    seen.add(edge.from_node)
-                    frontier.append(edge.from_node)
-        return False
+            for edge in self.edges_from(current):
+                if edge.to_node == source or edge.to_node in seen:
+                    continue
+                seen.add(edge.to_node)
+                frontier.append(edge.to_node)
+        return target not in seen
 
     def permission_for(self, capability: str) -> PermissionNode | None:
         """The declared permission for ``capability``, if the program has one."""
@@ -497,9 +590,51 @@ class KaiProgram(BaseModel):
         return None
 
     def record(self, observation: ObservationNode) -> ObservationNode:
-        """Append one observation to this program's durable record."""
+        """Append one observation to this program's durable record.
+
+        The point where the log's rule is enforced, because it is the only point
+        that sees one. A program is validated when it is built — with an empty
+        log, since ``program_from_plan`` cannot know what a run will observe — and
+        the Runtime fills the log afterwards through :func:`kai.ir.adapter.attach`,
+        with no validation in between. Checking only
+        :meth:`validate_executable` therefore admits every observation the IR
+        would refuse, one the ``ResultNode`` then reports. So the same rule is
+        applied here, before the record is appended, and a refused observation
+        leaves the program exactly as it was.
+
+        The refusal is not a repair: nothing is dropped or rewritten to make the
+        log fit, because a duplicate means an action's outcome was replaced rather
+        than appended, and a record for a step this plan does not have is a record
+        of an execution that did not come from this program.
+        """
+        refusal = self._observation_refusal(observation, self.observations)
+        if refusal is not None:
+            raise IrValidationError(refusal)
         self.observations.append(observation)
         return observation
+
+    def record_error(self, error: ErrorNode) -> ErrorNode:
+        """Append one typed failure to this program's record.
+
+        Kept separate from :meth:`record` because the two are not the same
+        event: a step that needed approval is recorded as an observation *and*
+        as an error, and neither replaces the other.
+        """
+        self.errors.append(error)
+        return error
+
+    def record_result(self, result: ResultNode) -> ResultNode:
+        """Note how this execution ended.
+
+        Only the Runtime calls this, and only when the run actually terminates:
+        a task parked in ``WAITING_APPROVAL`` has not ended, and ``WAITING_APPROVAL``
+        is not a reportable result state, so there is nothing to record yet.
+        Recording twice would be meaningless — a program is rebuilt per attempt,
+        so the record reflects one attempt and the full history stays in the
+        durable evidence log.
+        """
+        self.result = result
+        return result
 
     def to_json(self) -> str:
         """The full program, canonical form included, for storage or audit."""

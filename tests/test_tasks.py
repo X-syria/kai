@@ -71,6 +71,7 @@ def _contract(**overrides: object) -> TaskContractInput:
     data: dict[str, object] = {
         "goal": "Book a flight to Berlin",
         "success_criteria": ["booking reference exists", "cost confirmed"],
+        "fulfillment_profile": "calendar_meeting",
         "allowed_tools": ["calendar", "gmail"],
         "risk_policy": "LOW",
         "deadline": datetime(2026, 6, 24, 10, 0, tzinfo=UTC),
@@ -97,6 +98,7 @@ def _task_json(goal: str = "Book a flight to Berlin") -> dict:
     return {
         "goal": goal,
         "success_criteria": ["booking reference exists"],
+        "fulfillment_profile": "calendar_meeting",
         "allowed_tools": ["calendar"],
         "risk_policy": "LOW",
         "deadline": "2026-06-24T10:00:00Z",
@@ -933,7 +935,7 @@ async def test_responses_never_expose_internal_metadata(
 # --- migration -------------------------------------------------------------
 
 REVISION_PREV = "5f3e1d2c4b6a"
-REVISION_HEAD = "b3d5f7a9c1e2"
+REVISION_HEAD = "c8e1f3a5b7d9"
 
 
 def _alembic(*args: str) -> subprocess.CompletedProcess[str]:
@@ -1013,6 +1015,7 @@ async def _persist(**overrides: object) -> Task:
             "state": CREATED,
             "goal": "persisted goal",
             "success_criteria": ["criterion"],
+            "fulfillment_profile": "calendar_meeting",
             "allowed_tools": [],
             "risk_policy": "LOW",
             "max_cost": 0.0,

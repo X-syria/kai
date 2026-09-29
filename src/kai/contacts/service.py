@@ -9,8 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from kai.contacts import client
 from kai.contacts.models import Contact
 from kai.db.models import GoogleAccount
-from kai.google.client import GoogleOAuthError
-from kai.google.crypto import decrypt_credentials
+from kai.google.service import usable_access_token
 
 
 class AccountNotFoundError(ValueError):
@@ -39,12 +38,10 @@ async def list_contacts(
     if account is None:
         raise AccountNotFoundError("google account not found for tenant")
 
-    credentials = decrypt_credentials(account.credentials_encrypted)
-    access_token = credentials.get("access_token")
-    if not isinstance(access_token, str) or not access_token:
-        raise GoogleOAuthError("google account has no stored access token")
-
-    return await client.fetch_all_contacts(transport, access_token=access_token)
+    return await client.fetch_all_contacts(
+        transport,
+        access_token=await usable_access_token(session, transport, account=account),
+    )
 
 
 def _email_key(value: str) -> str:

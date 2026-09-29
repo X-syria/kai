@@ -61,7 +61,7 @@ import asyncio
 from collections.abc import Sequence
 from contextlib import suppress
 from dataclasses import dataclass
-from datetime import UTC, date, datetime, time, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Any, Final
 from uuid import UUID, uuid4
 
@@ -83,6 +83,8 @@ from kai.ir.adapter import (
     intent_from_action,
     observation_from_evidence,
     observation_from_result,
+    record_error,
+    record_result,
 )
 from kai.ir.build import allowed_capabilities_from_task, program_from_plan
 from kai.ir.control import ControlFacts, next_step
@@ -101,6 +103,18 @@ from kai.planner.service import (
     PlanNotAllowedError,
     PlanNotFoundError,
     PlanRejectedError,
+)
+from kai.runtime.evidence import qualifying_creation, qualifying_creations
+from kai.runtime.fulfillment import (
+    CALENDAR_MEETING_EVALUATOR_VERSION,
+    GMAIL_SEND_EVALUATOR_VERSION,
+    FulfillmentInput,
+    FulfillmentOutcome,
+    FulfillmentVerdict,
+    calendar_meeting_criteria,
+    evaluate_calendar_meeting,
+    evaluate_gmail_send,
+    gmail_send_criteria,
 )
 from kai.runtime.models import RuntimeExecution
 from kai.runtime.schemas import GoalSubmission, UnderstandingOutput
@@ -121,6 +135,7 @@ from kai.runtime.understanding import UnderstandingFailed, understand_scenario
 from kai.tasks.models import Task
 from kai.tasks.service import TaskNotFoundError, create_task, get_task, transition_task
 from kai.tasks.state import (
+    COMPLETED,
     CREATED,
     EXECUTING,
     FAILED,
@@ -154,6 +169,13 @@ _RESUMABLE_STATES: frozenset[str] = frozenset(
 #: again would achieve nothing. ``WAITING_APPROVAL`` is not one of them: an
 #: approval that is already settled leaves the task able to move on.
 _WAITING_ON_OTHERS: frozenset[str] = frozenset({WAITING_EXTERNAL})
+
+#: The fulfillment profiles this dispatcher answers to. Named here so the
+#: dispatch reads as a closed vocabulary and the value it records carries the
+#: same static type the sealed contract does. There is no third name, and adding
+#: one is an edit to this function rather than a lookup.
+_CALENDAR_MEETING: Final = "calendar_meeting"
+_GMAIL_SEND: Final = "gmail_send"
 
 #: How long a trigger's execution claim stays valid before another trigger may
 #: take it over. A live trigger finishes in seconds; a claim this old belongs
@@ -799,6 +821,13 @@ class AgentRuntime:
                         action=action, step_order=step.order, result=result
                     )
                     attach(program, observation)
+                    # The IR's own error taxonomy, applied to what the Gateway
+                    # actually returned. Bookkeeping only: the failure decision
+                    # below still reads the ToolResult, so a run behaves exactly
+                    # as it did before this line existed. What changes is that a
+                    # failure is now also recorded in the IR's own vocabulary
+                    # rather than only in the task state machine.
+                    record_error(program, observation)
                     record = evidence_from_observation(observation, tool_name=tool_name)
                     record["ir_program_id"] = str(program.program_id)
                     record["ir_fingerprint"] = program.fingerprint
@@ -825,6 +854,10 @@ class AgentRuntime:
                                 target=WAITING_APPROVAL,
                             )
                         pending = await self.pending_approval_ids(session, task)
+                        # No result is recorded: a task parked for a human has
+                        # not ended, and WAITING_APPROVAL is deliberately not a
+                        # reportable result state. The next attempt rebuilds the
+                        # program and finishes the record.
                         return TriggerOutcome(
                             WAITING_APPROVAL,
                             "WAITING_APPROVAL",
@@ -856,14 +889,25 @@ class AgentRuntime:
                             target=target,
                             fail_reason=message,
                         )
+                        # The run ends here, so the program says so. The
+                        # transition above is unchanged and remains the only
+                        # thing that decides the task's fate; this only writes
+                        # down the outcome that was already reached.
+                        record_result(program, result=target, reason=message)
                         return TriggerOutcome(target, target, message, [], steps_used)
 
                     if tool_name == "calendar.read_slots":
                         collected.extend(_read_slot_items([record]))
                     elif tool_name == "calendar.create_event":
-                        event_id = (result.evidence or {}).get("event_id")
-                        if event_id:
-                            created_event_id = event_id
+                        # Through the one qualification boundary, on the record
+                        # this attempt just wrote — the same boundary the
+                        # fulfillment evaluator applies, and the same one the
+                        # resume path below reads the log through. There is no
+                        # second, looser reading of "an event was created" on
+                        # the live path.
+                        witness = qualifying_creation(record)
+                        if witness is not None:
+                            created_event_id = witness.provider_event_id
 
                 cursor = step.order
                 row.cursor = step.order
@@ -883,9 +927,15 @@ class AgentRuntime:
                 user_id=task.user_id,
                 target=VERIFYING,
             )
-            return await self._settle_verification(
+            settled = await self._settle_verification(
                 session, task=task, row=row, scenario=scenario, claim=claim
             )
+            # The flow is finished, so the run has ended one way or another.
+            # COMPLETED, FAILED, and REQUIRES_ATTENTION are all reportable
+            # result states, so this records whichever one verification settled
+            # on — after the transitions, never instead of them.
+            record_result(program, result=settled.outcome, reason=settled.message)
+            return settled
         except (IrConditionError, IrControlFlowError) as exc:
             # A graph the runtime cannot walk is a fault in the program, not a
             # tool failure and not something to retry: the branch structure does
@@ -908,30 +958,67 @@ class AgentRuntime:
 
         Shared by the live execution path and by the recovery path, so a task
         that crashed a moment ago and a task that ran cleanly are decided by
-        exactly the same code, on exactly the same inputs.
+        exactly the same code, on exactly the same inputs. There is one call to
+        the evaluator in this function and no second settlement path anywhere, so
+        "what was recorded" cannot differ between the two.
+
+        This is where the fulfillment verdict becomes a task state, and it is
+        the only place in the runtime that does. The evaluator below is handed
+        the sealed contract and the durable row and returns an opinion; the
+        transitions below are this function's alone.
+
+        The audit triple is written *before* the transition, onto the row the
+        evaluator was just given, so the record and the state it produced commit
+        together. It is written from the freshly derived outcome and is never
+        read back: recovery re-derives exactly as the live path does, which is
+        what keeps the persisted verdict an artifact rather than a second source
+        of truth.
         """
         await self._fence_execution(
             session, task_id=task.id, tenant_id=task.tenant_id, claim=claim
         )
-        if _fulfilled(scenario, list(row.identities), list(row.evidence)):
+        outcome = _fulfillment_outcome(
+            task,
+            scenario=scenario,
+            identities=list(row.identities),
+            evidence=list(row.evidence),
+        )
+        # The audit record, not the decision. Nothing below reads it back, and
+        # every settlement re-derives and overwrites it — so a record that ever
+        # disagreed with the evidence would be corrected, not obeyed.
+        row.fulfillment_profile = outcome.profile
+        row.evaluator_version = outcome.version
+        row.fulfillment_verdict = outcome.verdict.value
+        verdict = outcome.verdict
+        if verdict is FulfillmentVerdict.FULFILLED:
             await transition_task(
                 session,
                 task_id=task.id,
                 tenant_id=task.tenant_id,
                 user_id=task.user_id,
-                target="COMPLETED",
+                target=COMPLETED,
             )
             return TriggerOutcome(
-                "COMPLETED",
-                "COMPLETED",
+                COMPLETED,
+                COMPLETED,
                 "meeting scheduled and verified",
                 [],
                 row.steps_used,
             )
-        return await self._fail(
+        if verdict is FulfillmentVerdict.NOT_FULFILLED:
+            return await self._fail(
+                session,
+                task,
+                "verified execution did not satisfy the task success criteria",
+                steps_used=row.steps_used,
+            )
+        # INDETERMINATE is not a failure: the run happened, and the evidence
+        # available cannot settle whether the Intent was fulfilled. That is
+        # exactly what REQUIRES_ATTENTION is for.
+        return await self._halt(
             session,
             task,
-            "verified execution did not satisfy the task success criteria",
+            f"fulfillment could not be settled from the available evidence ({verdict.value})",
             steps_used=row.steps_used,
         )
 
@@ -1327,6 +1414,8 @@ class AgentRuntime:
         session: AsyncSession,
         task: Task,
         reason: str,
+        *,
+        steps_used: int = 0,
     ) -> TriggerOutcome:
         """Stop a task that has run, but cannot continue on its own.
 
@@ -1343,7 +1432,7 @@ class AgentRuntime:
             target=REQUIRES_ATTENTION,
             fail_reason=reason,
         )
-        return TriggerOutcome("REQUIRES_ATTENTION", "REQUIRES_ATTENTION", reason, [], 0)
+        return TriggerOutcome("REQUIRES_ATTENTION", "REQUIRES_ATTENTION", reason, [], steps_used)
 
 
 def _plan_diverged(bound_version: int | None, current_version: int) -> str:
@@ -1393,57 +1482,120 @@ def _read_slot_items(
     return intervals
 
 
-def _created_event_id(evidence: list[dict[str, Any]]) -> str | None:
-    for entry in evidence:
-        if entry.get("tool") != "calendar.create_event":
-            continue
-        if entry.get("outcome") != "EXECUTION_SUCCEEDED" or not entry.get("verified"):
-            continue
-        from_provider = (entry.get("evidence") or {}).get("event_id")
-        if isinstance(from_provider, str) and from_provider:
-            return from_provider
-        from_data = (entry.get("data") or {}).get("event_id")
-        if isinstance(from_data, str) and from_data:
-            return from_data
-    return None
-
-
-def _fulfilled(
+def _fulfillment_outcome(
+    task: Task,
+    *,
     scenario: UnderstandingOutput,
     identities: list[dict[str, Any]],
     evidence: list[dict[str, Any]],
-) -> bool:
-    """Deterministic check of the slice's three success criteria."""
-    created = [
-        entry
-        for entry in evidence
-        if entry.get("tool") == "calendar.create_event"
-        and entry.get("outcome") == "EXECUTION_SUCCEEDED"
-        and entry.get("ok")
-        and entry.get("verified")
-        and (entry.get("evidence") or {}).get("event_id")
-    ]
-    if not created:
-        return False
+) -> FulfillmentOutcome:
+    """Decide fulfillment for one task, and say which semantics decided it.
 
-    args = created[0].get("args") or {}
-    attendees = {
-        str(address).casefold() for address in (args.get("attendees") or [])
-    }
-    resolved = {str(item["email"]).casefold() for item in identities if item.get("email")}
-    if not resolved or not attendees or not resolved <= attendees:
-        return False
+    The Sealed Contract's ``fulfillment_profile`` is the only thing that selects
+    an evaluator, and it is read off the task row — so a live run and a recovered
+    run pick the same evaluator, and neither a planner proposal nor a model
+    response can redirect the decision. The dispatch is an explicit closed
+    vocabulary rather than a registry: the branches are written out here, an
+    unknown profile is a fatal refusal rather than a lookup, and a further domain
+    is an amendment to this function, not a runtime resolution.
 
-    try:
-        day = date.fromisoformat(args["date"])
-        start_time = time.fromisoformat(args["start_time"])
-    except (KeyError, TypeError, ValueError):
-        return False
+    **``gmail_send`` is the second branch, and it is not reachable from the live
+    slice.** :data:`kai.runtime.translator.SLICE_FULFILLMENT_PROFILE` seals
+    ``calendar_meeting`` for every task the runtime drives, and driving a send
+    would need a second understanding intent, a second capability table, and a
+    KAI-IR program for it — none of which this experiment added or may add. What
+    is implemented and tested is the *binding*: that a contract naming
+    ``gmail_send`` gets the gmail criteria, the gmail evaluator and the gmail
+    version identity, and that the recovery path reaches the same branch from the
+    same durable row. Whether a send can be *driven* is deferred, and is recorded
+    as deferred rather than approximated by loosening the slice.
 
-    window = scenario.window
-    if not (window.start_date <= day <= window.end_date):
-        return False
-    return start_time >= window.earliest_time
+    The profile is *reported*, not resolved: it is the value already sealed on
+    the task, carried through untouched, so the recorded profile is the
+    authoritative one by construction rather than by a second lookup agreeing
+    with the first. The version comes from the same branch that runs the
+    evaluator, so an identity can never be recorded for semantics that did not
+    run.
+
+    This is also the single place the typed Success Criteria are built, from the
+    sealed scenario window and the sealed identities, immediately before they are
+    evaluated. Both inputs are already committed and never recomputed, so the
+    criteria are as fixed as the rows they come from — and because that is true,
+    nothing needs to be stored a second time to keep them sealed, and a resumed
+    run reconstructs the identical value.
+
+    This function returns an opinion and nothing else. It performs no transition,
+    and the profile it reads is validated on the way into the contract.
+    """
+    profile = task.fulfillment_profile
+    if profile == _CALENDAR_MEETING:
+        # The constant is the same value as ``profile`` — the branch is an
+        # equality — and it carries the sealed profile's own type, so the
+        # criteria and the outcome both name the profile that was checked.
+        criteria = calendar_meeting_criteria(
+            profile=_CALENDAR_MEETING,
+            window=scenario.window,
+            identities=identities,
+        )
+        return FulfillmentOutcome(
+            profile=_CALENDAR_MEETING,
+            version=CALENDAR_MEETING_EVALUATOR_VERSION,
+            verdict=evaluate_calendar_meeting(
+                FulfillmentInput(criteria=criteria, evidence=tuple(evidence))
+            ),
+        )
+    if profile == _GMAIL_SEND:
+        # The second sealed question, dispatched the same way and for the same
+        # reasons: the contract's profile selects the evaluator, the criteria are
+        # built here from sealed rows, the version comes from the same branch that
+        # runs the evaluator, and the function still returns an opinion and
+        # performs no transition.
+        #
+        # ``scenario`` is deliberately not read. A calendar contract is sealed
+        # with a meeting window, so its criteria need one; a send contract has no
+        # window, and its whole question is answered from the resolved identities
+        # already on the row. That the two domains need *different* sealed inputs
+        # is the finding — not a shortcut, and not a case of one branch quietly
+        # borrowing the other's inputs.
+        criteria = gmail_send_criteria(
+            profile=_GMAIL_SEND,
+            identities=identities,
+        )
+        return FulfillmentOutcome(
+            profile=_GMAIL_SEND,
+            version=GMAIL_SEND_EVALUATOR_VERSION,
+            verdict=evaluate_gmail_send(
+                FulfillmentInput(criteria=criteria, evidence=tuple(evidence))
+            ),
+        )
+    raise RuntimeFatal(
+        f"no fulfillment evaluator for sealed profile {profile!r}"
+    )
+
+
+def _created_event_id(evidence: list[dict[str, Any]]) -> str | None:
+    """The created meeting this run may read back, or ``None``.
+
+    A **sequencing** answer, not a fulfillment one: the runtime has to name *one*
+    meeting when the next step's ``calendar.get_event`` needs an id, and the
+    earliest qualifying creation in an append-only log is that meeting. Nothing
+    here decides whether anything was fulfilled — the verdict is the evaluator's,
+    over the whole witness set, and this choice cannot reach it.
+
+    What it does decide is *what counts as a creation*, so it does not decide
+    that for itself: the answer is read off
+    :func:`kai.runtime.evidence.qualifying_creations`, the same boundary the
+    evaluator uses. Concretely, that means the id comes from the record's
+    verification ``evidence`` and never from ``data``, and a record that is not a
+    verified, provider-identified attempt contributes nothing. Before this was
+    shared, this helper accepted a ``data.event_id`` fallback and did not require
+    ``ok``, so a record the evaluator called non-qualifying could still have been
+    acted on here; both of those are now the evaluator's reading, by construction.
+    """
+    return next(
+        (witness.provider_event_id for witness in qualifying_creations(evidence)),
+        None,
+    )
 
 
 __all__ = [
@@ -1453,4 +1605,5 @@ __all__ = [
     "RuntimeNotFoundError",
     "RuntimeResumeError",
     "TriggerOutcome",
+    "_fulfillment_outcome",
 ]

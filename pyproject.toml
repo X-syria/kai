@@ -34,9 +34,6 @@ dev = [
     "mypy>=1.15",
 ]
 
-[project.scripts]
-kai = "kai.cli:cli"
-
 [tool.hatch.build.targets.wheel]
 packages = ["src/kai"]
 

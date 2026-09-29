@@ -9,7 +9,7 @@ through the app dependency override.
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from typing import Final
 from urllib.parse import parse_qs, parse_qsl, urlparse
 from uuid import uuid4
@@ -23,7 +23,7 @@ from kai.db.engine import async_session_factory, engine
 from kai.db.models import GoogleAccount, Tenant, User
 from kai.google import client as google_client
 from kai.google.client import GoogleOAuthError
-from kai.google.crypto import decrypt_credentials, encrypt_credentials
+from kai.google.crypto import decrypt_credentials
 from kai.google.deps import get_google_http_client
 from kai.google.service import (
     GoogleAccountConflictError,
@@ -49,6 +49,7 @@ class GoogleStub:
         self.token_error = "invalid_request"
         self.userinfo_status = 200
         self.revoke_status = 200
+        self.omit_refresh_on_exchange = False
         self.token_calls: list[httpx.Request] = []
         self.userinfo_calls: list[httpx.Request] = []
         self.revoke_calls: list[httpx.Request] = []
@@ -56,11 +57,10 @@ class GoogleStub:
     def _token_payload(self, form: dict[str, str]) -> dict:
         if form.get("grant_type") == "refresh_token":
             return {"access_token": self.refresh_access_token, "expires_in": 3599}
-        return {
-            "access_token": self.access_token,
-            "refresh_token": self.refresh_token,
-            "expires_in": 3599,
-        }
+        payload = {"access_token": self.access_token, "expires_in": 3599}
+        if not self.omit_refresh_on_exchange:
+            payload["refresh_token"] = self.refresh_token
+        return payload
 
     def handler(self, request: httpx.Request) -> httpx.Response:
         if request.url.path == "/token" and request.url.host == "oauth2.googleapis.com":
@@ -324,6 +324,67 @@ async def test_same_google_identity_reconnects_without_duplicate(
     assert count == 1
 
 
+async def _stored_credentials() -> dict:
+    async with engine.begin() as conn:
+        row = (
+            await conn.execute(text("SELECT credentials_encrypted FROM google_accounts"))
+        ).scalar_one()
+    return decrypt_credentials(row)
+
+
+async def test_reconnect_preserves_refresh_token_when_google_omits_it(
+    client: httpx.AsyncClient,
+    google_settings: None,
+    google_transport: httpx.AsyncClient,
+    stub: GoogleStub,
+) -> None:
+    """A reconnect whose token response omits ``refresh_token`` must not erase
+    the stored one: the account would otherwise lose its only long-lived
+    credential and every later refresh would fail."""
+    token = await _register(client)
+    stub.sub = "sub-sec01"
+    assert (
+        await _callback(client, state=_state_from(await _connect(client, token)))
+    ).status_code == 200
+    assert (await _stored_credentials())["refresh_token"] == stub.refresh_token
+
+    stub.access_token = "new-access-token"
+    stub.omit_refresh_on_exchange = True
+    assert (
+        await _callback(client, state=_state_from(await _connect(client, token)))
+    ).status_code == 200
+
+    after = await _stored_credentials()
+    assert after["access_token"] == "new-access-token"
+    assert after["refresh_token"] == stub.refresh_token
+
+
+async def test_reconnect_replaces_refresh_token_when_google_issues_one(
+    client: httpx.AsyncClient,
+    google_settings: None,
+    google_transport: httpx.AsyncClient,
+    stub: GoogleStub,
+) -> None:
+    """When Google does issue a new ``refresh_token``, the stored one is
+    replaced — the preservation rule must never keep a stale token."""
+    token = await _register(client)
+    stub.sub = "sub-sec01b"
+    assert (
+        await _callback(client, state=_state_from(await _connect(client, token)))
+    ).status_code == 200
+    assert (await _stored_credentials())["refresh_token"] == stub.refresh_token
+
+    stub.access_token = "new-access-token-2"
+    stub.refresh_token = "brand-new-refresh-token"
+    assert (
+        await _callback(client, state=_state_from(await _connect(client, token)))
+    ).status_code == 200
+
+    after = await _stored_credentials()
+    assert after["access_token"] == "new-access-token-2"
+    assert after["refresh_token"] == "brand-new-refresh-token"
+
+
 async def test_distinct_google_identities_bind_separately(
     client: httpx.AsyncClient,
     google_settings: None,
@@ -413,9 +474,6 @@ async def test_bind_rejects_account_owned_by_another_user_in_tenant(
         await session.commit()
         await session.refresh(user_b)
 
-        credentials = encrypt_credentials(
-            {"access_token": "tok", "refresh_token": "refresh"}
-        )
         account = await bind_or_reconnect_google_account(
             session,
             tenant_id=tenant.id,
@@ -423,8 +481,9 @@ async def test_bind_rejects_account_owned_by_another_user_in_tenant(
             google_sub="shared-sub",
             email="a@example.com",
             scopes="openid email",
-            credentials_encrypted=credentials,
-            token_expires_at=datetime.now(UTC) + timedelta(hours=1),
+            access_token="tok",
+            refresh_token="refresh",
+            expires_in=3600,
         )
         assert account.user_id == user_a.id
 
@@ -436,8 +495,9 @@ async def test_bind_rejects_account_owned_by_another_user_in_tenant(
                 google_sub="shared-sub",
                 email="b@example.com",
                 scopes="openid email",
-                credentials_encrypted=credentials,
-                token_expires_at=datetime.now(UTC) + timedelta(hours=1),
+                access_token="tok",
+                refresh_token="refresh",
+                expires_in=3600,
             )
 
 
@@ -446,9 +506,6 @@ async def test_refresh_rotates_encrypted_access_token(
 ) -> None:
     tenant, user = await _make_user_and_tenant()
     async with async_session_factory() as session:
-        credentials = encrypt_credentials(
-            {"access_token": "old-access-token", "refresh_token": stub.refresh_token}
-        )
         account = await bind_or_reconnect_google_account(
             session,
             tenant_id=tenant.id,
@@ -456,8 +513,9 @@ async def test_refresh_rotates_encrypted_access_token(
             google_sub="sub-refresh",
             email="refresh@example.com",
             scopes="openid email",
-            credentials_encrypted=credentials,
-            token_expires_at=datetime.now(UTC) + timedelta(seconds=30),
+            access_token="old-access-token",
+            refresh_token=stub.refresh_token,
+            expires_in=30,
         )
         account_id = account.id
         before_expiry = account.token_expires_at
@@ -481,9 +539,6 @@ async def test_refresh_rejects_revoked_credentials(
 ) -> None:
     tenant, user = await _make_user_and_tenant()
     async with async_session_factory() as session:
-        credentials = encrypt_credentials(
-            {"access_token": "old-access-token", "refresh_token": stub.refresh_token}
-        )
         account = await bind_or_reconnect_google_account(
             session,
             tenant_id=tenant.id,
@@ -491,8 +546,9 @@ async def test_refresh_rejects_revoked_credentials(
             google_sub="sub-revoked",
             email="revoked@example.com",
             scopes="openid email",
-            credentials_encrypted=credentials,
-            token_expires_at=datetime.now(UTC) + timedelta(seconds=30),
+            access_token="old-access-token",
+            refresh_token=stub.refresh_token,
+            expires_in=30,
         )
         account_id = account.id
         before_expiry = account.token_expires_at
@@ -523,7 +579,6 @@ async def test_refresh_without_refresh_token_is_rejected(
 ) -> None:
     tenant, user = await _make_user_and_tenant()
     async with async_session_factory() as session:
-        credentials = encrypt_credentials({"access_token": "only-access"})
         account = await bind_or_reconnect_google_account(
             session,
             tenant_id=tenant.id,
@@ -531,8 +586,9 @@ async def test_refresh_without_refresh_token_is_rejected(
             google_sub="sub-no-refresh",
             email="norefresh@example.com",
             scopes="openid email",
-            credentials_encrypted=credentials,
-            token_expires_at=datetime.now(UTC) + timedelta(seconds=30),
+            access_token="only-access",
+            refresh_token=None,
+            expires_in=30,
         )
         account_id = account.id
 
@@ -550,9 +606,6 @@ async def test_refresh_is_tenant_scoped(google_settings: None, stub: GoogleStub)
     tenant_a, user_a = await _make_user_and_tenant()
     tenant_b, _ = await _make_user_and_tenant()
     async with async_session_factory() as session:
-        credentials = encrypt_credentials(
-            {"access_token": "tok", "refresh_token": stub.refresh_token}
-        )
         account = await bind_or_reconnect_google_account(
             session,
             tenant_id=tenant_a.id,
@@ -560,8 +613,9 @@ async def test_refresh_is_tenant_scoped(google_settings: None, stub: GoogleStub)
             google_sub="sub-cross",
             email="cross@example.com",
             scopes="openid email",
-            credentials_encrypted=credentials,
-            token_expires_at=datetime.now(UTC) + timedelta(seconds=30),
+            access_token="tok",
+            refresh_token=stub.refresh_token,
+            expires_in=30,
         )
         account_id = account.id
 

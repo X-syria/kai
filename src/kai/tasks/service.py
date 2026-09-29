@@ -22,7 +22,7 @@ from sqlalchemy import Select, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from kai.tasks.models import Task
-from kai.tasks.schemas import TaskContractInput
+from kai.tasks.schemas import FulfillmentProfile, TaskContractInput
 from kai.tasks.state import (
     CREATED,
     FAILED,
@@ -64,11 +64,32 @@ CLIENT_TRANSITION_TARGETS: frozenset[str] = frozenset(
 )
 
 
+#: The set of fulfillment profiles a contract may be sealed with for live
+#: execution (§10.10). Membership in :data:`FulfillmentProfile` is not itself
+#: permission to seal: a listed profile must carry at least one criterion value
+#: that its evaluator decides on from a sealed user-intent source. ``gmail_send``
+#: stays in the vocabulary but is not listed, so it remains sealable at the
+#: schema layer and is refused here, at the single write to
+#: ``Task.fulfillment_profile``.
+LIVE_SEALABLE_PROFILES: frozenset[FulfillmentProfile] = frozenset({
+    "calendar_meeting",
+})
+
+
 class InvalidActorError(ValueError):
     """Raised when a caller may not drive a state the machine would allow.
 
     Distinct from :class:`InvalidTransition`: the machine is not refusing the
     edge, the caller is not entitled to ask for it.
+    """
+
+
+class UnlicensedFulfillmentError(ValueError):
+    """Raised when a contract names a profile that may not be sealed for live use.
+
+    The value is a valid :data:`FulfillmentProfile` but is not in
+    :data:`LIVE_SEALABLE_PROFILES`, so persisting it would grant a live-sealing
+    licence the semantic review did not warrant (§10.10).
     """
 
 
@@ -79,13 +100,25 @@ async def create_task(
     user_id: UUID,
     contract: TaskContractInput,
 ) -> Task:
-    """Persist a freshly ``CREATED`` task for one tenant/user."""
+    """Persist a freshly ``CREATED`` task for one tenant/user.
+
+    The sealing gate lives here, before the row is written: a contract may only
+    be sealed with a profile from :data:`LIVE_SEALABLE_PROFILES`, so a profile
+    the review did not licence for live execution is refused at the single write
+    to ``Task.fulfillment_profile``.
+    """
+    if contract.fulfillment_profile not in LIVE_SEALABLE_PROFILES:
+        raise UnlicensedFulfillmentError(
+            f"fulfillment profile {contract.fulfillment_profile!r} "
+            "is not licensed for live sealing"
+        )
     task = Task(
         tenant_id=tenant_id,
         user_id=user_id,
         state=CREATED,
         goal=contract.goal,
         success_criteria=list(contract.success_criteria),
+        fulfillment_profile=contract.fulfillment_profile,
         allowed_tools=list(contract.allowed_tools),
         risk_policy=contract.risk_policy,
         deadline=contract.deadline,

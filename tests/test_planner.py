@@ -9,6 +9,7 @@ the *default* dependency whose endpoint URL is empty, so a request fails with
 
 from __future__ import annotations
 
+import asyncio
 from uuid import UUID, uuid4
 
 import httpx
@@ -16,11 +17,12 @@ import pytest
 from sqlalchemy import func, select
 
 from kai.db.engine import async_session_factory
-from kai.db.models import User
+from kai.db.models import Tenant, User
 from kai.main import app
 from kai.planner.deps import get_planner_model
 from kai.planner.model import ModelOutputError
 from kai.planner.models import TaskPlan
+from kai.planner.service import PlannerService
 from kai.tasks.schemas import TaskContractInput
 from kai.tasks.service import create_task, transition_task
 from kai.tasks.state import CREATED, FAILED, PLANNING, POLICY_CHECK, UNDERSTANDING
@@ -108,6 +110,7 @@ def _task_json() -> dict:
     return {
         "goal": GOAL,
         "success_criteria": list(CRITERIA),
+        "fulfillment_profile": "calendar_meeting",
         "allowed_tools": ["calendar"],
         "risk_policy": "LOW",
         "deadline": "2026-06-24T10:00:00Z",
@@ -291,6 +294,174 @@ async def test_replan_bumps_version_and_supersedes_old(
     versions = [p["version"] for p in history.json()["plans"]]
     assert versions == [2, 1]
     assert {p["status"] for p in history.json()["plans"]} == {"ACCEPTED", "SUPERSEDED"}
+
+
+# --- version allocation under concurrency ------------------------------------
+
+#: The unique constraint that makes duplicate persistence impossible, and the
+#: reason a racing loser used to surface as IntegrityError instead of a version.
+PLAN_VERSION_CONSTRAINT = "uq_task_plans_tenant_task_version"
+
+
+class _RendezvousModel(StubPlannerModel):
+    """A stub model that parks every caller until all of them have arrived.
+
+    The model call sits *before* the version read in ``PlannerService.create_plan``,
+    so releasing all callers here is what lets two real requests be in flight at
+    the same allocator: no timing, no sleep, only a rendezvous both sides must
+    reach before either is allowed to continue.
+    """
+
+    def __init__(self, arrivals: int) -> None:
+        super().__init__()
+        self._arrivals = arrivals
+        self._count = 0
+        self._all_arrived = asyncio.Event()
+        self._open = asyncio.Event()
+
+    async def generate_plan(self, *, messages: list[dict]) -> dict:
+        self._count += 1
+        if self._count >= self._arrivals:
+            self._all_arrived.set()
+        await self._open.wait()
+        return await super().generate_plan(messages=messages)
+
+    async def wait_all_arrived(self, timeout: float) -> None:
+        await asyncio.wait_for(self._all_arrived.wait(), timeout=timeout)
+
+    def release(self) -> None:
+        self._open.set()
+
+
+async def _plan_concurrently(
+    *, arrivals: int
+) -> tuple[
+    list[TaskPlan | None], list[Exception], _RendezvousModel, tuple[UUID, UUID, UUID]
+]:
+    """Run N real planners against one task, all released at the same instant.
+
+    Each caller gets its own real session, so these are genuinely separate
+    transactions against real PostgreSQL, not one shared unit of work.
+    """
+    model = _RendezvousModel(arrivals)
+    app.dependency_overrides[get_planner_model] = lambda: model
+    try:
+        async with async_session_factory() as setup:
+            tenant = Tenant(name=f"race-{uuid4().hex}")
+            setup.add(tenant)
+            await setup.flush()
+            user = User(
+                tenant_id=tenant.id,
+                email=f"race-{uuid4().hex}@example.com",
+                password_hash="unused",
+            )
+            setup.add(user)
+            await setup.flush()
+            task = await create_task(
+                setup,
+                tenant_id=tenant.id,
+                user_id=user.id,
+                contract=TaskContractInput.model_validate(_task_json()),
+            )
+            # PLANNING, not UNDERSTANDING: the allocator is what is under test
+            # here. A task in UNDERSTANDING additionally races the
+            # UNDERSTANDING->PLANNING transition, which is a different seam.
+            for target in (UNDERSTANDING, PLANNING):
+                await transition_task(
+                    setup,
+                    task_id=task.id,
+                    tenant_id=tenant.id,
+                    user_id=user.id,
+                    target=target,
+                )
+            task_scope = (task.id, tenant.id, user.id)
+
+        plans: list[TaskPlan | None] = []
+        errors: list[Exception] = []
+
+        async def one() -> None:
+            async with async_session_factory() as session:
+                try:
+                    plans.append(
+                        await PlannerService(model).create_plan(
+                            session,
+                            task_id=task_scope[0],
+                            tenant_id=task_scope[1],
+                            user_id=task_scope[2],
+                        )
+                    )
+                except Exception as exc:  # noqa: BLE001 - recorded as evidence
+                    errors.append(exc)
+
+        workers = [asyncio.create_task(one()) for _ in range(arrivals)]
+        # Deterministic: nobody proceeds until every caller is in flight, so
+        # the race is forced rather than hoped for.
+        await model.wait_all_arrived(timeout=30)
+        model.release()
+        await asyncio.gather(*workers)
+    finally:
+        app.dependency_overrides.pop(get_planner_model, None)
+    return plans, errors, model, task_scope
+
+
+async def test_concurrent_plan_creation_allocates_a_distinct_version_each() -> None:
+    """Two simultaneous replans of one task must both land, at N+1 and N+2.
+
+    Both callers are released at the same instant from the same predecessor
+    state, which is exactly the interleaving that used to make the loser hit
+    ``uq_task_plans_tenant_task_version``. The contract a caller can observe is
+    that a valid, fully-validated plan proposal is never turned away by a
+    version collision it had no way to know about.
+    """
+    plans, errors, _, _ = await _plan_concurrently(arrivals=2)
+
+    assert errors == [], f"a valid concurrent plan was refused: {errors!r}"
+    assert sorted(p.version for p in plans if p is not None) == [1, 2]
+
+    # The loser of the allocation is still a first-class plan, not a discarded
+    # write: exactly one is ACCEPTED and the other is retained as history. Read
+    # the committed rows, not the returned objects — a returned plan carries
+    # the status image from its own commit, not the task's final state.
+    async with async_session_factory() as check:
+        rows = (
+            await check.execute(
+                select(TaskPlan.version, TaskPlan.status).order_by(TaskPlan.version)
+            )
+        ).all()
+    assert rows == [(1, "SUPERSEDED"), (2, "ACCEPTED")]
+
+
+async def test_a_sequential_replan_after_a_race_still_takes_the_next_version() -> None:
+    """The fix must not turn allocation into a fixed or shared counter.
+
+    Ordinary non-concurrent allocation is the baseline contract: with a latest
+    version of N, the next plan is N+1. A third plan after the race above has
+    to be 3, proving the allocator still reads real history rather than
+    remembering what a lock did.
+    """
+    plans, errors, _, task_scope = await _plan_concurrently(arrivals=2)
+    assert errors == [], f"a valid concurrent plan was refused: {errors!r}"
+    assert sorted(p.version for p in plans if p is not None) == [1, 2]
+
+    model = StubPlannerModel()
+    async with async_session_factory() as session:
+        third = await PlannerService(model).create_plan(
+            session,
+            task_id=task_scope[0],
+            tenant_id=task_scope[1],
+            user_id=task_scope[2],
+        )
+
+    assert third.version == 3
+    assert third.status == "ACCEPTED"
+
+    async with async_session_factory() as check:
+        rows = (
+            await check.execute(
+                select(TaskPlan.version, TaskPlan.status).order_by(TaskPlan.version)
+            )
+        ).all()
+    assert rows == [(1, "SUPERSEDED"), (2, "SUPERSEDED"), (3, "ACCEPTED")]
 
 
 # --- failure paths ---------------------------------------------------------
@@ -667,6 +838,7 @@ async def test_user_isolation_within_tenant(
             {
                 "goal": GOAL,
                 "success_criteria": list(CRITERIA),
+                "fulfillment_profile": "calendar_meeting",
                 "allowed_tools": ["calendar"],
                 "risk_policy": "LOW",
                 "deadline": "2026-06-24T10:00:00Z",
@@ -738,6 +910,7 @@ async def test_prompt_injection_in_goal_stays_data(
         json={
             "goal": injected,
             "success_criteria": ["a thing happens"],
+            "fulfillment_profile": "calendar_meeting",
             "allowed_tools": ["calendar"],
             "risk_policy": "LOW",
             "deadline": "2026-06-24T10:00:00Z",

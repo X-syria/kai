@@ -1,4 +1,10 @@
-"""Pydantic + domain validation for the Task Contract — no database."""
+"""Pydantic + domain validation for the Task Contract.
+
+The schema-level tests are database-free. The two live-sealing license tests at
+the end exercise the real ``create_task`` boundary (the single write to
+``Task.fulfillment_profile``) against Postgres, so they need the same shared
+database the rest of the runtime suite uses.
+"""
 
 from __future__ import annotations
 
@@ -8,10 +14,17 @@ import pytest
 from pydantic import ValidationError
 
 from kai.tasks.schemas import StateTransitionRequest, TaskContractInput
+from kai.tasks.service import (
+    UnlicensedFulfillmentError,
+    count_tasks,
+    create_task,
+)
+from tool_harness import make_tenant_user, session_scope
 
 VALID = {
     "goal": "Book a flight to Berlin",
     "success_criteria": ["booking reference exists"],
+    "fulfillment_profile": "calendar_meeting",
     "allowed_tools": ["calendar", "gmail"],
     "risk_policy": "LOW",
     "max_cost": 500.0,
@@ -132,3 +145,45 @@ def test_deadline_is_a_future_boundary_not_required() -> None:
     past = datetime.now(UTC) - timedelta(days=30)
     # A past deadline is structurally fine; the scheduler enforces it later.
     assert _contract(deadline=past).deadline == past
+
+
+# --- live-sealing license gate (create_task is the single seal boundary) -----
+
+
+async def test_calendar_profile_is_accepted_by_the_sealing_gate() -> None:
+    """``calendar_meeting`` still seals through the real ``create_task`` path.
+
+    The reference profile carries an evaluator-decided sealed-intent anchor (the
+    enforced window), so it must remain licensable. This exercises the actual
+    persistence boundary, not the constant.
+    """
+    tenant, user = await make_tenant_user("owner@corp.example")
+    async with session_scope() as session:
+        task = await create_task(
+            session,
+            tenant_id=tenant.id,
+            user_id=user.id,
+            contract=_contract(),
+        )
+        assert task.fulfillment_profile == "calendar_meeting"
+
+
+async def test_gmail_profile_is_rejected_by_the_sealing_gate() -> None:
+    """``gmail_send`` cannot be sealed: no evaluator-decided user-intent source.
+
+    Every ``gmail_send`` criterion value is derived from execution-time
+    resolution, so the profile is refused at the license boundary — before any
+    ``Task`` row is persisted — and the error names the rejected profile.
+    """
+    tenant, user = await make_tenant_user("owner@corp.example")
+    async with session_scope() as session:
+        with pytest.raises(UnlicensedFulfillmentError) as excinfo:
+            await create_task(
+                session,
+                tenant_id=tenant.id,
+                user_id=user.id,
+                contract=_contract(fulfillment_profile="gmail_send"),
+            )
+        assert "gmail_send" in str(excinfo.value)
+        # The gate fires before persistence: nothing was sealed into the tenant.
+        assert await count_tasks(session, tenant_id=tenant.id) == 0

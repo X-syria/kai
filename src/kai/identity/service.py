@@ -172,7 +172,11 @@ class IdentityResolver:
             status = IdentityStatus.PROVIDER_VERIFIED
         elif channel_evidence:
             status = IdentityStatus.CHANNEL_VERIFIED
-        elif len(exact_claims) == 1:
+        elif len({claim.contact.resource_name for claim in exact_claims}) == 1:
+            # One entity, however many identifiers corroborated it. C1 has already
+            # excluded more than one, so this asks the question the result answers
+            # in ``_build``: exactly one contact was matched. Two exact claims on one
+            # contact are two assertions about one identity, not a competition.
             status = IdentityStatus.CONTACT_MATCH
         else:
             status = IdentityStatus.UNKNOWN

@@ -21,6 +21,12 @@ env/
 .env.local
 .env.*.local
 
+# Agent tooling — skills are project documentation and ARE tracked.
+# Registered git worktrees under .claude/worktrees/ are generated checkouts of
+# this repository, not project source. Excluding them keeps `git add -A` from
+# staging a second copy of the tree.
+.claude/worktrees/
+
 # IDE / OS
 .idea/
 .vscode/

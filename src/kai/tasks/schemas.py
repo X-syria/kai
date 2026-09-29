@@ -18,6 +18,32 @@ from kai.tasks.state import ALL_STATES
 RiskPolicy = Literal["LOW", "MEDIUM", "HIGH", "CRITICAL"]
 VerificationMethod = Literal["automatic", "manual", "ai_review"]
 
+#: The closed set of fulfillment semantics a Sealed Contract may name.
+#:
+#: This names *which* question is being asked, and it is part of the sealed
+#: contract, so a resumed run re-derives the same evaluator from persisted state
+#: rather than from anything mutable. It says nothing about the conditions inside
+#: that question: those live in the typed ``SuccessCriteria``, which is the
+#: authority the evaluator actually reads. ``success_criteria`` below is prose —
+#: a description the planner reproduces verbatim — and is never interpreted.
+#:
+#: There are two members because two domains are implemented. Each one was added
+#: as a deliberate amendment to the contract vocabulary, not as an accident of a
+#: new task's tools — which is why this is an explicit identifier and never
+#: derived from ``allowed_tools`` or from the goal text.
+#:
+#: ``calendar_meeting`` was closed on its own evidence, in
+#: ``kai.runtime.fulfillment.evaluate_calendar_meeting``.
+#: ``gmail_send`` is the second-domain experiment
+#: (:func:`kai.runtime.fulfillment.evaluate_gmail_send`): a second sealed
+#: question, sealed the same way, with its own semantics. Naming a second member
+#: is a statement that the *binding* is the part that generalizes. It is not a
+#: claim that fulfillment is a general framework, that any further domain is
+#: supported, or that a profile can be derived rather than declared — the
+#: runtime still seals ``calendar_meeting`` for every task it drives, and
+#: ``gmail_send`` is reachable only where a contract already names it.
+FulfillmentProfile = Literal["calendar_meeting", "gmail_send"]
+
 _MAX_CRITERIA = 50
 _MAX_TOOLS = 50
 _TEXT_LIMIT = 1000
@@ -30,6 +56,7 @@ class TaskContractInput(BaseModel):
     success_criteria: list[str] = Field(
         min_length=1, max_length=_MAX_CRITERIA
     )
+    fulfillment_profile: FulfillmentProfile
     allowed_tools: list[str] = Field(default_factory=list, max_length=_MAX_TOOLS)
     risk_policy: RiskPolicy = "LOW"
     deadline: datetime | None = None

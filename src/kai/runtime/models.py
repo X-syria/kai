@@ -21,6 +21,17 @@ committed reservation, never a held transaction or row lock, so no database
 lock is ever kept across an external provider call. A claim older than the lease
 is treated as abandoned by a crashed worker and may be taken over.
 
+``fulfillment_profile``/``evaluator_version``/``fulfillment_verdict`` record how
+fulfillment was decided: which sealed profile the contract named, which version of
+that profile's evaluator semantics ran, and what it concluded. They are an audit
+trail, and every one of them is nullable on purpose. A run that stops before
+verification has no verdict to record, and a row written before these columns
+existed cannot be given an identity that was never written down — so it is left
+``NULL`` rather than backfilled, because a backfilled ``evaluator_version`` would
+be a guess presented as provenance. ``NULL`` therefore means "not recorded", and
+never "no evaluator ran": the evaluator, the sealed contract, and the evidence
+are what decide, and this row only describes what they decided.
+
 Explicit tenants-and-users FK scope mirrors the Task row; ``task_id`` is
 unique so at most one execution exists per task. No secrets are stored here:
 no tokens, credentials, or message bodies.
@@ -80,6 +91,22 @@ class RuntimeExecution(PKMixin, TenantMixin, TimestampMixin, Base):
     claimed_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+
+    # The fulfillment audit triple: which sealed profile, which version of its
+    # evaluator, and what that evaluator concluded. All three are nullable
+    # because a run that never reached verification has nothing to record, and
+    # because the rows written before these columns existed cannot honestly
+    # claim an identity — see the module docstring.
+    #
+    # These columns are an audit trail, never a source of authority. The verdict
+    # here is re-derived from the evidence above on every settlement, and a
+    # re-derivation that disagrees with this row overwrites it. Nothing reads
+    # these columns to decide a task state.
+    fulfillment_profile: Mapped[str | None] = mapped_column(
+        String(64), nullable=True
+    )
+    evaluator_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    fulfillment_verdict: Mapped[str | None] = mapped_column(String(32), nullable=True)
 
 
 __all__ = ["RuntimeExecution"]

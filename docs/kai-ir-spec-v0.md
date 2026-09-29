@@ -2,6 +2,16 @@
 
 Status: **partially implemented — living specification**.
 
+Scope of authority: this document is the **implementation specification for
+KAI-IR** and nothing more. It does not define KAI's identity, and it is not the
+historical origin of that identity. On any question of *what KAI is* or *where
+the authority of a component ends*, the highest reference is
+[`docs/architecture/KAI_REFERENCE_ARCHITECTURE_AR.md`](architecture/KAI_REFERENCE_ARCHITECTURE_AR.md)
+(KAI Identity & Reference Architecture); this document refines it and must not be
+read as contradicting it. Where this document is silent, the reference
+architecture answers; where this document is specific, it governs. The
+document index is in `docs/architecture/DOCUMENTATION_STATUS.md`.
+
 This document began as a proposal. It is now a specification with a live
 implemented subset, maintained by describing the code that exists rather than by
 anticipating code that does not. Three terms are used precisely below, and they
@@ -48,7 +58,10 @@ Three rows need their reasoning stated rather than left to inference:
 - **`ErrorNode` is implemented as a model, not as dispatch.** It carries the
   error class with its declared response and validates the two against each
   other, but execution does not yet walk error nodes: a failure still resolves
-  through `error_code` and the task state machine (§4.9).
+  through `error_code` and the task state machine (§4.9). What the Runtime *does*
+  do is record it — `record_error` derives the typed failure for every recorded
+  action, so failures stop being bare strings in Runtime code while the decision
+  that consumes them stays exactly where it was (§8.15).
 - **`ControlNode` was not in the original fourteen.** It is the
   representation-level addition described in §12.2, and it introduced no new
   authority.
@@ -158,6 +171,14 @@ define "done". It carries no permissions and no tools.
 Supported: yes — this is the current `Task.goal` + `success_criteria` contract
 and the runtime `UnderstandingOutput` scenario.
 
+The IntentNode carries **no fulfillment binding**, and that absence is
+normative rather than provisional. Which evaluator answers `success_criteria` is
+decided by the Sealed Contract's `fulfillment_profile` field, read from the task
+row at settlement (§8.7.1). Were the profile an IntentNode field, a program could
+name the standard it is judged by; were it a `ConditionNode` fact, a model could
+propose it and the IR would be evaluating fulfillment with an LLM. The IR
+reproduces the question, and the question is not the answer.
+
 ### 2. `PlanNode` — the plan being executed
 
 An ordered, bounded sequence of steps with a declared plan version. This is the
@@ -189,8 +210,8 @@ branch. The condition is one flat object, not an expression:
 - `condition_id`: stable identifier for the condition itself.
 - `subject`: the single fact being read, as a `ConditionSubject`.
 - `operator`: one of `eq`, `neq`, `gt`, `gte`, `lt`, `lte`, `in`, `not_in`.
-- `value`: the literal operand — a `bool`, `int`, `str`, or a list of one of
-  those.
+- `value`: the literal operand — a `bool`, `int`, `str`, `None`, or a list of one
+  of `bool`, `int`, `str`.
 - `negate`: `bool`, default `false` (§4.4.3).
 
 #### 4.4.1 The fact vocabulary is closed
@@ -207,15 +228,20 @@ scalar:
 
 An `observation` subject must additionally name both `step_order` and `field`,
 where `field` is one of `outcome` (str), `ok` (bool), `verified` (bool), or
-`error_code` (str). The other three kinds must name no step and no field: a
-condition reads one fact, so there is no path expression to write.
+`error_code` (str **or null** — §4.4.4). The other three kinds must name no step
+and no field: a condition reads one fact, so there is no path expression to
+write.
 
 This is an allow-list of scalars, not a path into a provider payload. A condition
 cannot read an environment variable, call a tool, or ask the model, because the
 vocabulary has nowhere to put any of those. A step-scoped observation subject
 reads the **last** observation recorded for that step, which is that step's
 outcome: a step runs its intents in order and stops on the first unsuccessful
-one.
+one. That coupling is a contract on the Runtime, not a property of the IR — the
+IR cannot see whether a step stopped early, only which record is latest. A change
+to the Runtime's per-step stop policy must revise this paragraph in the same
+change, because "the last record for a step" would otherwise silently stop
+meaning "what that step did".
 
 #### 4.4.2 Operands are type-checked against the fact at build time
 
@@ -229,6 +255,8 @@ becoming a condition that silently never matches. In detail:
   the fact's type; every other operator requires a single scalar;
 - `gt`, `gte`, `lt`, and `lte` are refused for `str` facts, where ordering has
   no defined meaning.
+
+A `None` operand is the one exception, and only for `error_code` (§4.4.4).
 
 This is a deliberate property of the IR, not a convenience. Because the operand
 type is settled before a program can be sealed, evaluation is a single
@@ -253,6 +281,99 @@ The consequence is what a two-way branch looks like — two edges whose guards
 differ only in `negate`, which keeps a branch inspectable as a pair of opposites
 without either side being a nested expression. No branch is *proven* exhaustive
 by this in v0; see §8.14.
+
+#### 4.4.4 A null value is a fact, and a missing observation is not
+
+`error_code` is `str | None`, and `None` is its normal value: an action that
+recorded no error code has a null `error_code`. That is a real, decidable fact
+about a successful action, so it is expressible:
+
+| Condition | Meaning | Valid |
+| --- | --- | --- |
+| `error_code eq null` | the step recorded no error code | yes |
+| `error_code neq null` | the step recorded one | yes |
+| `error_code gt null`, `error_code in [null]` | — | **refused** |
+| `outcome eq null`, `cursor eq null`, `task_state eq null` | — | **refused** |
+| `error_code in ["a", null]` | — | **refused** |
+
+`NULLABLE_OBSERVATION_FACT_FIELDS` is the allow-list, and it is one field wide.
+`ConditionSubject.allows_null()` reads it, so adding a nullable field is one
+deliberate edit rather than a widening of the type system. Being nullable says
+nothing about the type when a value *is* present: `error_code` is still `str` in
+`OBSERVATION_FACT_TYPES`, and `error_code eq 7` is refused exactly as before.
+
+`null` is permitted only with `eq` and `neq`, because those ask whether the fact
+holds a value. Ordering and enumerating "nothing" have no defined meaning, so
+`gt null` and `in [null]` are refused **where the condition is written** — a
+build error, not a branch that can never be taken. A list operand cannot hold a
+null at all: the operand shapes are single-typed lists, so `list[str]` has
+nowhere to put one.
+
+The distinction this preserves is between a **null value** and a **missing
+observation**. `error_code eq null` against a step that ran and recorded no
+error is true; against a step that has no observation at all, evaluation is
+refused outright (§8.5) rather than answering "it had no error code". A field
+the program does not name is never silently null.
+
+Supported: yes — implemented, in `src/kai/ir/nodes.py`.
+
+#### 4.4.5 What a branch establishes, and what it does not
+
+A branch is an **alternative execution path for the same Intent under the same
+Sealed Contract** (§8.9). That is the whole of what it establishes, and it is
+established: two declared paths over one `IntentNode` and one set of Success
+Criteria, each independently reaching a task state the machine reports as
+fulfilled, are representable in v0 and are exercised end to end.
+
+Whether either path's evidence actually satisfies that contract is **not** a
+branching claim, and is decided outside the IR (§8.7.1). A run can terminate on
+every path and still not have fulfilled the Intent.
+
+It is **not** a provider-level method-substitution mechanism, and this
+specification does not claim one. The limit follows from the closed vocabulary in
+§4.4.1 rather than from anything missing or unfinished:
+
+| A condition can distinguish | A condition cannot distinguish |
+| --- | --- |
+| whether a step succeeded — `outcome`, `ok`, `verified`, `error_code` | a value the provider returned — `data`, `evidence`, `arguments` |
+| how far the run has progressed — `cursor`, `steps_used` | which method inside one capability produced a value |
+| which lifecycle state the task is in — `task_state` | any computed, derived, or aggregate value |
+
+`ActionNode` names a **capability**, not a method. Turning a capability into a
+concrete tool call belongs to the Tool Gateway (§9), so the IR has nowhere to
+name "method A" as against "method B" within a single capability. A condition can
+read only what §4.4.1 lists, so it can choose only between steps that are already
+separated by a fact the vocabulary already contains.
+
+A semantic experiment whose distinguishing fact comes from a provider-returned
+value — booking *slot 1* against *slot 2*, or provider method A against provider
+method B — therefore lies **outside the currently expressible semantic
+vocabulary**, and its status is:
+
+> **INCONCLUSIVE / NOT EXPRESSIBLE IN CURRENT IR**
+
+This is a specification boundary, not a test artifact and not a `FAILED` result.
+Nothing failed and nothing is broken: such a program is refused where it is
+written, because the same closed vocabulary that keeps a condition a pure
+comparison over already-durable facts (§8.5) has nowhere to put a provider
+payload. Widening `FactKind`, admitting arbitrary provider values, or introducing
+a method-level abstraction is a **deliberate amendment to this specification** that
+must carry its own authority argument; it is not a gap to be filled in, and it
+does not follow from the branching work (§13).
+
+Two readings of the boundary worth ruling out explicitly:
+
+- **Two paths are not two Intents.** Two branches under one `IntentNode` are two
+  attempts at the same thing, not two things the user asked for. Work that needs a
+  different goal is a different plan under a different sealed contract.
+- **Selecting a path is cheap; selecting a meaning is not.** A fork costs one
+  `ConditionNode` and one decision per step. Expressing *why* two paths differ
+  requires the fact that separates them to already exist in §4.4.1 — otherwise
+  the two paths are not distinguishable, however different they look.
+
+Supported: yes — implemented, as `FactKind` and `OBSERVATION_FACT_TYPES` in
+`src/kai/ir/nodes.py`. The boundary above is what that closed set is specified to
+be, not a limitation left in it.
 
 Supported: yes — implemented. The Runtime evaluates conditions on every step
 (§8.6), and the vocabulary above is exactly `FactKind` and
@@ -300,8 +421,8 @@ arguments) and the runtime's `capability_to_tool` translation.
 The durable, internal record of one executed `ActionNode`: outcome, evidence,
 verdict, and the request identity. Observations are append-only.
 
-- `action_id`, `outcome` (ToolOutcome), `ok`, `verified`, `error_code`,
-  `evidence` (full, internal), `request_id`, `recorded_at`.
+- `action_id`, `outcome` (ToolOutcome), `ok`, `verified`, `error_code`
+  (`str | None` — §4.4.4), `evidence` (full, internal), `request_id`, `recorded_at`.
 
 Supported: yes — this is the existing runtime `evidence` list and the Gateway's
 `ToolResult`.
@@ -315,7 +436,14 @@ requires attention, with the reason.
 
 `result` is restricted to the states the task state machine can actually report
 as terminal, so a program can never declare an outcome the machine cannot
-represent.
+represent. `WAITING_APPROVAL` is deliberately **not** one of them: a task parked
+for a human has not ended, and recording an outcome for it would assert something
+untrue.
+
+`final_observation_ids` names the actions **this attempt** ran. A program is
+rebuilt per trigger, so its observation log holds one attempt; the complete,
+gap-free history is the durable `RuntimeExecution.evidence` log, which is what an
+audit reads.
 
 Supported: yes — this maps to the runtime's terminal outcomes and the task
 state machine's terminal states.
@@ -480,6 +608,33 @@ Three strictly separated layers:
 3. **Audit/event data.** Correlatable identifiers (program id, plan version,
    action id, request id) for tracing across layers, without leaking payloads.
 
+### 7.1 How a `ToolResult` becomes a fact a condition can read
+
+A condition can only read what is durable, so the path from a tool call to a
+branch decision is one direction and has no shortcuts:
+
+```
+ToolResult            (transient, in the Gateway's hands; never a branch input)
+    -> ObservationNode           observation_from_result()  — the IR's record
+        -> durable evidence      evidence_from_observation() — same shape the
+                                 runtime already persisted, byte for byte
+            -> ControlFacts      rebuilt from RuntimeExecution.evidence on resume
+                -> ConditionNode evaluate()
+```
+
+`ToolResult` is **not** reachable from a `ConditionNode` and never will be: it
+exists for the lifetime of one call, and branching on something that does not
+outlive the call would make a branch unanswerable after a restart. The evidence
+record is the boundary — the same dict the runtime persists today, so resume,
+the slot and event readers, and the success check keep working on IR-produced
+records without knowing the IR exists.
+
+A step-scoped condition reads the **last** observation for its `step_order`
+(§4.4.1). That is correct precisely because the Runtime stops a step at its first
+non-successful intent, which makes the last record for a step the step's outcome.
+This is the one place where the IR's correctness depends on a Runtime policy, and
+it is stated as a contract rather than assumed.
+
 ## 8. Execution model and the KAI-IR Control-Flow Contract
 
 ```
@@ -509,7 +664,7 @@ Two things are easily confused here, and the model keeps them in separate fields
 
 | | Static control structure | Runtime execution state |
 | --- | --- | --- |
-| Fields | `nodes`, `edges` | `observations`, `snapshot` |
+| Fields | `nodes`, `edges` | `observations`, `errors`, `result`, `snapshot` |
 | Answers | what may run next, given facts | what has already happened |
 | In the fingerprint | yes | no |
 | Changes when the program runs | no | yes |
@@ -517,6 +672,18 @@ Two things are easily confused here, and the model keeps them in separate fields
 The graph says a step *may* run next. Whether it *did*, and with what result, is
 only ever in the runtime record. No part of the graph is a mutable cursor, and
 nothing in the graph is written to during execution.
+
+The runtime record is **bookkeeping and nothing else**. `record_error` and
+`record_result` are called only after the decision they describe has already been
+made, no validation depends on them, and no control-flow decision reads them. They
+exist so the IR can state what happened rather than leaving the answer implicit in
+Runtime code, and they are derived from the durable evidence log rather than
+stored, so a rebuild from the same evidence produces the same record.
+
+Because they are outside the canonical form (§8.11), a program that ran, failed,
+and recorded an outcome is the same program as one that has not started: its
+`program_id` and `fingerprint` are unchanged, and resume, retry, and identity
+comparison are all unaffected by the fact that it executed at all.
 
 #### 8.2 Entry is derived, never declared
 
@@ -567,26 +734,63 @@ having no defined next step.
   edge, and that edge is unguarded. A step's continuation is declared once; a
   branch after a step is expressed by a following condition node, not by
   guarding the step's own edge.
+- **Action edges are monotonic in `step_order`.** For an edge whose endpoints are
+  both action nodes, `target.step_order > source.step_order` (§8.3.1).
 - **Result nodes are terminal.** A result node has no outgoing edge.
 - **Every plan step appears exactly once.** The step orders carried by action
   nodes equal the step orders in the plan. A step the graph cannot account for,
   or accounts for twice, is refused.
 - **Conditions read only facts that can exist where they are read.** `cursor`,
   `steps_used`, and `task_state` are always available. An `observation` subject
-  names a step in this plan, and the reading node must be downstream of that
-  step's action node.
+  names a step in this plan, and that step's action node must **dominate** the
+  reading node.
 
 The last rule deserves precision, because the obvious weaker version is wrong. It
 is not enough that the referenced step is upstream on *some* path to the
-condition. The check is a **backward search from the reading node** for the
-producing action node, which asks whether *every* path arriving at the condition
-passed through that step. A condition also reachable by a path that skips the
-step could evaluate a fact that does not exist on that path, so the honest form
-of the rule is the stronger one.
+condition. Every path arriving at the condition must have passed through that
+step, which is exactly domination: the reading node is unreachable from the entry
+once the producing step is taken out of the graph. A condition also reachable by a
+path that skips the step could evaluate a fact that does not exist on that path —
+and the only reason it would exist is that some *other* path recorded it earlier,
+which is one arm's evidence answering another arm's guard. So the honest form of
+the rule is the stronger one, and the "some path" form is not a permitted reading
+of it. Implemented as `KaiProgram._dominates`.
 
 At run time the same rule is enforced again from the other direction: reading a
 step that has no observation is refused, never satisfied by a record that happens
 to be nearby (§8.5).
+
+#### 8.3.1 Why monotonicity is checked and acyclicity is not enough
+
+`next_node` treats the runtime cursor as a **watermark**: it steps past an action
+node once `step.order <= cursor`. A watermark cannot move backwards, so a walk is
+only sound while the graph is monotone in `step_order`. That is a property of the
+*walk*, not of the graph's shape, and acyclicity is a different property.
+
+The two are not substitutes. Consider `action-1 -> action-3 -> action-2 ->
+result`. It is acyclic. It declares every planned step exactly once. Every node
+is reachable from the unique entry. No node has two outgoing edges. The walk
+still executes `[1, 3]`, and then reports that the plan's steps are complete —
+because by the time control could arrive at step 2, the cursor already reads 3.
+Step 2 is declared, reachable, never run, never observed, and the flow ends as
+though it had.
+
+So the property the walker actually depends on is checked directly, and the
+refusal says what is wrong rather than only that something is: the edge "returns
+from step 3 to step 2; the runtime cursor is a watermark and only moves forward,
+so step 2 could never run".
+
+Scoped deliberately to action-to-action edges. An edge into a condition node is
+the fork itself and carries no step of its own; what a condition routes to is
+bounded by the builder's partition rule (`branch_errors` requires one target to
+be `after_step + 1`), so no plan-declared branch can step backwards through a
+condition either. A builder that ever relaxes that rule must extend this check to
+the condition's own targets in the same change.
+
+Forward edges are untouched. A plan-declared branch *is* a forward jump — that is
+what branching is — so refusing forward moves would refuse branching.
+
+Supported: yes — implemented as `KaiProgram._validate_action_monotonicity`.
 
 #### 8.4 Branch selection contract
 
@@ -685,11 +889,66 @@ eligible next. It owns nothing else. The Runtime remains authoritative for:
 - persistence of the cursor, step count, and evidence;
 - evidence durability and the append-only log;
 - task state transitions;
-- recovery authority, including what a resume is allowed to assume.
+- recovery authority, including what a resume is allowed to assume;
+- fulfillment evaluation, including which sealed profile's evaluator runs and
+  what that evaluator is recorded to be (`fulfillment_profile`,
+  `evaluator_version`, `fulfillment_verdict` on the execution row).
 
 The IR has no way to express any of these and no way to override them. A program
 whose flow is finished has stated that no step remains; it has not completed the
-task, and only the Runtime decides that.
+task, and only the Runtime decides that. The recorded verdict is an audit
+artifact, not an authority: it is re-derived from durable evidence on every
+settlement and never read back to decide a task state.
+
+#### 8.7.1 The IR is not a fulfillment authority either
+
+Reaching a `ResultNode` is the end of a *path*, and a `ConditionNode` evaluating
+true is a fact comparison. Neither is evidence that the user's Intent was
+fulfilled, and the IR has no vocabulary in which such a claim could be written:
+`ResultNode.result` is a reportable task state (§4.8), not a verdict about the
+Intent, and it is populated *from* the Runtime's decision rather than before it.
+
+The four questions stay separate, and the IR is only ever the first:
+
+```text
+Action Success     an ActionNode's tool call returned
+Path Termination   the graph ran out of steps
+Intent Fulfillment the Sealed Contract's criteria hold on durable Evidence
+Task State         the task state machine's lifecycle state
+```
+
+Fulfillment authority is layered and lives outside this document: the Sealed
+Contract supplies the question, a domain evaluator applies it against durable
+Evidence and returns a deterministic verdict, and the Runtime alone applies the
+resulting task state transition. The question reaches the evaluator as a typed,
+sealed `SuccessCriteria` value, not as prose to be parsed — the criteria text
+stays a descriptive, verbatim-reproduced contract field, and only the typed value
+is authority. The binding from question to evaluator is itself a contract field —
+`TaskContractInput.fulfillment_profile`, persisted on the task row — and it is
+deliberately **not** an IR node, not a `ConditionNode` fact, and not a
+`ResultNode` result: a program that could name its own evaluator could choose the
+standard it is later judged against. `PlanProposal` has no such field, so no plan
+can redirect the verdict. The normative statement, including why it is layered
+rather than owned by the Contract or by the domain, and the rule that `COMPLETED`
+means the verdict was `FULFILLED`, are in
+[`docs/architecture/KAI_REFERENCE_ARCHITECTURE_AR.md` §10](architecture/KAI_REFERENCE_ARCHITECTURE_AR.md).
+
+What the IR guarantees is only the part it can: a `ResultNode` cannot be reached
+by inventing an outcome, `result` must be a state the task machine can report
+(§4.8), and every observation a run produced is in the durable log a fulfillment
+evaluator reads. A branch changes *which* evidence accumulates. It does not change
+*what counts as fulfilled*, and a fork may never be used to make one path's
+evidence stand in for another's.
+
+Because of that last clause, the evaluator must not let which arm ran decide the
+answer. The verdict is a function of the **relevant evidence set** — the
+qualifying creation attempts — and the question over that set is *existence*: does
+a meeting satisfying every sealed criterion exist? Reading the log's first
+qualifying record instead would make the verdict a function of a path's position,
+so the same Intent, contract, and evidence could settle two different ways
+depending only on the order the log happened to be written in. The criteria
+themselves stay conjunctive, over one meeting, and the two scopes are never mixed.
+An empty relevant set is `NOT_FULFILLED` — an answer, not a vacuous `all()`.
 
 #### 8.8 Tool Gateway authority
 
@@ -910,6 +1169,35 @@ prove is structurally wrong, and run-time selection refuses everything else,
 where the facts exist. A program whose guards do not cover a case it can actually
 reach therefore fails when it reaches that case, not at build time.
 
+#### 8.15 The execution record is a record, not an input
+
+`KaiProgram` carries an execution record: `observations`, `errors`, and `result`
+(§8.1). These are the IR's own account of a run, and the rules that keep them
+honest are:
+
+1. **Nothing reads them.** No validation depends on them, and no control-flow
+   decision consults them. They are written after the fact, never before it.
+2. **They are derived, not stored.** `record_error` and `record_result` are
+   called by the Runtime from the same evidence that rebuilt the program, so the
+   record is reproducible from durable state rather than being a second source of
+   truth about it.
+3. **They are outside the fingerprint** (§8.11). Identity is what a program
+   intends, not what happened when it ran.
+4. **`result` may only be a reportable state** (§4.8). A run parked in
+   `WAITING_APPROVAL` has no result to record, and is not given one.
+
+Because of (1), enabling them cannot change what any program does. This is the
+whole of the claim: a program that records its failures and its outcome runs
+exactly as it did before, and says the same thing the task state machine already
+said.
+
+The one thing a record cannot do is substitute for the durable evidence log.
+`final_observation_ids` names the actions *this attempt* ran, because a program is
+rebuilt per trigger; the complete history is `RuntimeExecution.evidence`.
+
+Supported: yes — implemented as `KaiProgram.record_error` / `record_result` and
+`kai.ir.adapter.record_error` / `record_result`.
+
 ## 9. Compatibility with the current architecture
 
 - The closed `IntentNode`/`PlanNode`/`StepNode`/`ActionNode`/`ObservationNode`/
@@ -923,7 +1211,9 @@ reach therefore fails when it reaches that case, not at build time.
   does not replace the task state machine: that machine remains authoritative for
   task state (§8.7).
 - `ErrorNode` is implemented as a validated model, while the error classes
-  execution still derives from `error_code` + task state.
+  execution still derives from `error_code` + task state. The Runtime records the
+  typed `ErrorNode` for every failed action, which is bookkeeping and not
+  dispatch: nothing reads it back (§8.15).
 - The Tool Gateway is unaffected: IR references capabilities, and the Gateway
   already owns capability → tool, policy, approval, and verification.
 - A Computer Use tool, when it exists, is just another `ActionNode` capability
@@ -1019,10 +1309,13 @@ commitment to a particular design.
 | `ApprovalNode` (§4.12) | approvals are requested by the Gateway during execution, not named in advance by a plan | the `Approval` model and its single-use consume |
 | `MemoryOpNode` (§4.10) | memory is context for a step, not a step of its own | `MemoryService` (retrieve / create) |
 | A branch on a *failed* step (§8.9) | the Runtime stops a run at the first non-successful step, so such a branch can never fire | branches on `cursor` / `steps_used` / `task_state` and on the outcomes of steps that succeeded |
+| A condition over an arbitrary provider-returned value, or a method-level choice within one capability (§4.4.5) | a condition stays a pure comparison over the closed fact vocabulary; admitting a payload would make the guard a function of provider data | `FactKind` + `OBSERVATION_FACT_TYPES`, and branches over the facts they already name |
 | Exhaustive guard partition validation (§8.14) | it is a decision procedure, not a structural check | run-time "exactly one eligible edge" (§8.4) |
 | Cycles / loops (§8.13) | a cycle breaks action-id exactly-once and current recovery assumptions | acyclicity enforcement |
 | Execution-time dispatch of `ErrorNode` (§4.9) | error routing is still the task state machine's | the validated `ErrorNode` model |
 | Computer Use session identity on an `ActionNode` (§11) | the capability does not exist in the system | nothing — deliberately not fabricated |
+| ~~A semantic model for `success_criteria` (§8.7.1)~~ | **done for the one implemented domain**: the typed, sealed `SuccessCriteria` is the authority, and the prose remains a descriptive, verbatim-reproduced contract field | contract binding plus the closed `calendar_meeting` profile |
+| A *general* success-criteria language (any domain) | one domain is a closed payload; generalizing needs a new decision about where authority lives | nothing — deliberately not fabricated |
 
 Until one of these is implemented, the corresponding guarantee in this document
 holds exactly as far as §8 states, and no further.

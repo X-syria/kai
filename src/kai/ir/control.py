@@ -13,6 +13,40 @@ Both are pure functions of the program plus the facts the runtime already has
 durable. Neither performs I/O, so the same call after a resume yields the same
 node — the branch a program takes is a function of what already happened, not a
 fresh decision taken mid-run.
+
+The Observation -> ControlFacts -> Condition contract
+---------------------------------------------------
+
+A condition never reads a ``ToolResult``. The three stages are separate and each
+one is owned elsewhere:
+
+1. **Produced** — ``kai.ir.adapter.observation_from_result`` turns the Gateway's
+   transient ``ToolResult`` into an ``ObservationNode``, inside
+   ``AgentRuntime._execute``, immediately after ``ToolGateway.execute`` returns.
+2. **Persisted** — ``kai.ir.adapter.evidence_from_observation`` writes that
+   observation into the ``RuntimeExecution.evidence`` log, and the runtime
+   assigns the row *before* any branch could read it.
+3. **Read back** — ``AgentRuntime._control_facts`` rebuilds ``ControlFacts`` from
+   that durable log via ``observation_from_evidence``. Only then can
+   :func:`evaluate` see a fact at all.
+
+A condition therefore reads a *projection of durable state*, never an in-memory
+value. That is what makes evaluation reproducible: a resume rebuilds the same
+facts from the same log and reaches the same answer. Reading the ``ToolResult``
+directly would make the answer a function of process memory, and the branch
+taken would no longer be derivable after a crash.
+
+**This module's one dependency on Runtime behaviour (contract, spec §7.1).**
+:meth:`ControlFacts.observation_for` treats *the last observation recorded for a
+step* as *that step's outcome*. That is only true because the current Runtime
+stops a step at its first non-successful intent, so the final record for a step
+is the record that decided it. The IR states the rule; the Runtime supplies the
+guarantee.
+
+If the Runtime ever continues past a failing intent within a step, this module's
+semantics change with no change to the IR — so that change must revise this
+contract explicitly rather than inherit it silently. A step running several
+intents, or a step whose intents are retried, both fall under this contract.
 """
 
 from __future__ import annotations
@@ -50,9 +84,14 @@ class ControlFacts:
     def observation_for(self, step_order: int) -> ObservationNode:
         """The outcome of the step at ``step_order``.
 
-        The last observation recorded for that step. A step runs its intents in
-        order and the runtime stops the step on the first non-successful intent,
-        so the last record for a step is that step's outcome.
+        The last observation recorded for that step, under the Runtime contract
+        named in this module's docstring: a step runs its intents in order and
+        the runtime stops the step on the first non-successful intent, so the
+        last record for a step is that step's outcome.
+
+        Absent is not the same as unsuccessful. A step with no observation at all
+        is a fact that does not exist yet, and it is refused rather than guessed
+        at — only a recorded observation may be read, whatever it says.
         """
         latest: ObservationNode | None = None
         for observation in self.observations:
@@ -81,6 +120,15 @@ def _fact_value(condition: ConditionNode, facts: ControlFacts) -> object:
 
 
 def _compare(operator: ConditionOperator, left: object, right: object) -> bool:
+    if right is None and operator not in (ConditionOperator.EQ, ConditionOperator.NEQ):
+        # Unreachable through ConditionNode, which refuses a null operand with
+        # any other operator. Checked again here so a program assembled without
+        # that validation still fails closed instead of asking Python to order
+        # "nothing" and getting an answer by accident.
+        raise IrConditionError(
+            f"{operator.value} is undefined for a null operand; a condition may only "
+            f"ask whether a nullable fact holds a value"
+        )
     if operator is ConditionOperator.EQ:
         return left == right
     if operator is ConditionOperator.NEQ:

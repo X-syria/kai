@@ -25,6 +25,7 @@ from pydantic import ValidationError
 
 from kai.ir import (
     IR_VERSION,
+    NULLABLE_OBSERVATION_FACT_FIELDS,
     ActionNode,
     ConditionNode,
     ConditionOperator,
@@ -33,6 +34,7 @@ from kai.ir import (
     ControlFacts,
     ControlNode,
     ControlNodeKind,
+    ErrorClass,
     ErrorNode,
     FactKind,
     IntentNode,
@@ -46,6 +48,7 @@ from kai.ir import (
     StepNode,
     action_for,
     action_id_for,
+    attach,
     condition_from_plan,
     error_from_observation,
     evaluate,
@@ -57,6 +60,8 @@ from kai.ir import (
     observation_from_result,
     program_from_plan,
     program_id_for,
+    record_error,
+    record_result,
     require_valid,
     result_for,
     tool_name_for,
@@ -1688,6 +1693,73 @@ def test_observations_stay_out_of_the_program_identity() -> None:
     assert program.computed_fingerprint() == before
 
 
+def test_an_observation_the_program_would_refuse_never_enters_its_log() -> None:
+    """The log is filled in *after* the program was validated, so the writer is
+    the only place the observation rule can be enforced.
+
+    A program is built by ``program_from_plan`` with an empty observation log and
+    validated there, so ``validate_executable`` sees no observation at all while a
+    run is being planned. The Runtime then fills the log through ``attach`` — the
+    exact sequence ``AgentRuntime._execute`` performs after every Gateway call —
+    and nothing validates the program again afterwards. So the two rules the IR
+    declares for the log (one record per action id; a record only names a step of
+    this plan) have to hold at that writer, or a program can carry an observation
+    its own validation would reject.
+    """
+    program = _base()
+    # The precondition, stated because the whole finding is about it: the
+    # production builder seals and validates a program whose log is empty.
+    assert program.observations == []
+    assert require_valid(program) is program
+
+    step = program.plan.steps[0]
+    action = action_for(
+        step=step,
+        index=0,
+        capability=step.capability,
+        arguments={"query": "sara"},
+        task_id=TASK_ID,
+        plan_version=1,
+    )
+
+    # The correct case: the runtime's own sequence, admitted.
+    recorded = observation_from_result(
+        action=action,
+        step_order=step.order,
+        result=_result(request_id=action.action_id),
+    )
+    attach(program, recorded)
+
+    assert program.observations == [recorded]
+    assert program.validate_executable() is program
+
+    # The same action recorded twice is a rewrite, not an append.
+    with pytest.raises(IrValidationError, match="append-only"):
+        attach(program, recorded)
+    assert program.observations == [recorded]
+
+    # A record naming a step this plan does not have.
+    beyond = ObservationNode(
+        action_id=action_id_for(
+            task_id=TASK_ID, plan_version=1, step_order=len(program.plan.steps) + 1,
+            index=0,
+        ),
+        step_order=len(program.plan.steps) + 1,
+        outcome=ToolOutcome.EXECUTION_SUCCEEDED,
+        ok=True,
+        verified=True,
+    )
+    with pytest.raises(IrValidationError, match="does not exist in this plan"):
+        attach(program, beyond)
+
+    # A refusal changes nothing: the program is exactly as valid — and exactly as
+    # recorded — as it was before the attempt.
+    assert [item.action_id for item in program.observations] == [action.action_id]
+    assert program.validate_executable() is program
+    assert "observations" not in program.canonical_form()
+    assert program.fingerprint == program.computed_fingerprint()
+
+
 def test_a_program_with_no_conditions_never_asks_the_runtime_to_choose() -> None:
     """A plan that declared no branch is opted out of all of this."""
     program = _base()
@@ -2095,3 +2167,282 @@ def test_a_plan_cannot_smuggle_anything_into_a_branch() -> None:
                 "expression": "1 + 1",
             }
         )
+
+
+# ---------------------------------------------------------------------------
+# G4 — an action edge may only ever move the program forward.
+# ---------------------------------------------------------------------------
+
+
+def test_an_action_edge_may_only_move_the_program_forward() -> None:
+    """The out-of-order graph, refused, with the reason it could not have run.
+
+    This program is acyclic, declares all three planned steps exactly once, and
+    reaches every node. Acyclicity and reachability are both satisfied, and the
+    walk still never runs step 2 — so neither of those being checked is what makes
+    a program safe to walk. The property actually relied on is monotonicity.
+    """
+    nodes = [
+        _action_node("action-1", 1),
+        _action_node("action-3", 3),
+        _action_node("action-2", 2),
+        _result_node(),
+    ]
+    edges = [
+        ControlEdge(from_node="action-1", to_node="action-3"),
+        ControlEdge(from_node="action-3", to_node="action-2"),
+        ControlEdge(from_node="action-2", to_node="result"),
+    ]
+    _refused(_base(), nodes, edges, "returns from step 3 to step 2")
+
+
+def test_a_branch_that_routes_to_a_later_step_is_still_allowed() -> None:
+    """The rule forbids going *backwards*, which is what every real branch needs.
+
+    A plan-declared fork is the only legal way to skip a step, and it routes to
+    strictly later steps on both edges. Those are exactly the edges this check
+    inspects, so refusing forward jumps would refuse branching altogether.
+    """
+    program = _base(
+        proposal=_declared(
+            steps=6, branches=[_branch(else_step=4), _second_fork(step_order=1)]
+        )
+    )
+    order_by_id = {node.node_id: node.step_order for node in program.nodes}
+
+    assert [
+        (edge.from_node, edge.to_node)
+        for edge in program.edges
+        if edge.from_node.startswith("action-") and edge.to_node.startswith("action-")
+    ] == [("action-2", "action-3")]
+    # Every other forward move out of a step is routed by a condition, which
+    # carries no step of its own and so is not this check's business. Both kinds
+    # of edge together still only ever move the cursor forward.
+    assert all(
+        order_by_id[edge.to_node] > order_by_id[edge.from_node]
+        for edge in program.edges
+        if order_by_id.get(edge.from_node) and order_by_id.get(edge.to_node)
+    )
+
+
+def test_every_plan_a_planner_can_declare_still_validates() -> None:
+    """The check is on the graph, and the builder only ever emits forward ones.
+
+    Cheap to state and worth stating: if a planner could produce a program this
+    now refuses, the failure would land in production as a rejected plan rather
+    than as a build error.
+    """
+    early = _branch(else_step=4)
+    for read in (1, 4):
+        late = _second_fork(step_order=read)
+        for branches in ([early], [late], [early, late], [late, early]):
+            assert _base(proposal=_declared(steps=6, branches=branches)).fingerprint
+
+
+# ---------------------------------------------------------------------------
+# E5 — a null value is a fact, and a missing observation is not.
+# ---------------------------------------------------------------------------
+
+
+def _null_check(
+    *, field: str = "error_code", step_order: int = 1,
+    operator: ConditionOperator = ConditionOperator.EQ,
+    value: object = None, negate: bool = False,
+) -> ConditionNode:
+    return _condition(
+        field=field, step_order=step_order, operator=operator, value=value, negate=negate
+    )
+
+
+def test_a_successful_action_records_no_error_code_and_can_be_asked_about_it() -> None:
+    """The whole point of E5: absence of an error is decidable from durable facts."""
+    assert evaluate(_null_check(), _facts(observations=(_recorded(1),))) is True
+    assert (
+        evaluate(
+            _null_check(operator=ConditionOperator.NEQ), _facts(observations=(_recorded(1),))
+        )
+        is False
+    )
+
+
+def test_a_null_error_code_is_different_from_a_missing_observation() -> None:
+    """Two different kinds of nothing, and the difference is kept, not smoothed.
+
+    The first step ran and recorded no error; the second step never ran. A
+    condition that conflated them would route a branch on a fact nobody observed.
+    """
+    only_step_one_ran = _facts(observations=(_recorded(1),))
+
+    assert evaluate(_null_check(), only_step_one_ran) is True
+    # Step 2 has no observation at all, so it cannot be read — and that is still
+    # refused outright rather than answering "it had no error code".
+    with pytest.raises(IrConditionError, match="no observation has been recorded for step 2"):
+        evaluate(_null_check(step_order=2), only_step_one_ran)
+
+
+def test_null_is_refused_against_a_fact_that_always_has_a_value() -> None:
+    """Only ``error_code`` can be empty; the counters and the state never are."""
+    for field in ("outcome", "ok", "verified"):
+        with pytest.raises(ValidationError, match="cannot be compared with null"):
+            _null_check(field=field)
+    for kind in (FactKind.CURSOR, FactKind.STEPS_USED, FactKind.TASK_STATE):
+        with pytest.raises(ValidationError, match="cannot be compared with null"):
+            _condition(kind=kind, step_order=None, field=None, value=None)
+
+
+def test_null_is_refused_with_any_operator_but_eq_and_neq() -> None:
+    """Asking whether nothing is "greater than" or "in" a list has no answer.
+
+    Refused where the condition is written, so the mistake is a build error and
+    not a branch that can never be taken.
+    """
+    for operator in (
+        ConditionOperator.GT, ConditionOperator.GTE, ConditionOperator.LT,
+        ConditionOperator.LTE, ConditionOperator.IN, ConditionOperator.NOT_IN,
+    ):
+        with pytest.raises(ValidationError, match="undefined for a null operand"):
+            _null_check(operator=operator)
+
+
+def test_a_list_operand_cannot_hold_null_at_all() -> None:
+    """Membership in a set that includes "no error code" is not a supported question.
+
+    Refused by the type union rather than by the condition's own check: the
+    operand shapes are single-typed lists, so ``list[str]`` has no room for a
+    null in the first place. The result is the same refusal with less surface.
+    """
+    for operator in (ConditionOperator.IN, ConditionOperator.NOT_IN):
+        with pytest.raises(ValidationError):
+            _condition(field="error_code", operator=operator, value=["a", None])
+
+
+def test_a_real_error_code_still_compares_against_text() -> None:
+    """E5 changed the null case only; the ordinary string cases are untouched."""
+    failed = ObservationNode(
+        action_id="a1", step_order=1, outcome=ToolOutcome.EXECUTION_FAILED,
+        ok=False, verified=False, error_code="CONTACT_NOT_FOUND",
+    )
+
+    assert evaluate(
+        _condition(field="error_code", value="CONTACT_NOT_FOUND"),
+        _facts(observations=(failed,)),
+    ) is True
+    assert evaluate(_null_check(), _facts(observations=(failed,))) is False
+    # A non-string operand is still the same type error it always was.
+    with pytest.raises(ValidationError, match="operand must be str"):
+        _condition(field="error_code", value=7)
+
+
+def test_only_error_code_is_nullable() -> None:
+    """The allow-list is one field wide, and the type table is not loosened by it."""
+    assert sorted(NULLABLE_OBSERVATION_FACT_FIELDS) == ["error_code"]
+    # Nullable says nothing about the type when a value *is* present.
+    assert _condition(field="error_code", value="X").value == "X"
+
+
+def test_allowing_null_did_not_change_how_a_condition_serializes() -> None:
+    """Fingerprint stability: ``None`` is a new *legal* value, not a new encoding."""
+    as_before = _condition(field="error_code", value="CONTACT_NOT_FOUND")
+    nullable = _condition(field="error_code", value=None)
+
+    assert as_before.model_dump(mode="json")["value"] == "CONTACT_NOT_FOUND"
+    assert nullable.model_dump(mode="json")["value"] is None
+    assert "value" in as_before.model_dump(mode="json")
+
+
+# ---------------------------------------------------------------------------
+# E3 — the program records what it did, and that is all it does.
+# ---------------------------------------------------------------------------
+
+
+def test_a_program_records_its_failures_and_its_outcome() -> None:
+    """Two distinct records, because a step failing is not the run ending."""
+    program = _base()
+    failure = _observation(
+        program=program,
+        result=_result(
+            outcome=ToolOutcome.EXECUTION_FAILED, ok=False, verified=False,
+            error_code="PROVIDER_5XX", message="provider refused",
+        ),
+    )
+    attach(program, failure)
+
+    error = record_error(program, failure)
+    assert error is not None
+    assert (error.error_code, error.error_class) == (
+        "PROVIDER_5XX", ErrorClass.PERMANENT,
+    )
+    assert program.errors == [error]
+    # The observation itself is untouched: recording a failure is not a second
+    # way of reporting one.
+    assert program.observations == [failure]
+    assert program.result is None
+
+    record_result(program, result="FAILED", reason="provider refused")
+    assert program.result is not None
+    assert (program.result.result, program.result.reason) == ("FAILED", "provider refused")
+
+
+def test_recording_a_success_records_no_error() -> None:
+    program = _base()
+    succeeded = _observation(program=program)
+
+    assert record_error(program, succeeded) is None
+    assert program.errors == []
+
+
+def test_the_record_names_the_actions_this_attempt_actually_ran() -> None:
+    program = _base()
+    ran = _observation(program=program, step_order=1)
+    attach(program, ran)
+    skipped = _observation(program=program, step_order=3)
+    attach(program, skipped)
+
+    record_result(program, result="COMPLETED", reason="done")
+
+    assert program.result is not None
+    assert program.result.final_observation_ids == [ran.action_id, skipped.action_id]
+
+
+def test_a_run_that_is_still_waiting_has_no_result_to_record() -> None:
+    """A task parked for a human has not ended, and must not be reported as if it had."""
+    program = _base()
+    attach(program, _observation(program=program))
+
+    with pytest.raises(ValidationError, match="reportable task states"):
+        record_result(program, result="WAITING_APPROVAL", reason="needs approval")
+
+    assert program.result is None
+
+
+def test_recording_an_execution_never_changes_the_programs_identity() -> None:
+    """The whole reason the record is bookkeeping.
+
+    A program that ran, failed, and recorded an outcome is the same program as one
+    that has not started — so resuming, retrying, and comparing programs for
+    identity are all unaffected by the fact that it executed at all.
+    """
+    before = _base()
+    ran = _base()
+    attach(ran, _observation(program=ran))
+    record_error(
+        ran,
+        _observation(
+            program=ran,
+            result=_result(
+                outcome=ToolOutcome.EXECUTION_FAILED, ok=False, verified=False,
+                error_code="PROVIDER_5XX",
+            ),
+        ),
+    )
+    record_result(ran, result="FAILED", reason="provider refused")
+
+    assert (ran.observations, ran.errors) != ([], [])
+    assert ran.result is not None
+    assert ran.canonical_form() == before.canonical_form()
+    assert ran.fingerprint == before.fingerprint
+    assert ran.program_id == before.program_id
+    # The omission is a property of the hashed keys, not an accident of this case.
+    assert "observations" not in ran.canonical_form()
+    assert "errors" not in ran.canonical_form()
+    assert "result" not in ran.canonical_form()

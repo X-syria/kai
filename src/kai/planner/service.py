@@ -196,6 +196,20 @@ class PlannerService:
     async def _persist(
         self, session: AsyncSession, task: Task, proposal: PlanProposal
     ) -> TaskPlan:
+        # The version is allocated by reading the current maximum, so without a
+        # lock two concurrent planners read the same predecessor, pick the same
+        # number, and the loser is turned away by ``uq_task_plans_tenant_task_version``
+        # even though its own plan is perfectly valid. The task row is the scope
+        # that owns the version, so it is the row to lock: the loser waits here,
+        # then reads the winner's committed row and takes the next version. Same
+        # primitive as ``tasks.service._load_task_for_update``, taken here and only
+        # here so the lock is never held across the model call in ``_generate``.
+        await session.execute(
+            select(Task)
+            .where(Task.id == task.id, Task.tenant_id == task.tenant_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
         result = await session.execute(
             select(func.max(TaskPlan.version)).where(
                 TaskPlan.tenant_id == task.tenant_id,

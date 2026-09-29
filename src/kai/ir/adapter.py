@@ -235,8 +235,47 @@ def observation_from_evidence(
 
 
 def attach(program: KaiProgram, observation: ObservationNode) -> ObservationNode:
-    """Append an observation to the program's log and return it."""
+    """Append one observation to the program's log and return it."""
     return program.record(observation)
+
+
+def record_error(
+    program: KaiProgram, observation: ObservationNode
+) -> ErrorNode | None:
+    """Derive the typed failure an observation represents and keep it on the program.
+
+    The single place ``error_from_observation`` is called from execution, so the
+    IR's own error taxonomy is applied to every recorded action rather than
+    leaving failures as bare strings in Runtime code.
+
+    A success yields ``None`` and records nothing. This is bookkeeping only: the
+    returned error is not read by any control-flow decision, and the observation
+    itself is unaffected, so a caller that ignores the return value changes
+    nothing about what runs.
+    """
+    error = error_from_observation(observation)
+    if error is not None:
+        program.record_error(error)
+    return error
+
+
+def record_result(
+    program: KaiProgram, *, result: str, reason: str
+) -> ResultNode:
+    """Note how the program ended, from the observations it recorded.
+
+    ``final_observation_ids`` therefore names the actions *this attempt* ran. The
+    program's observation log holds one attempt, because a program is rebuilt per
+    trigger; the complete, gap-free history stays in the ``RuntimeExecution``
+    evidence log, which is what an audit reads.
+
+    ``result`` must be a reportable result state, so a task parked in
+    ``WAITING_APPROVAL`` cannot be recorded — a paused run has not ended, and
+    inventing a result for it would assert something untrue.
+    """
+    return program.record_result(
+        result_for(result=result, reason=reason, observations=program.observations)
+    )
 
 
 def _json_safe(value: Any) -> Any:
@@ -259,6 +298,8 @@ __all__ = [
     "intent_from_action",
     "observation_from_evidence",
     "observation_from_result",
+    "record_error",
+    "record_result",
     "result_for",
     "tool_name_for",
 ]

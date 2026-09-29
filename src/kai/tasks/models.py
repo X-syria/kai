@@ -20,8 +20,8 @@ from kai.db.base import Base, PKMixin, TenantMixin, TimestampMixin
 class Task(PKMixin, TenantMixin, TimestampMixin, Base):
     """A domain task owned by exactly one ``(tenant, user)`` pair.
 
-    The Task Contract (``goal``, ``success_criteria``, ``allowed_tools``,
-    ``risk_policy``, ``deadline``, ``max_cost``, ``max_steps``,
+    The Task Contract (``goal``, ``success_criteria``, ``fulfillment_profile``,
+    ``allowed_tools``, ``risk_policy``, ``deadline``, ``max_cost``, ``max_steps``,
     ``verification_method``, ``fallback``) plus failure/retry metadata live on
     the row itself, so the Planner can consume it later without any schema
     change. ``is_archived`` is the only data path removed from the default
@@ -46,6 +46,14 @@ class Task(PKMixin, TenantMixin, TimestampMixin, Base):
     goal: Mapped[str] = mapped_column(Text, nullable=False)
     success_criteria: Mapped[list[str]] = mapped_column(
         JSONB, default=list, nullable=False
+    )
+    #: Which deterministic fulfillment evaluator answers this contract's
+    #: criteria. Sealed with the rest of the contract, so a resumed run derives
+    #: the same evaluator from the row instead of from anything mutable. The
+    #: server default only exists so rows written before this column keep
+    #: loading; every code path that seals a contract sets it explicitly.
+    fulfillment_profile: Mapped[str] = mapped_column(
+        String(64), nullable=False, server_default="calendar_meeting"
     )
     allowed_tools: Mapped[list[str]] = mapped_column(
         JSONB, default=list, nullable=False
@@ -76,6 +84,7 @@ class Task(PKMixin, TenantMixin, TimestampMixin, Base):
         return {
             "goal": self.goal,
             "success_criteria": list(self.success_criteria),
+            "fulfillment_profile": self.fulfillment_profile,
             "allowed_tools": list(self.allowed_tools),
             "risk_policy": self.risk_policy,
             "deadline": self.deadline,
