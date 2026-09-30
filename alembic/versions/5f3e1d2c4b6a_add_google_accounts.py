@@ -5,16 +5,15 @@ Revises: 25ad7c2f956f
 Create Date: 2026-09-23 16:20:00.000000
 
 """
-from typing import Sequence, Union
+from collections.abc import Sequence
 
-from alembic import op
 import sqlalchemy as sa
-
+from alembic import op
 
 revision: str = '5f3e1d2c4b6a'
-down_revision: Union[str, None] = '25ad7c2f956f'
-branch_labels: Union[str, Sequence[str], None] = None
-depends_on: Union[str, Sequence[str], None] = None
+down_revision: str | None = '25ad7c2f956f'
+branch_labels: str | Sequence[str] | None = None
+depends_on: str | Sequence[str] | None = None
 
 
 def upgrade() -> None:
@@ -28,15 +27,29 @@ def upgrade() -> None:
     sa.Column('token_expires_at', sa.DateTime(timezone=True), nullable=True),
     sa.Column('id', sa.UUID(), nullable=False),
     sa.Column('tenant_id', sa.UUID(), nullable=False),
-    sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False),
-    sa.Column('updated_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False),
+    sa.Column(
+        'created_at',
+        sa.DateTime(timezone=True),
+        server_default=sa.text('now()'),
+        nullable=False,
+    ),
+    sa.Column(
+        'updated_at',
+        sa.DateTime(timezone=True),
+        server_default=sa.text('now()'),
+        nullable=False,
+    ),
     sa.ForeignKeyConstraint(['tenant_id'], ['tenants.id'], ondelete='CASCADE'),
     sa.ForeignKeyConstraint(['user_id'], ['users.id'], ondelete='CASCADE'),
     sa.PrimaryKeyConstraint('id'),
     sa.UniqueConstraint('tenant_id', 'google_sub', name='uq_google_accounts_tenant_google_sub')
     )
-    op.create_index(op.f('ix_google_accounts_tenant_id'), 'google_accounts', ['tenant_id'], unique=False)
-    op.create_index(op.f('ix_google_accounts_user_id'), 'google_accounts', ['user_id'], unique=False)
+    op.create_index(
+        op.f('ix_google_accounts_tenant_id'), 'google_accounts', ['tenant_id'], unique=False
+    )
+    op.create_index(
+        op.f('ix_google_accounts_user_id'), 'google_accounts', ['user_id'], unique=False
+    )
     # ### end Alembic commands ###
 
 

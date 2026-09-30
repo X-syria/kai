@@ -1,3 +1,25 @@
+# Reproducible local deployment stack for KAI.
+#
+# This is a development/CI-shaped stack, not production infrastructure. It exists
+# so a clean checkout can be brought up the same way every time, with the same
+# ordering guarantees a deployment needs: database healthy, then migrations
+# applied exactly once, then the application serving.
+#
+#   docker compose up -d db
+#   docker compose run --rm migrate      # one-shot, applies schema
+#   docker compose up -d app
+#   Invoke-RestMethod http://127.0.0.1:8000/api/v1/health
+#
+# Startup ordering is explicit rather than implied:
+#   db       -> healthcheck (pg_isready)
+#   migrate  -> runs to completion, is a one-shot job, exits 0
+#   app      -> depends on migrate completing successfully
+#
+# Migrations are a separate one-shot service rather than a command the app runs
+# on boot. An app that migrates itself takes schema locks on every replica
+# start, which turns a rolling restart into a migration race. Here exactly one
+# job migrates, and the app only ever reads the schema.
+
 services:
   db:
     image: postgres:17-alpine
@@ -14,6 +36,52 @@ services:
       interval: 5s
       timeout: 3s
       retries: 10
+    restart: unless-stopped
+
+  # One-shot schema application. Never scaled; exits when the schema is current.
+  migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["alembic", "upgrade", "head"]
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-kai}:${POSTGRES_PASSWORD:-kai}@db:5432/${POSTGRES_DB:-kai}
+      ENVIRONMENT: ${ENVIRONMENT:-development}
+      JWT_SECRET: ${JWT_SECRET:-change-me-in-production}
+      GOOGLE_CREDS_ENCRYPTION_SECRET: ${GOOGLE_CREDS_ENCRYPTION_SECRET:-change-me-google-token-encryption}
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: "no"
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "${APP_PORT:-8000}:8000"
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-kai}:${POSTGRES_PASSWORD:-kai}@db:5432/${POSTGRES_DB:-kai}
+      ENVIRONMENT: ${ENVIRONMENT:-development}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      JWT_SECRET: ${JWT_SECRET:-change-me-in-production}
+      GOOGLE_OAUTH_CLIENT_ID: ${GOOGLE_OAUTH_CLIENT_ID:-}
+      GOOGLE_OAUTH_CLIENT_SECRET: ${GOOGLE_OAUTH_CLIENT_SECRET:-}
+      GOOGLE_OAUTH_REDIRECT_URI: ${GOOGLE_OAUTH_REDIRECT_URI:-http://localhost:8000/api/v1/auth/google/callback}
+      GOOGLE_CREDS_ENCRYPTION_SECRET: ${GOOGLE_CREDS_ENCRYPTION_SECRET:-change-me-google-token-encryption}
+      PLANNER_MODEL_URL: ${PLANNER_MODEL_URL:-}
+      PLANNER_MODEL_API_KEY: ${PLANNER_MODEL_API_KEY:-}
+    depends_on:
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/api/v1/health', timeout=4).status == 200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
     restart: unless-stopped
 
 volumes:

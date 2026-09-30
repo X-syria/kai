@@ -12,7 +12,15 @@ license = { text = "Proprietary" }
 dependencies = [
     "fastapi>=0.115",
     "uvicorn[standard]>=0.34",
-    "sqlalchemy>=2.0.41",
+    # The [asyncio] extra is required, not cosmetic. KAI drives SQLAlchemy only
+    # through its async engine, which needs greenlet to suspend a coroutine at
+    # an await. SQLAlchemy 2.0.x pulled greenlet in unconditionally; 2.1.x moved
+    # it behind this extra. With a bare "sqlalchemy>=2.0.41" dependency a clean
+    # install resolves 2.1.x, and the very first async engine creation raises
+    # ImportError: "The SQLAlchemy asyncio module requires that the Python
+    # 'greenlet' library is installed". A developer venv that already had 2.0.x
+    # installed hid this, because only a from-scratch install reproduced it.
+    "sqlalchemy[asyncio]>=2.0.41",
     "alembic>=1.16",
     "psycopg[binary]>=3.2",
     "asyncpg>=0.30",
@@ -59,4 +67,29 @@ check_untyped_defs = true
 warn_redundant_casts = true
 warn_unused_ignores = true
 ignore_missing_imports = true
+
+# Resolution root for the checked package.
+#
+# KAI is an application, not a distributed library: it is never installed by
+# anyone in order to consume its types, so it declares no ``py.typed`` marker.
+# Without ``mypy_path``, ``packages = ["kai"]`` resolved the package from
+# site-packages and mypy refused to check it at all ("cannot be type checked
+# due to missing py.typed marker"), which meant the configured command type
+# checked nothing. Pointing ``mypy_path`` at ``src`` makes the same command
+# check the source tree that actually ships.
+#
+# The official command is therefore simply ``mypy``, and CI runs exactly that.
+mypy_path = "src"
 packages = ["kai"]
+
+# Known gap: tests/ is deliberately outside this gate's scope.
+#
+# ``mypy src tests`` reports 196 findings, all in tests, none in src. They are
+# real annotation debt - largely fixtures built as deliberately-invalid values
+# to assert that runtime validation refuses them, plus 20 stale ``type: ignore``
+# comments. Tightening them is a standalone task; folding it into a deployment
+# round would mean editing the tests that guard fulfillment semantics.
+#
+# This narrows *type* checking only. Every test still runs in full under pytest
+# in CI - see the test job. src/ is 100% covered by the type gate.
+exclude = ['^tests/']
