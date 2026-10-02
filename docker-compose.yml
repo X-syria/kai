@@ -55,6 +55,12 @@ services:
     restart: unless-stopped
 
   # One-shot schema application. Never scaled; exits when the schema is current.
+  #
+  # RATE_LIMIT_BACKEND and REDIS_URL are present even though this job serves no
+  # HTTP. Settings validation is process-wide and fails closed in production
+  # unless the Redis backend is selected, so a one-shot job that omits them
+  # cannot start at all under ENVIRONMENT=production. Supplying the same values
+  # the app uses keeps that check intact rather than weakening it.
   migrate:
     build:
       context: .
@@ -62,11 +68,15 @@ services:
     command: ["alembic", "upgrade", "head"]
     environment:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-kai}:${POSTGRES_PASSWORD:-kai}@db:5432/${POSTGRES_DB:-kai}
-      ENVIRONMENT: ${ENVIRONMENT:-development}
+      ENVIRONMENT: ${ENVIRONMENT:-production}
       JWT_SECRET: ${JWT_SECRET:-change-me-in-production}
       GOOGLE_CREDS_ENCRYPTION_SECRET: ${GOOGLE_CREDS_ENCRYPTION_SECRET:-change-me-google-token-encryption}
+      RATE_LIMIT_BACKEND: ${RATE_LIMIT_BACKEND:-redis}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
     depends_on:
       db:
+        condition: service_healthy
+      redis:
         condition: service_healthy
     restart: "no"
 
@@ -76,9 +86,14 @@ services:
       dockerfile: Dockerfile
     ports:
       - "${APP_PORT:-8000}:8000"
+    # The defaults below are the shipped production posture: ENVIRONMENT is
+    # production, so a `.env` that only supplies secrets still boots a stack
+    # with every control enforced. Each default is one the production validators
+    # accept, because a compose file whose own defaults cannot start is a file
+    # that fails on the operator's first `docker compose up`.
     environment:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-kai}:${POSTGRES_PASSWORD:-kai}@db:5432/${POSTGRES_DB:-kai}
-      ENVIRONMENT: ${ENVIRONMENT:-development}
+      ENVIRONMENT: ${ENVIRONMENT:-production}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       JWT_SECRET: ${JWT_SECRET:-change-me-in-production}
       GOOGLE_OAUTH_CLIENT_ID: ${GOOGLE_OAUTH_CLIENT_ID:-}
@@ -87,7 +102,12 @@ services:
       GOOGLE_CREDS_ENCRYPTION_SECRET: ${GOOGLE_CREDS_ENCRYPTION_SECRET:-change-me-google-token-encryption}
       PLANNER_MODEL_URL: ${PLANNER_MODEL_URL:-}
       PLANNER_MODEL_API_KEY: ${PLANNER_MODEL_API_KEY:-}
-      RATE_LIMIT_BACKEND: ${RATE_LIMIT_BACKEND:-auto}
+      # "redis", not "auto". The two are behaviourally identical here -- the
+      # limiter resolves "auto" to redis whenever REDIS_URL is set, and the line
+      # below always sets it -- but production validation reads the literal
+      # string and refuses anything but "redis". A default that the validator
+      # rejects means `ENVIRONMENT=production` alone refuses to boot.
+      RATE_LIMIT_BACKEND: ${RATE_LIMIT_BACKEND:-redis}
       REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
       AUTH_RATE_LIMIT_REQUESTS: ${AUTH_RATE_LIMIT_REQUESTS:-10}
       AUTH_RATE_LIMIT_WINDOW_SECONDS: ${AUTH_RATE_LIMIT_WINDOW_SECONDS:-60}
@@ -124,9 +144,15 @@ services:
   #   docker compose run --rm purge-revocations
   #
   # and schedule that command every 15 minutes UTC in whatever already runs
-  # scheduled jobs for the environment. Overlapping invocations are safe: the
-  # command takes a transaction-scoped PostgreSQL advisory lock, so all but one
-  # exit 0 having done nothing.
+  # scheduled jobs for the environment. The shipped schedule is
+  # deploy/scheduler/kai.cron, which calls deploy/scheduler/run-purge-revocations.sh.
+  # Overlapping invocations are safe: the command takes a transaction-scoped
+  # PostgreSQL advisory lock, so all but one exit 0 having done nothing.
+  #
+  # RATE_LIMIT_BACKEND and REDIS_URL are here for the same reason they are on
+  # migrate: process-wide fail-closed validation would otherwise stop this job
+  # from starting under ENVIRONMENT=production, and a purge that cannot run in
+  # production is not a purge.
   purge-revocations:
     build:
       context: .
@@ -134,12 +160,16 @@ services:
     command: ["kai-purge-revocations"]
     environment:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-kai}:${POSTGRES_PASSWORD:-kai}@db:5432/${POSTGRES_DB:-kai}
-      ENVIRONMENT: ${ENVIRONMENT:-development}
+      ENVIRONMENT: ${ENVIRONMENT:-production}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       JWT_SECRET: ${JWT_SECRET:-change-me-in-production}
       GOOGLE_CREDS_ENCRYPTION_SECRET: ${GOOGLE_CREDS_ENCRYPTION_SECRET:-change-me-google-token-encryption}
+      RATE_LIMIT_BACKEND: ${RATE_LIMIT_BACKEND:-redis}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
     depends_on:
       db:
+        condition: service_healthy
+      redis:
         condition: service_healthy
       migrate:
         condition: service_completed_successfully
