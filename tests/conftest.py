@@ -19,9 +19,34 @@ import httpx
 import pytest
 import pytest_asyncio
 
-from kai.config import get_settings
-from kai.db.engine import engine
-from kai.main import app
+from kai.config import Settings, get_settings
+
+# Run the suite as if no ``.env`` existed next to the repository.
+#
+# ``Settings`` reads ``.env`` from the working directory, so creating one
+# silently changes how the tests behave. The dangerous case is the intended one:
+# a production-shaped file. A ``TRUSTED_HOSTS`` entry rejects the ``testserver``
+# Host header httpx sends, and every HTTP test then fails with 400 for reasons
+# that have nothing to do with the code under test.
+#
+# Found while standing up the release stack: the production ``.env`` written for
+# the Compose smoke broke the suite, and the failures pointed at host validation
+# rather than at the stray file.
+#
+# This has to happen here, at import time, and not in a fixture. ``kai.main``
+# builds the application - and its TrustedHostMiddleware - while this module is
+# being imported, so a fixture would run long after the settings that shaped the
+# app under test had already been read from disk.
+#
+# Only the env *file* is disabled. Real environment variables still apply,
+# because CI legitimately configures the suite through them, and the database
+# URL still comes from the Settings default, which addresses the Compose
+# database this suite already documents.
+Settings.model_config["env_file"] = None
+get_settings.cache_clear()
+
+from kai.db.engine import engine  # noqa: E402
+from kai.main import app  # noqa: E402
 
 API_PREFIX: Final = "/api/v1"
 
