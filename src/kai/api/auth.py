@@ -13,6 +13,7 @@ from kai.auth.revocation import revoke_token
 from kai.auth.security import hash_password, verify_password
 from kai.db.engine import get_session
 from kai.db.models import Tenant, User
+from kai.observability import metrics
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -95,6 +96,12 @@ async def login(req: LoginRequest, session: AsyncSession = Depends(get_session))
         req.password, _DUMMY_HASH if user is None else user.password_hash
     )
     if user is None or not password_ok:
+        # Counted as one reason class for both cases on purpose. Splitting them
+        # would make the metric itself an account-existence oracle: a spike in
+        # "no such account" versus "wrong password" tells an attacker which
+        # emails are registered, which is exactly what the equal timing and the
+        # identical 401 body exist to prevent. The email is never a label.
+        metrics.record_auth_failure("bad_credentials")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="invalid credentials",
@@ -102,8 +109,11 @@ async def login(req: LoginRequest, session: AsyncSession = Depends(get_session))
         )
     # A deactivated account must not be able to mint a fresh token. Login is
     # the only place a new token is issued, so this is where an existing
-    # suspension has to be honoured.
+    # suspension has to be honoured. Counted as its own class so a mass
+    # deactivation being logged into is visible, while still returning the
+    # identical body.
     if not user.is_active:
+        metrics.record_auth_failure("inactive")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="invalid credentials",

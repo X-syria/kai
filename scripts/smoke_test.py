@@ -26,6 +26,7 @@ import uuid
 COMPOSE = ["docker", "compose"]
 HEALTH_URL = "http://127.0.0.1:8000/api/v1/health"
 REGISTER_URL = "http://127.0.0.1:8000/api/v1/auth/register"
+METRICS_URL = "http://127.0.0.1:8000/api/v1/metrics"
 DB_NAME = "kai_smoke"
 DB_USER = "kai"
 EXPECTED_HEAD = "d4e5f6a7b8c9"
@@ -118,12 +119,20 @@ def main() -> int:
         fail("database never became ready")
     else:
         ok("database accepting connections")
-    run(["docker", "exec", "kai-db-1", "psql", "-U", DB_USER, "-d", "postgres", "-c",
-         f'DROP DATABASE IF EXISTS {DB_NAME};'])
+    # The app container from a previous run is still connected to the throwaway
+    # database, and PostgreSQL refuses to drop a database that has live
+    # connections. Left in place, the DROP fails silently and the CREATE below
+    # then reports "already exists", which looks like a broken stack rather than
+    # a leftover from the last run.
+    run(COMPOSE + ["rm", "-sf", "app"])
+    dropped = run(["docker", "exec", "kai-db-1", "psql", "-U", DB_USER, "-d", "postgres", "-c",
+                   f'DROP DATABASE IF EXISTS {DB_NAME};'])
+    if dropped.returncode != 0:
+        fail(f"could not drop the previous {DB_NAME}: {dropped.stderr.strip()[:200]}")
     created = run(["docker", "exec", "kai-db-1", "psql", "-U", DB_USER, "-d", "postgres", "-c",
                    f'CREATE DATABASE {DB_NAME};'])
     if created.returncode != 0:
-        fail(f"could not create throwaway database {DB_NAME}")
+        fail(f"could not create throwaway database {DB_NAME}: {created.stderr.strip()[:200]}")
     else:
         ok(f"throwaway database {DB_NAME} created")
 
@@ -232,9 +241,52 @@ def main() -> int:
         else:
             fail("no revoked_tokens row was written")
 
-    # 8. Restart and persist ---------------------------------------------------
+    # 8. Observability and the purge job ---------------------------------------
+    # Asserted over the running container rather than in-process, because the
+    # claim under test is that these work as deployed: the route is not mounted
+    # unless asked for, every response carries a correlation id, and the one-shot
+    # command an external scheduler will actually invoke exits 0.
+    name_of[0] = "observability"
+    step("8. Observability and revocation purge")
+
+    metrics_code = _status(urllib.request.Request(METRICS_URL))
+    if metrics_code == 404:
+        ok(f"{METRICS_URL} is not mounted while METRICS_ENABLED is false")
+    else:
+        fail(
+            f"metrics route answered HTTP {metrics_code} without METRICS_ENABLED; "
+            "an unauthenticated route must be opt-in and must not leak its shape"
+        )
+
+    try:
+        with urllib.request.urlopen(HEALTH_URL, timeout=15) as response:
+            request_id = response.headers.get("X-Request-ID")
+        if request_id:
+            ok(f"every response carries an X-Request-ID ({request_id})")
+        else:
+            fail("no X-Request-ID response header")
+    except (urllib.error.URLError, OSError) as exc:
+        fail(f"could not read response headers: {exc}")
+
+    purged = run(COMPOSE + ["run", "--rm", "purge-revocations"])
+    if purged.returncode == 0:
+        ok("kai-purge-revocations exited 0")
+    else:
+        fail(f"purge job exited {purged.returncode}: {purged.stderr.strip()[:300]}")
+
+    if purged.returncode == 0:
+        still_there = psql("SELECT count(*) FROM revoked_tokens;", DB_NAME)
+        if still_there and still_there.strip() not in ("", "0"):
+            ok("purge left the unexpired revocation in place")
+        else:
+            fail(
+                "purge deleted a revocation whose token had not expired; "
+                "a revoked token must stay revoked until its own exp passes"
+            )
+
+    # 9. Restart and persist ---------------------------------------------------
     name_of[0] = "persistence"
-    step("8. Restart and confirm state survives")
+    step("9. Restart and confirm state survives")
     before = psql("SELECT count(*) FROM users;", DB_NAME)
     run(COMPOSE + ["restart", "app"])
     if not wait_for_health():

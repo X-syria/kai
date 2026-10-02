@@ -21,9 +21,13 @@ from uuid import UUID
 from sqlalchemy import Select, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from kai.observability import metrics
+from kai.observability.metrics import TASK_FAILURE_STATES
+from kai.observability.tracing import span
 from kai.tasks.models import Task
 from kai.tasks.schemas import FulfillmentProfile, TaskContractInput
 from kai.tasks.state import (
+    COMPLETED,
     CREATED,
     FAILED,
     REQUIRES_ATTENTION,
@@ -112,6 +116,9 @@ async def create_task(
             f"fulfillment profile {contract.fulfillment_profile!r} "
             "is not licensed for live sealing"
         )
+    # Observed after the gate, so the counter measures tasks that actually
+    # entered the lifecycle rather than requests that were refused.
+    metrics.record_task_event("started", profile=contract.fulfillment_profile)
     task = Task(
         tenant_id=tenant_id,
         user_id=user_id,
@@ -228,6 +235,41 @@ async def transition_task(
 ) -> Task:
     """Move a task to ``target`` through the explicit machine.
 
+    A thin, instrumented entry point around :func:`_transition_task_locked`, whose
+    body is the whole transition and is unchanged by this wrapper.
+
+    The span carries only closed-set facts: ``actor`` is one of the two declared
+    actors and ``to_state`` comes from the state machine. ``target`` is *not*
+    carried, because on the client path it is caller-supplied text and this round
+    does not put caller text in telemetry.
+    """
+    attributes: dict[str, str] = {"actor": actor}
+    with span("task.transition", attributes=attributes):
+        task = await _transition_task_locked(
+            session,
+            task_id=task_id,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            target=target,
+            fail_reason=fail_reason,
+            actor=actor,
+        )
+        attributes["to_state"] = task.state
+        return task
+
+
+async def _transition_task_locked(
+    session: AsyncSession,
+    *,
+    task_id: UUID,
+    tenant_id: UUID,
+    user_id: UUID | None,
+    target: str,
+    fail_reason: str | None = None,
+    actor: str = INTERNAL_ACTOR,
+) -> Task:
+    """Move a task to ``target`` through the explicit machine.
+
     Legal transitions update the row; the machine also enforces the retry
     budget on the failure -> retry path. Anything else raises
     :class:`InvalidTransition` and persists nothing.
@@ -286,6 +328,15 @@ async def transition_task(
 
     if fail_reason and next_state in ("FAILED", "REQUIRES_ATTENTION"):
         task.last_error = " ".join(fail_reason.split())[:2000]
+
+    # Counted only after the machine has agreed and before the write is
+    # committed, so a refused transition never inflates a count. The label is
+    # the sealed fulfillment profile - a property of the code's vocabulary, not
+    # caller input, so it is bounded.
+    if next_state == COMPLETED:
+        metrics.record_task_event("completed", profile=task.fulfillment_profile)
+    elif next_state in TASK_FAILURE_STATES:
+        metrics.record_task_event("failed", profile=task.fulfillment_profile)
 
     await session.commit()
     await session.refresh(task)

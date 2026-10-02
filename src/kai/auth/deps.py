@@ -7,6 +7,8 @@ from kai.auth.revocation import is_token_revoked
 from kai.db.engine import get_session
 from kai.db.models import User
 from kai.db.scoping import get_user_for_tenant
+from kai.observability import metrics
+from kai.observability.tracing import span
 
 _bearer = HTTPBearer(auto_error=False)
 
@@ -19,6 +21,10 @@ _UNAUTHENTICATED: dict[str, str] = {
 
 
 def _reject(reason: str) -> HTTPException:
+    # Counted by reason class, never by the token or the subject: those are
+    # unbounded and are exactly the values that must not reach a shared
+    # monitoring system. The four reasons are a closed set declared above.
+    metrics.record_auth_failure(reason)
     return HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail=_UNAUTHENTICATED[reason],
@@ -43,28 +49,29 @@ async def get_current_user(
     is checked next, and only then is the user row loaded, so an unauthenticated
     request never becomes a database query.
     """
-    if credentials is None:
-        raise _reject("missing")
-    try:
-        claims = decode_access_token(credentials.credentials)
-    except InvalidTokenError as exc:
-        raise _reject("invalid") from exc
+    with span("auth.verify"):
+        if credentials is None:
+            raise _reject("missing")
+        try:
+            claims = decode_access_token(credentials.credentials)
+        except InvalidTokenError as exc:
+            raise _reject("invalid") from exc
 
-    # Revocation is checked before anything is done on the caller's behalf, and
-    # before the user row is trusted for authorization decisions below.
-    if await is_token_revoked(session, jti=claims.jti):
-        raise _reject("revoked")
+        # Revocation is checked before anything is done on the caller's behalf,
+        # and before the user row is trusted for authorization decisions below.
+        if await is_token_revoked(session, jti=claims.jti):
+            raise _reject("revoked")
 
-    user = await get_user_for_tenant(
-        session,
-        tenant_id=claims.tenant_id,
-        user_id=claims.user_id,
-    )
-    # A token that names a user which no longer exists, or that has been
-    # deactivated, is as unusable as one that was never signed. Previously
-    # ``is_active`` was only ever reported by /auth/me and never enforced, so
-    # deactivating an account did not actually stop anyone already holding a
-    # live token.
-    if user is None or not user.is_active:
-        raise _reject("inactive")
-    return user
+        user = await get_user_for_tenant(
+            session,
+            tenant_id=claims.tenant_id,
+            user_id=claims.user_id,
+        )
+        # A token that names a user which no longer exists, or that has been
+        # deactivated, is as unusable as one that was never signed. Previously
+        # ``is_active`` was only ever reported by /auth/me and never enforced,
+        # so deactivating an account did not actually stop anyone already
+        # holding a live token.
+        if user is None or not user.is_active:
+            raise _reject("inactive")
+        return user

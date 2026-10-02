@@ -13,6 +13,8 @@ from urllib.parse import urlencode
 import httpx
 
 from kai.config import get_settings
+from kai.observability import metrics
+from kai.observability.providers import provider_call
 
 AUTHORIZATION_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 TOKEN_URL = "https://oauth2.googleapis.com/token"
@@ -89,17 +91,18 @@ async def exchange_code(
 ) -> TokenData:
     """Exchange an authorization code for tokens."""
     settings = get_settings()
-    resp = await transport.post(
-        TOKEN_URL,
-        data={
-            "grant_type": "authorization_code",
-            "code": code,
-            "client_id": settings.google_oauth_client_id,
-            "client_secret": settings.google_oauth_client_secret,
-            "redirect_uri": redirect_uri,
-        },
-    )
-    return _parse_token_response(resp)
+    with provider_call(provider=metrics.PROVIDER_GOOGLE, operation="oauth_exchange_code"):
+        resp = await transport.post(
+            TOKEN_URL,
+            data={
+                "grant_type": "authorization_code",
+                "code": code,
+                "client_id": settings.google_oauth_client_id,
+                "client_secret": settings.google_oauth_client_secret,
+                "redirect_uri": redirect_uri,
+            },
+        )
+        return _parse_token_response(resp)
 
 
 async def refresh_access_token(
@@ -107,16 +110,17 @@ async def refresh_access_token(
 ) -> TokenData:
     """Exchange a refresh token for a fresh access token."""
     settings = get_settings()
-    resp = await transport.post(
-        TOKEN_URL,
-        data={
-            "grant_type": "refresh_token",
-            "refresh_token": refresh_token,
-            "client_id": settings.google_oauth_client_id,
-            "client_secret": settings.google_oauth_client_secret,
-        },
-    )
-    return _parse_token_response(resp)
+    with provider_call(provider=metrics.PROVIDER_GOOGLE, operation="oauth_refresh"):
+        resp = await transport.post(
+            TOKEN_URL,
+            data={
+                "grant_type": "refresh_token",
+                "refresh_token": refresh_token,
+                "client_id": settings.google_oauth_client_id,
+                "client_secret": settings.google_oauth_client_secret,
+            },
+        )
+        return _parse_token_response(resp)
 
 
 async def fetch_userinfo(
@@ -126,21 +130,24 @@ async def fetch_userinfo(
 
     ``sub`` is the stable Google subject id used to bind accounts.
     """
-    resp = await transport.get(
-        USERINFO_URL, headers={"Authorization": f"Bearer {access_token}"}
-    )
-    if resp.status_code != 200:
-        raise GoogleOAuthError(f"google userinfo request failed ({resp.status_code})")
-    payload = resp.json()
-    sub = payload.get("sub")
-    email = payload.get("email")
-    if not sub or not email:
-        raise GoogleOAuthError("google userinfo response is missing sub or email")
-    return UserInfo(
-        sub=str(sub),
-        email=str(email),
-        email_verified=bool(payload.get("email_verified")),
-    )
+    with provider_call(provider=metrics.PROVIDER_GOOGLE, operation="oauth_userinfo"):
+        resp = await transport.get(
+            USERINFO_URL, headers={"Authorization": f"Bearer {access_token}"}
+        )
+        if resp.status_code != 200:
+            raise GoogleOAuthError(
+                f"google userinfo request failed ({resp.status_code})"
+            )
+        payload = resp.json()
+        sub = payload.get("sub")
+        email = payload.get("email")
+        if not sub or not email:
+            raise GoogleOAuthError("google userinfo response is missing sub or email")
+        return UserInfo(
+            sub=str(sub),
+            email=str(email),
+            email_verified=bool(payload.get("email_verified")),
+        )
 
 
 async def revoke_access_token(
@@ -152,10 +159,13 @@ async def revoke_access_token(
     tokens; all three mean the token can no longer be used, so they are not
     treated as errors.
     """
-    resp = await transport.post(
-        REVOKE_URL,
-        params={"token": access_token},
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
-    )
-    if resp.status_code not in (200, 400, 404):
-        raise GoogleOAuthError(f"google revoke request failed ({resp.status_code})")
+    with provider_call(provider=metrics.PROVIDER_GOOGLE, operation="oauth_revoke"):
+        resp = await transport.post(
+            REVOKE_URL,
+            params={"token": access_token},
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        if resp.status_code not in (200, 400, 404):
+            raise GoogleOAuthError(
+                f"google revoke request failed ({resp.status_code})"
+            )

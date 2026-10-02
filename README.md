@@ -7,8 +7,8 @@ and human authorities decide. It is not a general workflow engine.
 
 **Deployment status: Deployment-Ready, with production hardening applied to the
 minimum viable set.** Authentication, authorization, rate limiting, revocation,
-CORS and TrustedHost are enforced and tested. Remaining gaps — chiefly metrics
-export and the test-tree typing debt — are listed under
+CORS, TrustedHost, metrics export and request tracing are enforced and tested.
+Remaining gaps — chiefly the test-tree typing debt — are listed under
 [Known production gaps](#known-production-gaps). Read it before exposing this
 to users.
 
@@ -109,6 +109,63 @@ its database must not be reported as serving traffic. If you need a separate
 liveness signal (process is running, dependencies irrelevant), that endpoint does
 not exist yet; see gaps below.
 
+## Observability
+
+Three independent signals, all served or emitted by the same process. See
+[`docs/OBSERVABILITY.md`](docs/OBSERVABILITY.md) for the metric and span
+inventory and the label rules.
+
+### Metrics
+
+```powershell
+# Off by default. Enabling it is an exposure decision: the route is
+# unauthenticated, so Prometheus cannot present a KAI token.
+$env:METRICS_ENABLED = "true"
+Invoke-WebRequest http://127.0.0.1:8000/api/v1/metrics | Select-Object -Expand Content
+```
+
+`METRICS_ENABLED=false` (the default) means the route does not exist at all: it is
+not mounted, and it is absent from the OpenAPI schema. There is no route that
+answers 403, because a 403 would confirm the endpoint's existence and shape to an
+unauthenticated scanner.
+
+**What it means.** Every label value is drawn from a closed set or is a route
+template. There is deliberately no `user_id`, `task_id`, `token`, email address,
+raw URL or exception message label anywhere in the output, because a metric is
+long-lived and shared: a high-cardinality label is a permanent storage cost, and a
+secret in a label is a secret in every downstream system that scrapes it. An
+unrecognised value collapses to `unknown` rather than creating a new series.
+
+### Tracing
+
+No collector and no agent. Spans are emitted as JSON log records with
+`event="span_ended"`, carrying a W3C `trace_id`, `span_id`, parent `span_id`,
+duration and the route template, so a trace is a join over log lines rather than a
+second storage system to run.
+
+`TRACING_ACCEPT_INBOUND=false` (the default) means an inbound `traceparent` header
+is ignored and this service starts its own root trace. Honouring a header from an
+untrusted caller would let any client attach its own ids to this service's spans,
+which corrupts the trace it is trying to follow.
+
+### Revocation purge
+
+`revoked_tokens` grows on every logout, so an external scheduler runs a one-shot
+job that deletes rows whose expiry has already passed:
+
+```powershell
+python -m kai.maintenance.revocation_purge   # exit 0 ok, 1 failed
+docker compose run --rm purge-revocations   # same image, same command
+```
+
+**What it means.** The job deletes only rows that are *already* unusable, because a
+revoked token is denied on the strength of its `jti` and an access token's own
+expiry bounds how long it could ever be presented. That is the invariant that makes
+this safe to run unattended. Runs take a PostgreSQL transaction-scoped advisory
+lock, so overlapping invocations collapse into one purge instead of racing, and a
+lock that is already held is exit 0, not an error — a scheduler should not page
+anyone because two runs overlapped. No HTTP endpoint purges anything.
+
 ## Quality gates
 
 The official commands. CI runs exactly these, and each one fails the build on
@@ -116,7 +173,7 @@ error.
 
 ```powershell
 ruff check .   # repository-wide, no exclusions
-mypy            # type-checks src/ (117 files)
+mypy            # type-checks src/ (130 files)
 pytest -q       # full suite against a real PostgreSQL
 ```
 
@@ -221,9 +278,6 @@ The following are enforced in code and covered by tests in
 
 These are open, and none of them are closed by a passing test suite:
 
-- **No request correlation or metrics export.** Failures are logged as structured
-  JSON with a per-request `X-Request-ID`, but there is no tracing, no Prometheus
-  endpoint, and no alerting hook.
 - **Rate limiting is per source address, and `X-Forwarded-For` is ignored.**
   Behind a proxy, every client shares the proxy's address, so the limit applies
   per proxy. Honouring the header without a trusted proxy would let any client
@@ -232,8 +286,9 @@ These are open, and none of them are closed by a passing test suite:
 - **Access tokens cannot be refreshed.** There is no refresh token; a client
   re-authenticates when its access token expires. Revocation makes expiry
   enforceable early, but it does not extend session length.
-- **Tests are outside the type-check gate.** `mypy src tests` reports 196
-  findings, all in tests, none in `src`; tightening them is separate work. Every
+- **Tests are outside the type-check gate.** `mypy` reads `packages = ["kai"]` with
+  `mypy_path = "src"`, so the checked tree is `src/` and the configured command
+  cannot be pointed at `tests/` at all. Tightening that is separate work; every
   test still runs in CI.
 - **`gmail_send` is not live-sealable.** `LIVE_SEALABLE_PROFILES` is
   `{"calendar_meeting"}` only, and this is intentional. Recipient intent is

@@ -10,6 +10,8 @@
 #   docker compose up -d app
 #   Invoke-RestMethod http://127.0.0.1:8000/api/v1/health
 #
+#   docker compose run --rm purge-revocations   # one-shot, scheduled externally
+#
 # Startup ordering is explicit rather than implied:
 #   db       -> healthcheck (pg_isready)
 #   migrate  -> runs to completion, is a one-shot job, exits 0
@@ -91,6 +93,11 @@ services:
       AUTH_RATE_LIMIT_WINDOW_SECONDS: ${AUTH_RATE_LIMIT_WINDOW_SECONDS:-60}
       CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-}
       TRUSTED_HOSTS: ${TRUSTED_HOSTS:-}
+      METRICS_ENABLED: ${METRICS_ENABLED:-false}
+      METRICS_PATH: ${METRICS_PATH:-/api/v1/metrics}
+      TRACING_ENABLED: ${TRACING_ENABLED:-true}
+      TRACING_ACCEPT_INBOUND: ${TRACING_ACCEPT_INBOUND:-false}
+      TRACING_SAMPLE_RATIO: ${TRACING_SAMPLE_RATIO:-1.0}
     depends_on:
       db:
         condition: service_healthy
@@ -105,6 +112,38 @@ services:
       start_period: 15s
       retries: 3
     restart: unless-stopped
+
+  # One-shot expired-revocation purge. The same image and the same code as the
+  # app, a different entrypoint.
+  #
+  # It is deliberately NOT a long-running service here. Compose has no
+  # scheduler, and a loop here would tie the schedule to this stack rather than
+  # to the operator's cron / systemd timer / Kubernetes CronJob. Run it on
+  # demand with:
+  #
+  #   docker compose run --rm purge-revocations
+  #
+  # and schedule that command every 15 minutes UTC in whatever already runs
+  # scheduled jobs for the environment. Overlapping invocations are safe: the
+  # command takes a transaction-scoped PostgreSQL advisory lock, so all but one
+  # exit 0 having done nothing.
+  purge-revocations:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["kai-purge-revocations"]
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-kai}:${POSTGRES_PASSWORD:-kai}@db:5432/${POSTGRES_DB:-kai}
+      ENVIRONMENT: ${ENVIRONMENT:-development}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      JWT_SECRET: ${JWT_SECRET:-change-me-in-production}
+      GOOGLE_CREDS_ENCRYPTION_SECRET: ${GOOGLE_CREDS_ENCRYPTION_SECRET:-change-me-google-token-encryption}
+    depends_on:
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    restart: "no"
 
 volumes:
   kai_pgdata:

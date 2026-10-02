@@ -19,6 +19,8 @@ from kai.calendar.models import (
     parse_events_payload,
 )
 from kai.calendar.service_models import CreateEventRequest
+from kai.observability import metrics
+from kai.observability.providers import provider_call
 
 EVENTS_COLLECTION_URL = "https://www.googleapis.com/calendar/v3/calendars/primary/events"
 MAX_RESULTS = 250
@@ -86,19 +88,20 @@ async def fetch_events_page(
     }
     if page_token:
         params["pageToken"] = page_token
-    resp = await transport.get(
-        EVENTS_COLLECTION_URL,
-        params=params,
-        headers={"Authorization": f"Bearer {access_token}"},
-    )
-    _raise_for_status(resp)
-    try:
-        payload = resp.json()
-    except ValueError as exc:
-        raise GoogleApiError(
-            "google calendar api returned a malformed response"
-        ) from exc
-    return parse_events_payload(payload)
+    with provider_call(provider=metrics.PROVIDER_GOOGLE, operation="list_events"):
+        resp = await transport.get(
+            EVENTS_COLLECTION_URL,
+            params=params,
+            headers={"Authorization": f"Bearer {access_token}"},
+        )
+        _raise_for_status(resp)
+        try:
+            payload = resp.json()
+        except ValueError as exc:
+            raise GoogleApiError(
+                "google calendar api returned a malformed response"
+            ) from exc
+        return parse_events_payload(payload)
 
 
 async def fetch_events(
@@ -139,22 +142,23 @@ async def create_event(
         "end": {"dateTime": req.end.isoformat(), "timeZone": req.timezone},
         "attendees": [{"email": email} for email in req.attendees],
     }
-    resp = await transport.post(
-        EVENTS_COLLECTION_URL,
-        json=body,
-        headers={"Authorization": f"Bearer {access_token}"},
-    )
-    _raise_for_status(resp)
-    try:
-        payload = resp.json()
-    except ValueError as exc:
-        raise GoogleApiError(
-            "google calendar create returned a malformed response"
-        ) from exc
-    event = parse_event_payload(payload)
-    if event is None:
-        raise GoogleApiError("google calendar create returned an unparseable event")
-    return event
+    with provider_call(provider=metrics.PROVIDER_GOOGLE, operation="create_event"):
+        resp = await transport.post(
+            EVENTS_COLLECTION_URL,
+            json=body,
+            headers={"Authorization": f"Bearer {access_token}"},
+        )
+        _raise_for_status(resp)
+        try:
+            payload = resp.json()
+        except ValueError as exc:
+            raise GoogleApiError(
+                "google calendar create returned a malformed response"
+            ) from exc
+        event = parse_event_payload(payload)
+        if event is None:
+            raise GoogleApiError("google calendar create returned an unparseable event")
+        return event
 
 
 async def fetch_event(
@@ -162,17 +166,18 @@ async def fetch_event(
 ) -> CalendarEvent:
     """Read one event back from the primary calendar (read-after-create)."""
     url = f"{EVENTS_COLLECTION_URL}/{quote(event_id, safe='')}"
-    resp = await transport.get(
-        url, headers={"Authorization": f"Bearer {access_token}"}
-    )
-    _raise_for_status(resp)
-    try:
-        payload = resp.json()
-    except ValueError as exc:
-        raise GoogleApiError(
-            "google calendar read returned a malformed response"
-        ) from exc
-    event = parse_event_payload(payload)
-    if event is None:
-        raise GoogleApiError("google calendar read returned an unparseable event")
-    return event
+    with provider_call(provider=metrics.PROVIDER_GOOGLE, operation="read_event"):
+        resp = await transport.get(
+            url, headers={"Authorization": f"Bearer {access_token}"}
+        )
+        _raise_for_status(resp)
+        try:
+            payload = resp.json()
+        except ValueError as exc:
+            raise GoogleApiError(
+                "google calendar read returned a malformed response"
+            ) from exc
+        event = parse_event_payload(payload)
+        if event is None:
+            raise GoogleApiError("google calendar read returned an unparseable event")
+        return event

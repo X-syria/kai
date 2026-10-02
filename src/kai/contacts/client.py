@@ -10,6 +10,8 @@ least-privilege contacts scope the account was granted at connect time
 import httpx
 
 from kai.contacts.models import Contact, ContactsPage, parse_connections_payload
+from kai.observability import metrics
+from kai.observability.providers import provider_call
 
 
 class GoogleApiError(RuntimeError):
@@ -58,19 +60,20 @@ async def fetch_connections_page(
     params: dict[str, str] = {"personFields": PERSON_FIELDS, "pageSize": str(PAGE_SIZE)}
     if page_token:
         params["pageToken"] = page_token
-    resp = await transport.get(
-        CONNECTIONS_URL,
-        params=params,
-        headers={"Authorization": f"Bearer {access_token}"},
-    )
-    _raise_for_status(resp)
-    try:
-        payload = resp.json()
-    except ValueError as exc:
-        raise GoogleApiError(
-            "google people api returned a malformed response"
-        ) from exc
-    return parse_connections_payload(payload)
+    with provider_call(provider=metrics.PROVIDER_GOOGLE, operation="list_contacts"):
+        resp = await transport.get(
+            CONNECTIONS_URL,
+            params=params,
+            headers={"Authorization": f"Bearer {access_token}"},
+        )
+        _raise_for_status(resp)
+        try:
+            payload = resp.json()
+        except ValueError as exc:
+            raise GoogleApiError(
+                "google people api returned a malformed response"
+            ) from exc
+        return parse_connections_payload(payload)
 
 
 async def fetch_all_contacts(

@@ -165,6 +165,33 @@ class Settings(BaseSettings):
     approval_fatigue_cooldown_days: int = 30
     approval_suggestion_expiration_days: int = 30
 
+    # ------------------------------------------------------------------
+    # Observability
+    # ------------------------------------------------------------------
+    # Metrics are collected always (recording is exception-safe and costs
+    # nothing when nobody scrapes), but the /metrics route is a deliberate
+    # exposure decision, so it is off by default and must be turned on. The
+    # path is configurable so a deployment can move it off the well-known
+    # location without renaming anything.
+    #
+    # There is no push-based exporter and no OTLP endpoint: KAI renders its
+    # own registry on demand, so a monitoring backend being unreachable cannot
+    # affect this service. Nothing here is an application-critical dependency.
+    metrics_enabled: bool = False
+    metrics_path: str = "/api/v1/metrics"
+    # Traces are correlation, not a distributed-tracing stack: spans ride the
+    # structured-log channel that already ships. There is deliberately no
+    # OTEL_EXPORTER_ENDPOINT and no collector to point it at; see
+    # src/kai/observability/tracing.py and docs/OBSERVABILITY.md. Accepted as a
+    # *sampling ratio* only, and it must never be a required dependency.
+    tracing_enabled: bool = True
+    # Honour an inbound W3C ``traceparent``. Off by default: honouring it means
+    # trusting an upstream to have started a well-formed trace, and a client
+    # can otherwise pick its own trace id. Turn it on only behind a proxy or
+    # collector that is known to do this correctly.
+    tracing_accept_inbound: bool = False
+    tracing_sample_ratio: float = 1.0
+
 
 @lru_cache
 def get_settings() -> Settings:
@@ -236,3 +263,37 @@ def _validate_production_security_settings(settings: Settings) -> None:
             "production; a short secret is brute-forceable offline by anyone who "
             "obtains a token, which makes every other control here irrelevant"
         )
+    _validate_production_observability_settings(settings)
+
+
+def _validate_production_observability_settings(settings: Settings) -> None:
+    """Refuse production observability settings that expose or mislead.
+
+    A metrics endpoint is public telemetry: it leaks the route table, the error
+    rate, and the traffic shape. That is acceptable inside a private network and
+    is not acceptable on a public interface, and nothing in the application can
+    tell the difference - so the only honest control is to make the operator
+    state the intent, and to refuse a path that would collide with a real
+    endpoint. Telemetry never becomes a hard dependency: none of these checks
+    can stop the service from serving traffic.
+    """
+    if not settings.metrics_enabled:
+        return
+    path = settings.metrics_path
+    if not path.startswith("/"):
+        raise RuntimeError(
+            f"METRICS_PATH must be an absolute path starting with '/'; got {path!r}"
+        )
+    # Shadowing a real endpoint with an unauthenticated one would be a
+    # downgrade of that endpoint's protection, so refuse the collision outright.
+    if path.rstrip("/") in _RESERVED_METRICS_PATHS:
+        raise RuntimeError(
+            f"METRICS_PATH must not shadow a built-in endpoint ({path!r}). Serve "
+            "observability on its own path, e.g. /api/v1/metrics."
+        )
+
+
+#: Built-in routes a metrics path must never collide with.
+_RESERVED_METRICS_PATHS: Final[frozenset[str]] = frozenset(
+    {"/api/v1/health", "/api/v1/auth/login", "/api/v1/auth/register"}
+)

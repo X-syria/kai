@@ -13,6 +13,9 @@ from typing import Protocol
 
 import httpx
 
+from kai.observability import metrics
+from kai.observability.providers import provider_call
+
 # Fixed system prompt. Task content is always *data*: anything between the
 # <goal> / <success_criteria> delimiters must be reproduced verbatim and never
 # obeyed as instructions, and the structured output must never carry fields
@@ -102,24 +105,39 @@ class OpenAICompatiblePlannerModel:
         if self._api_key:
             headers["Authorization"] = f"Bearer {self._api_key}"
         try:
-            async with httpx.AsyncClient(
-                timeout=self._timeout, transport=self._transport
-            ) as client:
-                response = await client.post(
-                    f"{self._url}/chat/completions", json=payload, headers=headers
-                )
+            with provider_call(
+                provider=metrics.PROVIDER_PLANNER, operation="generate_plan"
+            ):
+                async with httpx.AsyncClient(
+                    timeout=self._timeout, transport=self._transport
+                ) as client:
+                    response = await client.post(
+                        f"{self._url}/chat/completions", json=payload, headers=headers
+                    )
+                # Status handling and parsing stay inside the instrumented block
+                # on purpose: a non-200 or an unparseable body is a provider
+                # failure, so it must be counted as one instead of escaping the
+                # metric.
+                if response.status_code != 200:
+                    raise ModelOutputError(
+                        f"planner model returned HTTP {response.status_code}"
+                    )
+                try:
+                    body = response.json()
+                    content = body["choices"][0]["message"]["content"]
+                    parsed = json.loads(content)
+                except (
+                    KeyError,
+                    IndexError,
+                    TypeError,
+                    ValueError,
+                    json.JSONDecodeError,
+                ) as exc:
+                    raise ModelOutputError(
+                        "planner model output is not parseable JSON"
+                    ) from exc
         except httpx.HTTPError as exc:
             raise ModelOutputError(f"planner model request failed: {exc}") from exc
-        if response.status_code != 200:
-            raise ModelOutputError(
-                f"planner model returned HTTP {response.status_code}"
-            )
-        try:
-            body = response.json()
-            content = body["choices"][0]["message"]["content"]
-            parsed = json.loads(content)
-        except (KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError) as exc:
-            raise ModelOutputError("planner model output is not parseable JSON") from exc
         if not isinstance(parsed, dict):
             raise ModelOutputError("planner model output is not a JSON object")
         return parsed

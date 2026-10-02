@@ -17,14 +17,20 @@ from __future__ import annotations
 import threading
 import time
 from collections.abc import Callable
-from typing import Any
+from typing import Any, Final
 
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from kai.config import get_settings
 from kai.logging import get_logger
+from kai.observability import metrics
 
 _log = get_logger(__name__)
+
+#: Bounded reason classes for a rejection. Two reasons, both decided in this
+#: module, so the metric label can never grow with client input.
+REASON_EXCEEDED: Final[str] = "exceeded"
+REASON_BACKEND_UNAVAILABLE: Final[str] = "backend_unavailable"
 
 
 class RateLimitExceeded(Exception):
@@ -170,11 +176,18 @@ class RateLimitMiddleware:
             # silently become "no limit", which is the failure mode that turns
             # a Redis blip into an open brute-force window.
             _log.error("rate_limit_backend_unavailable", error=str(exc), path=path)
+            metrics.record_rate_limit_rejection(REASON_BACKEND_UNAVAILABLE)
             await _send_rate_limited(send, 1)
             return
 
         if not allowed:
+            # ``path`` here is one of the two constants in RATE_LIMITED_PATHS, so
+            # it is a bounded label by construction. The client address is
+            # deliberately NOT a label: it is unbounded and would leak who is
+            # being limited into a shared monitoring system. It stays in the log
+            # line, which is access-controlled, rather than in the metric.
             _log.warning("rate_limit_exceeded", path=path, client=host)
+            metrics.record_rate_limit_rejection(REASON_EXCEEDED)
             await _send_rate_limited(send, max(int(retry_after), 1))
             return
 

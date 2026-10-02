@@ -18,6 +18,8 @@ from kai.gmail.models import (
     parse_message_payload,
     parse_search_payload,
 )
+from kai.observability import metrics
+from kai.observability.providers import provider_call
 
 MESSAGES_URL = "https://www.googleapis.com/gmail/v1/users/me/messages"
 SEND_URL = "https://www.googleapis.com/gmail/v1/users/me/messages/send"
@@ -104,54 +106,57 @@ async def _search_page(
     }
     if page_token:
         params["pageToken"] = page_token
-    resp = await transport.get(
-        MESSAGES_URL,
-        params=params,
-        headers={"Authorization": f"Bearer {access_token}"},
-    )
-    _raise_for_status(resp)
-    try:
-        payload = resp.json()
-    except ValueError as exc:
-        raise GoogleApiError("gmail search returned a malformed response") from exc
-    return parse_search_payload(payload)
+    with provider_call(provider=metrics.PROVIDER_GOOGLE, operation="search_messages"):
+        resp = await transport.get(
+            MESSAGES_URL,
+            params=params,
+            headers={"Authorization": f"Bearer {access_token}"},
+        )
+        _raise_for_status(resp)
+        try:
+            payload = resp.json()
+        except ValueError as exc:
+            raise GoogleApiError("gmail search returned a malformed response") from exc
+        return parse_search_payload(payload)
 
 
 async def get_message(
     transport: httpx.AsyncClient, *, access_token: str, message_id: str
 ) -> GmailMessage:
     """Read one message (headers, snippet, text body) from the mailbox."""
-    resp = await transport.get(
-        f"{MESSAGES_URL}/{quote(message_id, safe='')}",
-        params={"format": "full"},
-        headers={"Authorization": f"Bearer {access_token}"},
-    )
-    _raise_for_status(resp)
-    try:
-        payload = resp.json()
-    except ValueError as exc:
-        raise GoogleApiError("gmail read returned a malformed response") from exc
-    message = parse_message_payload(payload)
-    if message is None:
-        raise GoogleApiError("gmail read returned an unparseable message")
-    return message
+    with provider_call(provider=metrics.PROVIDER_GOOGLE, operation="get_message"):
+        resp = await transport.get(
+            f"{MESSAGES_URL}/{quote(message_id, safe='')}",
+            params={"format": "full"},
+            headers={"Authorization": f"Bearer {access_token}"},
+        )
+        _raise_for_status(resp)
+        try:
+            payload = resp.json()
+        except ValueError as exc:
+            raise GoogleApiError("gmail read returned a malformed response") from exc
+        message = parse_message_payload(payload)
+        if message is None:
+            raise GoogleApiError("gmail read returned an unparseable message")
+        return message
 
 
 async def send_message(
     transport: httpx.AsyncClient, *, access_token: str, raw: str
 ) -> GmailMessage:
     """Send a raw RFC5322 message; return the created Gmail message."""
-    resp = await transport.post(
-        SEND_URL,
-        json={"raw": raw},
-        headers={"Authorization": f"Bearer {access_token}"},
-    )
-    _raise_for_status(resp)
-    try:
-        payload = resp.json()
-    except ValueError as exc:
-        raise GoogleApiError("gmail send returned a malformed response") from exc
-    message = parse_message_payload(payload)
-    if message is None or not message.message_id:
-        raise GoogleApiError("gmail send returned no accepted message_id")
-    return message
+    with provider_call(provider=metrics.PROVIDER_GOOGLE, operation="send_message"):
+        resp = await transport.post(
+            SEND_URL,
+            json={"raw": raw},
+            headers={"Authorization": f"Bearer {access_token}"},
+        )
+        _raise_for_status(resp)
+        try:
+            payload = resp.json()
+        except ValueError as exc:
+            raise GoogleApiError("gmail send returned a malformed response") from exc
+        message = parse_message_payload(payload)
+        if message is None or not message.message_id:
+            raise GoogleApiError("gmail send returned no accepted message_id")
+        return message

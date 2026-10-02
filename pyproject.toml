@@ -31,6 +31,14 @@ dependencies = [
     "structlog>=25.2",
     "httpx>=0.28",
     "cryptography>=44",
+    # Metrics exposition only. One dependency, no transitive tree, and it owns
+    # exactly one job: render the counters/histograms this service records into
+    # the Prometheus text format at /api/v1/metrics. Deliberately *not* the
+    # OpenTelemetry SDK: that is a collector-and-exporter stack whose consumer
+    # this single-service deployment does not have. KAI records its own spans
+    # and ships them through the structured-log channel it already runs (see
+    # src/kai/observability/tracing.py), which needs no extra dependency.
+    "prometheus-client>=0.21",
     # Required, not optional: production refuses to start on the in-memory
     # rate-limit store, because a per-process counter is not a rate limit once
     # more than one replica is behind the load balancer. The async client is
@@ -46,6 +54,14 @@ dev = [
     "ruff>=0.11",
     "mypy>=1.15",
 ]
+
+# The revocation purge is a one-shot maintenance command, not a long-running
+# process: the application never owns the schedule, so the operator's scheduler
+# (cron / Kubernetes CronJob / systemd timer) invokes this and it exits. It
+# takes a PostgreSQL transaction-scoped advisory lock, so overlapping replicas'
+# runs collapse into one purge and the losers exit 0 without doing work.
+[project.scripts]
+kai-purge-revocations = "kai.maintenance.revocation_purge:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/kai"]
