@@ -105,17 +105,25 @@ groups:
             is broken. Every other rule in this file is blind while this is true.
 
       - alert: KaiReadinessFailing
+        # NOTE: /api/v1/health returns HTTP 200 even when it reports
+        # {"status": "degraded"}, by design (see src/kai/api/health.py) - a probe
+        # must not fail a replica because its database blipped. So this rule
+        # fires only when the health route itself raises, not when the database
+        # is down. Database degradation is carried by KaiDatabaseErrors and
+        # KaiDatabaseUnavailable below, which read kai_db_errors_total.
         expr: >-
           sum(rate(kai_http_requests_total{route="/api/v1/health",status_class="5xx"}[5m])) > 0
         for: 5m
         labels:
           severity: critical
         annotations:
-          summary: KAI readiness is failing
+          summary: The readiness endpoint itself is failing
           description: >-
-            /api/v1/health returns 5xx, which means the database does not answer.
-            The endpoint reports 200 only when the database is reachable, so this
-            is a database-availability signal arriving through the health path.
+            /api/v1/health is returning 5xx. The endpoint answers 200 even while
+            reporting status "degraded", so this means the probe route itself is
+            broken (an unhandled error in the handler or its middleware), not
+            merely that the database is unreachable. For a database outage watch
+            KaiDatabaseUnavailable.
 
       - alert: KaiPersistentServerErrors
         expr: >-

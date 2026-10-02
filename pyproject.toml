@@ -53,6 +53,10 @@ dev = [
     "httpx>=0.28",
     "ruff>=0.11",
     "mypy>=1.15",
+    # tests/test_alerting_rules.py parses deploy/alerting/*.yml. It is present
+    # transitively via uvicorn[standard], but a test must not depend on another
+    # package's dependency graph staying as it is today.
+    "PyYAML>=6.0",
 ]
 
 # The revocation purge is a one-shot maintenance command, not a long-running
