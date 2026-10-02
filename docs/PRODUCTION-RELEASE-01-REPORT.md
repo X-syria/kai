@@ -1,5 +1,20 @@
 # PRODUCTION-RELEASE-01 report
 
+> **Partly superseded.** See
+> [`FINAL-PRODUCTION-GO-LIVE-01-REPORT.md`](FINAL-PRODUCTION-GO-LIVE-01-REPORT.md),
+> which carries the current verdict and replaces two facts recorded below:
+>
+> - The head commit is **`7ef5d2c`**, not `52a8232` or `66426b9`. The five
+>   release commits were rewritten subject-only after this report was written,
+>   to remove a UTF-8 BOM from their subjects. Trees, files, patches, authors
+>   and dates were preserved; the diff is empty.
+> - The commit-subject BOM is therefore **no longer an open gap** for the
+>   release range. "Gap 5" below should be read as historical. One older
+>   commit, `d421326`, still carries a BOM and was outside the scope of that
+>   rewrite.
+>
+> The verdict is unchanged.
+
 **Verdict: DEPLOYMENT-READY — EXTERNAL ALERT DESTINATION REQUIRED**
 
 Not `PRODUCTION-READY`. The code, the scheduler and the alert rules are all
