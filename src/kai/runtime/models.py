@@ -82,8 +82,23 @@ class RuntimeExecution(PKMixin, TenantMixin, TimestampMixin, Base):
 
     #: What the cursor above is counting: one plan version plus the hash of its
     #: steps. Nullable until the first trigger binds it.
-    plan_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    plan_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    #:
+    #: The ``comment=`` values below restate what the migrations already applied
+    #: to the database (``b3d5f7a9c1e2`` and ``c8e1f3a5b7d9``). They are metadata
+    #: only: no type, nullability, default or index changes with them. They are
+    #: declared here so this model accurately describes a migrated schema and
+    #: ``alembic check`` reports real drift rather than six columns whose
+    #: operator-facing descriptions it believes are missing.
+    plan_version: Mapped[int | None] = mapped_column(
+        Integer,
+        nullable=True,
+        comment="task plan version this cursor is bound to",
+    )
+    plan_hash: Mapped[str | None] = mapped_column(
+        String(64),
+        nullable=True,
+        comment="sha256 of the bound plan version steps",
+    )
 
     claim_token: Mapped[UUID | None] = mapped_column(
         PG_UUID(as_uuid=True), nullable=True, index=True
@@ -103,10 +118,20 @@ class RuntimeExecution(PKMixin, TenantMixin, TimestampMixin, Base):
     # re-derivation that disagrees with this row overwrites it. Nothing reads
     # these columns to decide a task state.
     fulfillment_profile: Mapped[str | None] = mapped_column(
-        String(64), nullable=True
+        String(64),
+        nullable=True,
+        comment="sealed contract profile whose evaluator decided fulfillment",
     )
-    evaluator_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    fulfillment_verdict: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    evaluator_version: Mapped[str | None] = mapped_column(
+        String(64),
+        nullable=True,
+        comment="semantic version of the fulfillment evaluator that ran",
+    )
+    fulfillment_verdict: Mapped[str | None] = mapped_column(
+        String(32),
+        nullable=True,
+        comment="verdict the evaluator returned: audit record, not authority",
+    )
 
 
 __all__ = ["RuntimeExecution"]

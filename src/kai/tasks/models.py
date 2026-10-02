@@ -52,8 +52,15 @@ class Task(PKMixin, TenantMixin, TimestampMixin, Base):
     #: the same evaluator from the row instead of from anything mutable. The
     #: server default only exists so rows written before this column keep
     #: loading; every code path that seals a contract sets it explicitly.
+    #: The ``comment=`` restates what ``a4c7e2b9d1f3`` already applied to the
+    #: database. It is metadata only and changes no DDL; declaring it keeps this
+    #: model an accurate description of a migrated schema so ``alembic check``
+    #: reports real drift instead of a column whose description it thinks absent.
     fulfillment_profile: Mapped[str] = mapped_column(
-        String(64), nullable=False, server_default="calendar_meeting"
+        String(64),
+        nullable=False,
+        server_default="calendar_meeting",
+        comment="which deterministic fulfillment evaluator answers this contract",
     )
     allowed_tools: Mapped[list[str]] = mapped_column(
         JSONB, default=list, nullable=False

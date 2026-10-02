@@ -1,0 +1,12 @@
+# The scheduler is a POSIX shell script and a crontab. Both are executed by
+# /bin/sh on a Linux host, where a stray carriage return is not whitespace: it
+# becomes part of the command name, and the job dies with "\r: not found" on
+# every run -- after it was installed, scheduled, and reported as working.
+#
+# Git's autocrlf applies on checkout, so on a Windows contributor's machine
+# these files would silently acquire CRLF. Pinning the line endings here makes
+# the working tree correct regardless of each developer's core.autocrlf, and
+# keeps the shebang and the cron command intact.
+*.sh text eol=lf
+*.cron text eol=lf
+deploy/scheduler/** text eol=lf

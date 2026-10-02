@@ -1,0 +1,277 @@
+# Alert rules for KAI.
+#
+# Scope: this file is the *rules*. It is not a monitoring system, and KAI
+# contains no notification code. Loading this file requires a Prometheus that
+# already scrapes KAI's metrics endpoint; delivering the alerts requires a
+# notification target that already exists in the deployment. See
+# docs/ALERTING.md for both wirings.
+#
+#   promtool check rules deploy/alerting/kai-alerts.yml
+#
+# ---------------------------------------------------------------------------
+# On thresholds
+# ---------------------------------------------------------------------------
+# KAI has never run under production traffic, so there is no historical
+# baseline to fit. Two rules were used instead of invented numbers:
+#
+#   1. Prefer a *ratio of the service's own activity* over an absolute count.
+#      `failed / (completed + failed)` and `5xx / requests` are correct at any
+#      traffic level, including ten requests a minute and ten thousand. An
+#      absolute threshold cannot be, which is why there are so few of them.
+#
+#   2. Where no denominator exists (auth failures, rate-limit rejections there
+#      is no "auth successes" counter), the threshold is derived from a
+#      configured limit rather than guessed. AUTH_RATE_LIMIT_REQUESTS defaults
+#      to 10 per 60 seconds *per client*, so no single legitimate client can
+#      produce more than 0.17/s. The aggregates below sit an order of magnitude
+#      above that, which is the reasoning behind their numbers.
+#
+# Every threshold here is a starting point and is expected to be tuned against
+# real traffic. What must not change is the *shape*: a single transient failure
+# is never sufficient to fire anything. Sustained conditions only.
+#
+# ---------------------------------------------------------------------------
+# On false positives
+# ---------------------------------------------------------------------------
+# Each rule carries a `for:` long enough that one 500, one provider timeout, one
+# failed login, one rate-limited request, or one overlapping purge window cannot
+# fire it. Overlap in particular is not a fault at all: the purge returns exit 0
+# when another run holds the advisory lock, so it can never reach a rule here.
+#
+# ---------------------------------------------------------------------------
+# On `job`
+# ---------------------------------------------------------------------------
+# The `job` label is matched against `kai`. If the scrape config names the job
+# something else, change it in one place: the `KAI_JOB` value below is not
+# substitutable inside an expression, so the selector is written to tolerate
+# either the exact name or a prefix, via `job=~"kai.*"`.
+#
+# ---------------------------------------------------------------------------
+# There is deliberately no purge rule in this file
+# ---------------------------------------------------------------------------
+# kai_revocation_purge_runs_total is recorded by the purge *process*, into that
+# process's own CollectorRegistry, which is destroyed when the process exits.
+# Nothing scrapes it, so a rule written against it would evaluate `absent()`
+# forever - permanently blind while looking like coverage.
+#
+# The purge expressions are written, promtool-checked and kept in
+# kai-alerts.scheduler-pending.yml, which is deliberately NOT loaded. They become
+# loadable when a Pushgateway is wired. Until then, purge alerting runs on the
+# job's exit code and its log records; docs/ALERTING.md gives those rules.
+#
+# What any future purge rule must keep: result="failed" is a fault and
+# result="lock_not_acquired" is NOT. An overlapping run exits 0 and must never
+# page anyone.
+
+groups:
+  - name: kai-availability
+    interval: 30s
+    rules:
+      - alert: KaiApplicationDown
+        expr: up{job=~"kai.*"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: KAI is not responding to scrapes
+          description: >-
+            Prometheus has failed to scrape KAI for 2 minutes. The process is
+            down, or the metrics endpoint is unreachable from the scrape
+            network. Check the container and the readiness endpoint.
+
+      - alert: KaiProcessShuttingDown
+        expr: kai_process_up == 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: KAI reports itself as not serving
+          description: >-
+            The process answered a scrape but reports kai_process_up = 0, so it
+            has shut down or has not finished starting. A normal deploy shows
+            this briefly; persisting means startup is failing after the socket
+            is already open.
+
+      - alert: KaiMetricsEndpointUnavailable
+        expr: absent(kai_process_up)
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: KAI metrics are not being scraped at all
+          description: >-
+            No kai_process_up series exists. Either METRICS_ENABLED is false, in
+            which case the route is deliberately not mounted, or the scrape job
+            is broken. Every other rule in this file is blind while this is true.
+
+      - alert: KaiReadinessFailing
+        expr: >-
+          sum(rate(kai_http_requests_total{route="/api/v1/health",status_class="5xx"}[5m])) > 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: KAI readiness is failing
+          description: >-
+            /api/v1/health returns 5xx, which means the database does not answer.
+            The endpoint reports 200 only when the database is reachable, so this
+            is a database-availability signal arriving through the health path.
+
+      - alert: KaiPersistentServerErrors
+        expr: >-
+          sum(rate(kai_http_5xx_total[5m]))
+          / clamp_min(sum(rate(kai_http_requests_total[5m])), 0.001) > 0.05
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: KAI is returning sustained 5xx responses
+          description: >-
+            More than 5% of requests have failed with a server error for 10
+            minutes. Expressed as a ratio, so it means the same thing at any
+            traffic level, and the 10-minute window keeps a single 500 from
+            firing it.
+
+  - name: kai-database
+    interval: 30s
+    rules:
+      - alert: KaiDatabaseErrors
+        expr: sum(rate(kai_db_errors_total[5m])) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: KAI is seeing sustained database errors
+          description: >-
+            Database errors have not stopped for 10 minutes. This fires on a
+            sustained rate and not on a single failed statement, because a
+            transient error during a failover is normal and self-correcting.
+
+      - alert: KaiDatabaseUnavailable
+        expr: >-
+          sum(rate(kai_db_errors_total[5m])) / clamp_min(sum(rate(kai_http_requests_total[5m])), 0.001) > 0.25
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: KAI cannot reach its database
+          description: >-
+            A quarter of all requests are failing at the database layer. Total
+            unavailability also takes the scrape down and is caught by
+            KaiApplicationDown.
+
+  - name: kai-authentication-abuse
+    interval: 30s
+    rules:
+      - alert: KaiAuthFailureSpike
+        # 5/s sustained. A single client is rate limited at 10 per 60s
+        # (0.17/s), so 5/s is ~30x one client's ceiling and is aggregate across
+        # all clients: credential stuffing, not a user mistyping a password.
+        expr: >-
+          sum(rate(kai_auth_failures_total{reason="bad_credentials"}[5m])) > 5
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: Sustained authentication failures
+          description: >-
+            Failed logins have exceeded 5/s for 10 minutes. A single mistyped
+            password cannot reach this; a distributed attempt can.
+
+      - alert: KaiRateLimitRejectionSpike
+        # 10/s sustained against a 10-per-60s-per-client limit.
+        expr: >-
+          sum(rate(kai_auth_rate_limit_rejections_total{reason="exceeded"}[5m])) > 10
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: Sustained rate-limit rejections
+          description: >-
+            Auth endpoints are rejecting more than 10 requests/s for 10 minutes.
+            This is either credential stuffing or a client stuck in a retry loop.
+
+      - alert: KaiRateLimitBackendUnavailable
+        # reason="backend_unavailable" is an infrastructure fault, not abuse:
+        # the Redis counter store is unreachable, so limits are not being
+        # enforced at all. Split from the rule above because the response is
+        # different - this one is fixed by restoring Redis, not by blocking anyone.
+        expr: >-
+          sum(rate(kai_auth_rate_limit_rejections_total{reason="backend_unavailable"}[5m])) > 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: Rate limiting is not being enforced
+          description: >-
+            The rate-limit backend is unavailable, so the auth endpoints are not
+            enforcing any limit. Production refuses to start without Redis, so
+            this means Redis became unreachable after startup.
+
+      - alert: KaiRevokedTokenReuse
+        # reason="revoked" means a token was presented after being revoked.
+        # That is either a stolen token being replayed, or a purge that deleted
+        # a revocation too early - the second being a security defect in KAI
+        # itself, which is why this is worth a distinct signal.
+        expr: >-
+          sum(rate(kai_auth_failures_total{reason="revoked"}[10m])) > 0.5
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: Revoked access tokens are being presented
+          description: >-
+            Tokens that were revoked are still being sent. Treat as credential
+            theft until the purge is shown to be correct: a purge that deletes
+            unexpired revocations would allow a logged-out token to work again.
+
+  - name: kai-providers
+    interval: 30s
+    rules:
+      - alert: KaiProviderFailureSpike
+        # Denominator is the provider call count from the latency histogram's
+        # _count series, so this is a real error ratio rather than an absolute
+        # error rate.
+        expr: >-
+          sum(rate(kai_provider_errors_total[10m]))
+          / clamp_min(sum(rate(kai_provider_latency_seconds_count[10m])), 0.001) > 0.2
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: Provider calls are failing at a high rate
+          description: >-
+            Over 20% of Google or planner calls have failed for 15 minutes. A
+            single provider timeout does not reach this.
+
+      - alert: KaiProviderLatencyDegraded
+        expr: >-
+          histogram_quantile(0.95, sum(rate(kai_provider_latency_seconds_bucket[10m])) by (le)) > 5
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: Provider latency is degraded
+          description: >-
+            95th percentile provider latency is above 5s for 15 minutes. Tasks
+            will start timing out before requests begin failing, so this fires
+            before KaiProviderFailureSpike.
+
+  - name: kai-task-execution
+    interval: 30s
+    rules:
+      - alert: KaiTaskFailureSpike
+        expr: >-
+          sum(rate(kai_tasks_failed_total[15m]))
+          / clamp_min(
+              sum(rate(kai_tasks_completed_total[15m]))
+              + sum(rate(kai_tasks_failed_total[15m])),
+              0.001) > 0.25
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: A quarter of all tasks are failing
+          description: >-
+            Task failure ratio has exceeded 25% for 15 minutes. Expressed as a
+            ratio against tasks actually run, so a quiet hour cannot fire it.

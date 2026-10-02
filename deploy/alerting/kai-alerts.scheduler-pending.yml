@@ -1,0 +1,92 @@
+# Purge alert rules that are NOT currently loadable.
+#
+# Do NOT point your rule_files glob at this file. It is kept here, and kept
+# syntax-checked by tests/test_alerting_rules.py, so the expressions are ready
+# the moment the blocker below is resolved. Loading it today produces rules that
+# can never fire, which is worse than having no rule: it looks like coverage.
+#
+# ---------------------------------------------------------------------------
+# The blocker
+# ---------------------------------------------------------------------------
+# kai_revocation_purge_runs_total and kai_revocation_purged_rows_total are
+# recorded by the purge process itself, into the CollectorRegistry that process
+# builds for itself. The purge is a one-shot job: it records, logs, and exits,
+# and the registry dies with it. No scraper ever sees those series.
+#
+# This is inherent to the agreed design - an external scheduler runs a one-shot
+# command, and the application process never owns the schedule. It is not a bug
+# to be fixed in KAI, and it is why purge observability currently rests on the
+# job's exit code and its log records instead.
+#
+# Two ways to make these rules loadable, in order of preference:
+#
+#   A. Point Prometheus at the log pipeline (Loki, Elastic, CloudWatch) and use
+#      the log-based rules in docs/ALERTING.md. No code change, no new service,
+#      and it also covers the crash-and-never-log case, which an exit code does
+#      not. This is what the shipped documentation recommends.
+#
+#   B. Add a Pushgateway: set PUSHGATEWAY_URL in the purge process, have it push
+#      its registry before exiting, and scrape the gateway. Then merge this
+#      file's groups into kai-alerts.yml. This is a deployment change, not a
+#      change to KAI's semantics, and it needs a new dependency in the image.
+#
+# ---------------------------------------------------------------------------
+# Semantics these rules must keep
+# ---------------------------------------------------------------------------
+# result="failed" is a fault. result="lock_not_acquired" is NOT: the purge
+# returns exit 0 when another run holds the advisory lock, because two windows
+# overlapping is the scheduler working. Neither rule below selects on
+# result="lock_not_acquired", and neither should ever be edited to.
+
+groups:
+  - name: kai-scheduler-pending
+    interval: 30s
+    rules:
+      - alert: KaiPurgeRepeatedlyFailing
+        # Two failures in an hour. One is a transient database blip worth
+        # looking at; a second inside the hour means revoked_tokens is growing
+        # without bound and needs a human.
+        expr: sum(increase(kai_revocation_purge_runs_total{result="failed"}[1h])) >= 2
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: The revocation purge is repeatedly failing
+          description: >-
+            The purge failed two or more times in an hour, so revoked_tokens
+            grows without bound. Check the database and the job's log records.
+
+      - alert: KaiPurgeStoppedRunning
+        # Scheduled every 15 minutes, so 45 minutes is three missed windows.
+        # `result=~"purged|nothing_expired"` counts only runs that actually
+        # reached the delete, which is the point: a job that keeps failing has
+        # also "stopped running" as far as the table is concerned, and this
+        # rule says so without needing a success counter.
+        expr: >-
+          sum(increase(kai_revocation_purge_runs_total{result=~"purged|nothing_expired"}[45m])) < 1
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: The revocation purge has stopped running
+          description: >-
+            No purge reached its delete step in 45 minutes, which is three
+            missed 15-minute windows. Either the schedule is not installed or
+            every run is failing.
+
+      - alert: KaiPurgeNoLongerDeleting
+        # The same failure seen from the other side: rows stop being reclaimed.
+        # Only meaningful once something has been revoked, so the rate() form
+        # avoids firing on an install that has never had a logout.
+        expr: >-
+          rate(kai_revocation_purged_rows_total[1h]) == 0
+          and increase(kai_revocation_purge_runs_total{result="purged"}[2h]) == 0
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: The purge runs but deletes nothing
+          description: >-
+            The purge has reported success for two hours and deleted no rows.
+            Either nothing has expired yet, which is benign, or the delete
+            predicate has stopped matching, which is not.

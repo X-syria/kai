@@ -1,0 +1,48 @@
+# Scheduled jobs for KAI.
+#
+# Install with:
+#
+#   crontab deploy/scheduler/kai.cron
+#
+# or, to keep it out of the user crontab entirely:
+#
+#   sudo install -m 0644 deploy/scheduler/kai.cron /etc/cron.d/kai
+#
+# Check it loaded, without installing:
+#
+#   crontab deploy/scheduler/kai.cron -l
+#
+# ---------------------------------------------------------------------------
+# Timezone
+# ---------------------------------------------------------------------------
+# CRON_TZ is honoured by Vixie cron, Debian/Ubuntu cron and cronie. It is NOT
+# honoured by busybox crond, which is what Alpine and most container base
+# images ship. The line below is therefore documentation-first: if your cron
+# ignores it, the schedule still runs every 15 minutes, just not aligned to UTC.
+#
+# That degradation is bounded and is the reason this job is specified at a 15
+# minute cadence rather than a fixed wall-clock time. Every real-world UTC
+# offset is a whole number of quarter-hours, so `*/15 * * * *` fires exactly
+# every 15 minutes in any timezone. Only the phase against absolute UTC moves.
+# The purge itself is timezone-independent: it deletes on `expires_at <= now()`
+# against a `timestamptz` column, so no run depends on the host clock's zone.
+#
+# Every timezone-named zone below is set for the *command environment* as well,
+# so the timestamps the job logs are UTC regardless of what the scheduler does
+# with CRON_TZ.
+# ---------------------------------------------------------------------------
+SHELL=/bin/sh
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+#: Where this repository is checked out. Change this one line.
+KAI_HOME=/opt/kai
+
+#: The Compose project the deployment runs under. The purge must reach the same
+#: database as the running app; a mismatch here creates a second, empty stack
+#: that purges nothing and looks like it worked.
+COMPOSE_PROJECT_NAME=kai
+
+#: Set once per run rather than exported globally, so `docker compose` picks up
+#: the deployment's .env (its real secrets) without this file containing any.
+#: Every run is also timed out, so a wedged database cannot overlap the next one.
+*/15 * * * * TZ=UTC KAI_COMPOSE_PROJECT_NAME=$COMPOSE_PROJECT_NAME cd $KAI_HOME && TZ=UTC ./deploy/scheduler/run-purge-revocations.sh >> $KAI_HOME/var/purge-scheduler.log 2>&1
