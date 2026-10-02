@@ -497,7 +497,10 @@ def test_no_dml_or_setattr_path_can_write_the_column() -> None:
     assert offenders == [], f"a DML path names the column: {offenders}"
 
     migrations = sorted((REPO / "alembic" / "versions").glob("*.py"))
-    assert len(migrations) == 11, f"unexpected migration count: {len(migrations)}"
+    # 12 = the original 11 plus ``d4e5f6a7b8c9_add_revoked_tokens``, which adds
+    # the access-token revocation table. The count is asserted so an *unintended*
+    # migration cannot appear unnoticed; a new one has to be declared here.
+    assert len(migrations) == 12, f"unexpected migration count: {len(migrations)}"
     declaring = [p for p in migrations if "'identities'," in p.read_text(encoding="utf-8")]
     assert len(declaring) == 1, f"expected one migration to declare the column: {declaring}"
     text = declaring[0].read_text(encoding="utf-8")
@@ -987,8 +990,10 @@ def test_this_round_changed_no_semantics() -> None:
     # Gmail stays unlicensed for live sealing.
     assert frozenset({"calendar_meeting"}) == LIVE_SEALABLE_PROFILES
 
-    # No new migration.
-    assert len(list((REPO / "alembic" / "versions").glob("*.py"))) == 11
+    # The identity round itself added no migration. The twelfth file is
+    # ``d4e5f6a7b8c9_add_revoked_tokens`` from the later security round, which
+    # declares an access-token revocation table and touches no identity column.
+    assert len(list((REPO / "alembic" / "versions").glob("*.py"))) == 12
 
     # The conflict rule is the same object, untouched: the round changed no semantics, so
     # it is referenced rather than restated.

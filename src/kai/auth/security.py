@@ -29,6 +29,15 @@ def verify_password(password: str, encoded: str) -> bool:
         algo, n, r, p, salt_b64, digest_b64 = encoded.split("$")
         if algo != _ALGO:
             return False
+        # The stored hash is trusted to describe a hash this service produced.
+        # Without a floor, a row whose parameters were weakened to n=2 (or a
+        # hand-edited value far above _N) would be verified as-is: a downgrade
+        # to a near-zero cost makes every stored password cheap to crack
+        # offline, and a huge n turns verification into a CPU-exhaustion
+        # primitive on the unauthenticated login route. Reject anything that
+        # is not exactly the cost this module hashes at.
+        if (int(n), int(r), int(p)) != (_N, _R, _P):
+            return False
         salt = base64.b64decode(salt_b64)
         expected = base64.b64decode(digest_b64)
         actual = hashlib.scrypt(

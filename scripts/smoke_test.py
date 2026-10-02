@@ -28,7 +28,7 @@ HEALTH_URL = "http://127.0.0.1:8000/api/v1/health"
 REGISTER_URL = "http://127.0.0.1:8000/api/v1/auth/register"
 DB_NAME = "kai_smoke"
 DB_USER = "kai"
-EXPECTED_HEAD = "c8e1f3a5b7d9"
+EXPECTED_HEAD = "d4e5f6a7b8c9"
 
 failures: list[str] = []
 
@@ -73,6 +73,21 @@ def psql(sql: str, database: str) -> str:
         ["docker", "exec", "kai-db-1", "psql", "-U", DB_USER, "-d", database, "-t", "-A", "-c", sql]
     )
     return result.stdout.strip()
+
+
+def _status(request: urllib.request.Request) -> int:
+    """Return the HTTP status of ``request``, treating any HTTP error as a status.
+
+    A 401 or 429 is the expected outcome in several gates here, so an
+    ``HTTPError`` is a result rather than a failure of the probe.
+    """
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            return int(response.status)
+    except urllib.error.HTTPError as exc:
+        return int(exc.code)
+    except OSError:
+        return 0
 
 
 def main() -> int:
@@ -165,10 +180,14 @@ def main() -> int:
     request = urllib.request.Request(
         REGISTER_URL, data=payload, headers={"Content-Type": "application/json"}
     )
+    register_token: str | None = None
     try:
         with urllib.request.urlopen(request, timeout=15) as response:
             if response.status == 201:
                 ok(f"register returned 201 for {email}")
+                register_token = json.loads(response.read()).get("access_token")
+                if not register_token:
+                    fail("register returned no access_token")
             else:
                 fail(f"register returned {response.status}, expected 201")
     except urllib.error.HTTPError as exc:
@@ -176,9 +195,46 @@ def main() -> int:
     except OSError as exc:
         fail(f"register could not be reached: {exc}")
 
-    # 7. Restart and persist ---------------------------------------------------
+    # 7. Security: logout really revokes --------------------------------------
+    # Asserted over real HTTP against the running container, because the point
+    # of revocation is that a request presenting a revoked token is refused; a
+    # helper-level check would not prove the middleware ever sees it.
+    name_of[0] = "revocation"
+    step("7. Logout revokes the access token")
+    if register_token is None:
+        fail("cannot test revocation: registration did not return a token")
+    else:
+        auth = {"Authorization": f"Bearer {register_token}"}
+        me_url = "http://127.0.0.1:8000/api/v1/auth/me"
+        logout_url = "http://127.0.0.1:8000/api/v1/auth/logout"
+
+        before = _status(urllib.request.Request(me_url, headers=auth))
+        if before == 200:
+            ok("token authenticates before logout")
+        else:
+            fail(f"token was rejected before logout (HTTP {before})")
+
+        out = _status(urllib.request.Request(logout_url, data=b"", headers=auth))
+        if out == 200:
+            ok("logout accepted")
+        else:
+            fail(f"logout returned HTTP {out}, expected 200")
+
+        after = _status(urllib.request.Request(me_url, headers=auth))
+        if after == 401:
+            ok("revoked token is refused afterwards")
+        else:
+            fail(f"revoked token still authenticated (HTTP {after}, expected 401)")
+
+        revoked_rows = psql("SELECT count(*) FROM revoked_tokens;", DB_NAME)
+        if revoked_rows and revoked_rows.strip() not in ("", "0"):
+            ok("revocation persisted in the database")
+        else:
+            fail("no revoked_tokens row was written")
+
+    # 8. Restart and persist ---------------------------------------------------
     name_of[0] = "persistence"
-    step("7. Restart and confirm state survives")
+    step("8. Restart and confirm state survives")
     before = psql("SELECT count(*) FROM users;", DB_NAME)
     run(COMPOSE + ["restart", "app"])
     if not wait_for_health():

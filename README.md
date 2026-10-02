@@ -5,8 +5,12 @@ Governed Agent Runtime for trusted personal AI agents.
 KAI's identity is a **Governed Agent Runtime**: the model proposes, deterministic
 and human authorities decide. It is not a general workflow engine.
 
-**Deployment status: Deployment-Ready. Not Production-Ready.** See
-[Known production gaps](#known-production-gaps) before exposing this to users.
+**Deployment status: Deployment-Ready, with production hardening applied to the
+minimum viable set.** Authentication, authorization, rate limiting, revocation,
+CORS and TrustedHost are enforced and tested. Remaining gaps — chiefly metrics
+export and the test-tree typing debt — are listed under
+[Known production gaps](#known-production-gaps). Read it before exposing this
+to users.
 
 ## Documentation
 
@@ -171,20 +175,63 @@ internally included routers. Developer utility; not used at runtime or in CI.
 - Cross-tenant access denied at the application layer (see `tests/test_tenant_isolation.py`).
 - Structured JSON logs; no secrets/logged tokens.
 
+## Security controls
+
+The following are enforced in code and covered by tests in
+`tests/test_security_hardening.py`.
+
+- **Rate limiting on unauthenticated auth routes.** `/api/v1/auth/login` and
+  `/api/v1/auth/register` are limited per source address
+  (`AUTH_RATE_LIMIT_REQUESTS` per `AUTH_RATE_LIMIT_WINDOW_SECONDS`). Production
+  refuses to start on the in-memory store, because a per-process counter is not a
+  limit once more than one replica sits behind a load balancer; Redis is required
+  there. If the limiter's store is unreachable the route fails closed with 429
+  rather than silently becoming unlimited.
+- **Access-token revocation.** Tokens carry a `jti`. `POST /api/v1/auth/logout`
+  records it in `revoked_tokens` and the token stops authenticating immediately
+  instead of at expiry. Revocation is per token, so signing out one device does
+  not sign the account out everywhere. Expired records can be purged
+  (`purge_expired_revocations`) and are safe to purge: a record only ever
+  outlives a token that expiry already rejects.
+- **Account deactivation is enforced.** `is_active` is checked on login and on
+  every authenticated request. It used to be reported by `/auth/me` and enforced
+  nowhere, so suspending an account did not stop a token already in hand.
+- **Login does not disclose account existence.** Password verification runs even
+  when no such account exists, so the response time does not distinguish a
+  registered email from an unknown one, and both failures return one identical
+  body. Unauthenticated 401s never say whether a token was forged, expired,
+  revoked, or belonged to a deactivated account.
+- **JWT verification is strict.** The signing algorithm is checked against a
+  closed allowlist (`HS256/384/512`); production refuses `none` or an asymmetric
+  algorithm. `exp`, `iat`, `sub`, `jti`, `iss` and `aud` are all required, so a
+  token that omits `exp` cannot be treated as non-expiring. Production refuses a
+  `JWT_SECRET` shorter than 32 characters.
+- **CORS and TrustedHost are configurable and fail safe.** `CORS_ALLOWED_ORIGINS`
+  is empty by default (no cross-origin access) and `*` is refused in production
+  because it is incompatible with credentialed requests. `TRUSTED_HOSTS` rejects
+  requests whose `Host` is not listed. Both accept a comma-separated or JSON
+  list, and an unset variable means "not configured" rather than a boot failure.
+- **Passwords.** Registration and login both bound the password to 128
+  characters, so the unauthenticated scrypt path cannot be turned into a CPU
+  exhaustion primitive by an oversized body. Verification rejects any stored
+  hash whose scrypt parameters are not the ones this service writes, so a
+  downgraded work factor cannot be accepted.
+
 ## Known production gaps
 
-Deployment-Ready is not Production-Ready. These are open, and none of them are
-closed by a passing test suite:
+These are open, and none of them are closed by a passing test suite:
 
-- **No rate limiting or request-size limits.** `/api/v1/auth/register` and
-  `/login` are unauthenticated and unthrottled.
-- **No CORS or TrustedHost middleware.** The API is same-origin only as shipped;
-  adding a browser front-end requires configuring both explicitly.
-- **JWT has no refresh or revocation.** Tokens live for
-  `JWT_ACCESS_TOKEN_MINUTES` (default 120) with no deny-list, so logout does not
-  invalidate an issued token and secret rotation is the only global kill switch.
 - **No request correlation or metrics export.** Failures are logged as structured
-  JSON, but there is no tracing, no Prometheus endpoint, and no alerting hook.
+  JSON with a per-request `X-Request-ID`, but there is no tracing, no Prometheus
+  endpoint, and no alerting hook.
+- **Rate limiting is per source address, and `X-Forwarded-For` is ignored.**
+  Behind a proxy, every client shares the proxy's address, so the limit applies
+  per proxy. Honouring the header without a trusted proxy would let any client
+  mint a fresh rate-limit identity per request. Terminate the limit at a proxy
+  that already does this if you need per-client limits.
+- **Access tokens cannot be refreshed.** There is no refresh token; a client
+  re-authenticates when its access token expires. Revocation makes expiry
+  enforceable early, but it does not extend session length.
 - **Tests are outside the type-check gate.** `mypy src tests` reports 196
   findings, all in tests, none in `src`; tightening them is separate work. Every
   test still runs in CI.

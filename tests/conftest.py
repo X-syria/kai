@@ -40,6 +40,21 @@ def google_settings(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest_asyncio.fixture(autouse=True)
+async def _reset_rate_limits() -> AsyncIterator[None]:
+    """Drop rate-limit counters between tests.
+
+    The limiter keeps process-global state (that is the whole point of the
+    in-memory store), so without this a test that exhausts an auth budget
+    would make the next test fail for a reason that has nothing to do with it.
+    """
+    from kai.security.ratelimit import reset_store
+
+    reset_store()
+    yield
+    reset_store()
+
+
+@pytest_asyncio.fixture(autouse=True)
 async def _clean_state() -> AsyncIterator[None]:
     """Start every test from the same empty database, done for real."""
     from sqlalchemy import text
@@ -50,7 +65,8 @@ async def _clean_state() -> AsyncIterator[None]:
                 "TRUNCATE TABLE tenants, users, google_accounts, tasks, task_plans,"
                 " approvals, approval_rule_suggestions, runtime_executions,"
                 " memory_entries,"
-                " memory_preferences RESTART IDENTITY CASCADE"
+                " memory_preferences, revoked_tokens"
+                " RESTART IDENTITY CASCADE"
             )
         )
     yield
@@ -60,7 +76,8 @@ async def _clean_state() -> AsyncIterator[None]:
                 "TRUNCATE TABLE tenants, users, google_accounts, tasks, task_plans,"
                 " approvals, approval_rule_suggestions, runtime_executions,"
                 " memory_entries,"
-                " memory_preferences RESTART IDENTITY CASCADE"
+                " memory_preferences, revoked_tokens"
+                " RESTART IDENTITY CASCADE"
             )
         )
 

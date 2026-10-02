@@ -9,6 +9,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    func,
 )
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -47,6 +48,40 @@ class User(PKMixin, TenantMixin, TimestampMixin, Base):
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
 
     tenant: Mapped["Tenant"] = relationship("Tenant", back_populates="users")
+
+
+class RevokedToken(Base):
+    """A single access token that was explicitly invalidated before expiry.
+
+    Keyed by the token's ``jti`` (JWT id). Signing out cannot un-sign a token
+    that is already in someone's hands, so revocation works by recording the
+    id and refusing it on every subsequent decode. ``expires_at`` mirrors the
+    token's own ``exp`` so a revoked id is only meaningful until the token
+    would have expired anyway, which lets the row be purged without ever
+    revoking a token that is already invalid.
+    """
+
+    __tablename__ = "revoked_tokens"
+
+    jti: Mapped[str] = mapped_column(String(64), primary_key=True)
+    user_id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    tenant_id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("tenants.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+    revoked_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
 
 
 class GoogleAccount(PKMixin, TenantMixin, TimestampMixin, Base):
