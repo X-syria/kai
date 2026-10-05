@@ -2932,3 +2932,112 @@ def test_the_audit_columns_are_nullable_so_history_is_left_unclaimed() -> None:
     nullable = asyncio.run(_nullable())
     assert set(nullable) == set(AUDIT_COLUMNS), nullable
     assert all(nullable.values()), nullable
+
+
+async def test_an_orphan_left_by_a_crash_is_never_created_a_second_time(
+    client: httpx.AsyncClient,
+    backend: GoogleBackend,
+) -> None:
+    """The refusal still holds when the orphan is real, not only when none exists.
+
+    This extends ``test_crash_after_create_before_persist_never_duplicates``, which
+    reproduces the same crash window but resumes against an *empty* provider. That
+    proves the runtime refuses redispatch, but it leaves one thing unasserted: that the
+    refusal still holds when the provider genuinely does hold the event the crashed
+    attempt created. Here the orphan is already there before recovery starts, so "no
+    second insert" is checked in the only state in which a duplicate was ever possible.
+
+    Nothing about the mechanism differs. The single use was committed before dispatch,
+    so the resumed attempt is refused at the approval boundary and never reaches the
+    provider. The orphan KAI cannot see is precisely why parking for a human is the
+    correct answer rather than a retry: the runtime is not choosing caution over
+    progress here, it is unable to tell the two situations apart at all.
+    """
+    from kai.approvals.models import Approval
+    from kai.runtime.models import RuntimeExecution
+    from tool_harness import event_payload
+
+    token, task_id, approval_id = await _ready_task(client, "khaled@example.com")
+    await _approve(client, token, approval_id)
+
+    # The same crash window: the single use is spent, the create step was never
+    # persisted, and the worker's claim was abandoned.
+    async with async_session_factory() as session:
+        approval = (
+            await session.execute(
+                select(Approval).where(Approval.id == UUID(approval_id))
+            )
+        ).scalar_one()
+        approval.consumed_at = datetime.now(UTC)
+        row = (
+            await session.execute(
+                select(RuntimeExecution).where(
+                    RuntimeExecution.task_id == UUID(task_id)
+                )
+            )
+        ).scalar_one()
+        row.cursor = 2
+        await session.commit()
+    await _set_claim(task_id, claimed_at=datetime.now(UTC) - timedelta(minutes=30))
+
+    # The external half of the crash, which the sibling test leaves empty: the event the
+    # crashed attempt created really exists at the provider, and KAI holds no receipt
+    # for it. Built through the harness's own payload helper, so a duplicate would be
+    # indistinguishable from the orphan.
+    orphan_id = "created-event-orphan"
+    backend.created_events[orphan_id] = event_payload(
+        event_id=orphan_id,
+        summary="weekly sync",
+        start="2026-10-12T16:00:00",
+        end="2026-10-12T17:00:00",
+        timezone=TIMEZONE,
+        attendees=(ATTENDEE_EMAIL,),
+    )
+    assert len(backend.created_events) == 1
+    # Seeding the orphan directly must not look like a dispatch: the harness only
+    # advances this counter inside the create POST handler, so it measures "the provider
+    # was never asked" independently of what the provider already holds.
+    assert backend.next_event_id == 1, backend.next_event_id
+
+    before = await _row(task_id)
+    before_creates = _create_attempts(await _inspect(client, token, task_id))
+
+    resumed = await _trigger(client, token, task_id)
+
+    # The established refusal semantics, unchanged by the orphan being present.
+    assert resumed["task_state"] == "REQUIRES_ATTENTION", resumed
+    assert "INDETERMINATE" in resumed["message"], resumed
+    assert await _audit_row(UUID(task_id)) == (
+        "calendar_meeting",
+        "calendar_meeting:v1",
+        "INDETERMINATE",
+    )
+
+    # No redispatch, measured at the provider rather than inferred from the refusal.
+    assert backend.next_event_id == 1, "the create POST must never be dispatched"
+
+    # The orphan is still alone. This is the assertion the sibling test cannot make:
+    # recovery did not re-dispatch, so it added nothing beside what was already there.
+    assert list(backend.created_events) == [orphan_id], backend.created_events
+    assert len(backend.created_events) == 1
+
+    # The attempt is on record as a refusal rather than swallowed, and the cursor was
+    # not rewound -- identical to the empty-provider case.
+    after = await _row(task_id)
+    assert after[0] == before[0] == 2
+    assert after[1] == before[1] + 1
+    assert after[2] == before[2] + 1
+    blocked = _create_attempts(await _inspect(client, token, task_id))
+    assert len(blocked) == len(before_creates) + 1
+    assert not blocked[-1]["ok"]
+    assert all(not entry["ok"] for entry in blocked)
+
+    # Replay stays refused, and the orphan is still the only event.
+    replay = await client.post(
+        f"{API_PREFIX}/runtime/tasks/{task_id}/trigger",
+        headers=_auth(token),
+    )
+    assert replay.status_code == 409, replay.text
+    assert (await _inspect(client, token, task_id))["task_state"] == "REQUIRES_ATTENTION"
+    assert backend.next_event_id == 1, backend.next_event_id
+    assert list(backend.created_events) == [orphan_id], backend.created_events
