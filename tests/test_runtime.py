@@ -2081,12 +2081,24 @@ async def test_crash_after_create_before_persist_never_duplicates(
     before_creates = _create_attempts(await _inspect(client, token, task_id))
 
     resumed = await _trigger(client, token, task_id)
-    assert resumed["task_state"] == "FAILED", resumed
-    assert "STALE" in resumed["message"]
+    assert resumed["task_state"] == "REQUIRES_ATTENTION", resumed
+    # The reason is now the verdict the evaluator reached, not a message invented
+    # at the crash site: the runtime settles an unknown through the same single
+    # settlement path every other verdict uses, so the durable audit triple says
+    # INDETERMINATE rather than the task merely ending up parked.
+    assert "INDETERMINATE" in resumed["message"], resumed
+
+    assert await _audit_row(UUID(task_id)) == (
+        "calendar_meeting",
+        "calendar_meeting:v1",
+        "INDETERMINATE",
+    )
 
     # No second insert, no cursor rollback, and the blocked attempt is
     # recorded rather than swallowed: one more step and one more evidence
-    # record, both describing the denial.
+    # record, both describing the denial. The task is parked rather than
+    # reported FAILED, because a spent approval and a lost receipt cannot say
+    # whether the provider already accepted the event.
     assert backend.created_events == {}
     after = await _row(task_id)
     assert after[0] == before[0] == 2
@@ -2103,8 +2115,80 @@ async def test_crash_after_create_before_persist_never_duplicates(
         headers=_auth(token),
     )
     assert replay.status_code == 409, replay.text
-    assert (await _inspect(client, token, task_id))["task_state"] == "FAILED"
+    assert (await _inspect(client, token, task_id))["task_state"] == "REQUIRES_ATTENTION"
     assert backend.created_events == {}
+
+
+async def test_a_lost_answer_is_re_derived_identically_after_a_crash(
+    client: httpx.AsyncClient,
+    backend: GoogleBackend,
+) -> None:
+    """Recovery reaches the same verdict, and still never calls the provider.
+
+    The undetermined verdict is not remembered, it is re-derived: the task is put
+    back into ``VERIFYING`` as if it had died between the transition and the
+    settlement, and the recorded audit triple is deliberately corrupted first. A
+    recovery that obeyed the record would return the wrong verdict from it; this
+    one overwrites it with the same answer, which is what makes the triple an
+    artifact rather than a second source of truth.
+    """
+    from kai.approvals.models import Approval
+    from kai.runtime.models import RuntimeExecution
+    from kai.tasks.models import Task
+
+    token, task_id, approval_id = await _ready_task(client, "khaled@example.com")
+    await _approve(client, token, approval_id)
+
+    async with async_session_factory() as session:
+        approval = (
+            await session.execute(
+                select(Approval).where(Approval.id == UUID(approval_id))
+            )
+        ).scalar_one()
+        approval.consumed_at = datetime.now(UTC)
+        row = (
+            await session.execute(
+                select(RuntimeExecution).where(
+                    RuntimeExecution.task_id == UUID(task_id)
+                )
+            )
+        ).scalar_one()
+        row.cursor = 2
+        await session.commit()
+    await _set_claim(task_id, claimed_at=datetime.now(UTC) - timedelta(minutes=30))
+
+    parked = await _trigger(client, token, task_id)
+    assert parked["task_state"] == "REQUIRES_ATTENTION", parked
+    assert backend.created_events == {}
+    before_creates = len(backend.created_events)
+
+    # Rewind to the window between the transition and the settlement, and leave a
+    # verdict that disagrees with the evidence behind.
+    async with async_session_factory() as session:
+        row = (
+            await session.execute(
+                select(RuntimeExecution).where(
+                    RuntimeExecution.task_id == UUID(task_id)
+                )
+            )
+        ).scalar_one()
+        row.fulfillment_verdict = "FULFILLED"
+        task = (
+            await session.execute(select(Task).where(Task.id == UUID(task_id)))
+        ).scalar_one()
+        task.state = "VERIFYING"
+        await session.commit()
+    await _set_claim(task_id, claimed_at=datetime.now(UTC) - timedelta(minutes=30))
+
+    recovered = await _trigger(client, token, task_id)
+    assert recovered["task_state"] == "REQUIRES_ATTENTION", recovered
+    assert await _audit_row(UUID(task_id)) == (
+        "calendar_meeting",
+        "calendar_meeting:v1",
+        "INDETERMINATE",
+    )
+    # Re-deriving the verdict must not re-drive the step that lost its answer.
+    assert len(backend.created_events) == before_creates
 
 
 def datetime_parse(raw: str) -> datetime:

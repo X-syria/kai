@@ -117,7 +117,12 @@ from kai.runtime.fulfillment import (
     gmail_send_criteria,
 )
 from kai.runtime.models import RuntimeExecution
-from kai.runtime.schemas import GoalSubmission, UnderstandingOutput
+from kai.runtime.schemas import (
+    EXTERNAL_OUTCOME,
+    EXTERNAL_OUTCOME_UNKNOWN,
+    GoalSubmission,
+    UnderstandingOutput,
+)
 from kai.runtime.translator import (
     CAPABILITY_TO_TOOL,
     build_slice_contract,
@@ -150,8 +155,13 @@ from kai.tasks.state import (
     is_terminal,
 )
 from kai.tools.context import ToolContext
+from kai.tools.definition import VerificationContract
+from kai.tools.errors import (
+    APPROVAL_STALE,
+    is_unresolved_external,
+)
 from kai.tools.gateway import ToolGateway
-from kai.tools.result import ToolOutcome
+from kai.tools.result import ToolOutcome, ToolResult
 
 _RESUMABLE_STATES: frozenset[str] = frozenset(
     {
@@ -831,6 +841,13 @@ class AgentRuntime:
                     record = evidence_from_observation(observation, tool_name=tool_name)
                     record["ir_program_id"] = str(program.program_id)
                     record["ir_fingerprint"] = program.fingerprint
+                    if _external_outcome_unestablished(self.gateway, result):
+                        # What the runtime concluded about the provider's
+                        # side, kept apart from the error code that says why
+                        # the gateway refused. Written before the branch below
+                        # so the conclusion is durable even if this process
+                        # dies next.
+                        record[EXTERNAL_OUTCOME] = EXTERNAL_OUTCOME_UNKNOWN
                     evidence.append(record)
                     row.evidence = list(evidence)
                     row.steps_used = steps_used
@@ -869,6 +886,48 @@ class AgentRuntime:
                         result.outcome is not ToolOutcome.EXECUTION_SUCCEEDED
                         or not result.ok
                     ):
+                        if _external_outcome_unestablished(self.gateway, result):
+                            # The approval that authorised this write is spent
+                            # (or the provider never answered), so the step
+                            # cannot run again, and nothing durable says whether
+                            # it already did. Retrying is refused by the gateway
+                            # and asserting failure is a guess, so the honest
+                            # answer is INDETERMINATE: park for a human to
+                            # reconcile instead of reporting a failure the
+                            # provider may already have contradicted.
+                            #
+                            # The verdict is not asserted here. The task moves to
+                            # VERIFYING and the one settlement path decides, from
+                            # the durable log, whether the lost answer matters:
+                            # a witness may still prove the intent, in which case
+                            # this completes rather than parks. That keeps
+                            # "which evaluator concluded what" true on a recovery
+                            # exactly as it is on the live path.
+                            await self._fence_execution(
+                                session,
+                                task_id=task.id,
+                                tenant_id=task.tenant_id,
+                                claim=claim,
+                            )
+                            await transition_task(
+                                session,
+                                task_id=task.id,
+                                tenant_id=task.tenant_id,
+                                user_id=task.user_id,
+                                target=VERIFYING,
+                            )
+                            record_result(
+                                program,
+                                result="REQUIRES_ATTENTION",
+                                reason="external outcome was never recorded",
+                            )
+                            return await self._settle_verification(
+                                session,
+                                task=task,
+                                row=row,
+                                scenario=scenario,
+                                claim=claim,
+                            )
                         message = result.message or f"tool {tool_name} did not succeed"
                         target = (
                             "REQUIRES_ATTENTION"
@@ -1480,6 +1539,53 @@ def _read_slot_items(
             continue
         intervals.extend(parse_free_intervals((entry.get("data") or {}).get("free")))
     return intervals
+
+
+def _external_outcome_unestablished(
+    gateway: ToolGateway, result: ToolResult
+) -> bool:
+    """Did this run of a side-effecting tool end without a knowable outcome?
+
+    Three things have to hold, and the first two are the ones that keep the
+    layers apart:
+
+    * the tool **changes the world**, per its declared ``verification_contract``;
+    * and either the provider's answer did not settle what happened
+      (:func:`kai.tools.errors.is_unresolved_external` -- dispatched with no
+      complete response, or a 5xx that does not say whether the write was
+      applied); **or** the approval's single use was already spent, which means
+      an earlier attempt reached the point of dispatch and left no receipt.
+
+    **``APPROVAL_STALE`` is an authorization fact, not an outcome, and the two
+    are not the same claim.** The gateway consumes an approval immediately
+    *before* dispatch, so the refusal this invocation received provably stopped
+    *this* invocation before the provider was reached -- no side effect was
+    attempted here. What it does not establish is what the *earlier* attempt that
+    held the same single use did. That earlier attempt left no durable record at
+    all, so this process can neither confirm nor exclude that a side effect
+    occurred.
+
+    Because that inference spans two attempts rather than describing this one,
+    it is written as its own conclusion under :data:`EXTERNAL_OUTCOME` rather than
+    being smuggled into the error taxonomy. A reader can then tell a refusal
+    from an unresolved world without interpreting anything.
+
+    A provably-never-contacted provider is excluded: no bytes left the process,
+    so nothing is unknown about the world. So is a 4xx: the provider rejected the
+    request, which for a write is positive evidence that it did not apply.
+    """
+    if not (
+        is_unresolved_external(result.error_code)
+        or result.error_code == APPROVAL_STALE
+    ):
+        return False
+    registry = getattr(gateway, "registry", None)
+    if registry is None:
+        return False
+    definition = registry.get_if_present(result.tool_name)
+    if definition is None:
+        return False
+    return definition.verification_contract is not VerificationContract.READ_BACKED
 
 
 def _fulfillment_outcome(

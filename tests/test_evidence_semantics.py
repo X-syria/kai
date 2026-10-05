@@ -615,6 +615,13 @@ def test_the_model_cannot_be_widened_into_a_generic_evidence_language() -> None:
     ``Witness`` type with a payload per domain. That is a schema decision nobody
     has made, and a shared evidence vocabulary across domains has its own
     authority questions. This is a closed predicate over one tool.
+
+    ``undetermined_creations`` is the one name Phase 6 added, and it is here
+    only because it is *narrower* than a generic vocabulary rather than a step
+    towards one: it reads the same single tool, returns the same single record
+    shape the log already holds, and answers a question about one domain. It is
+    the complement of ``qualifying_creations``, not a second kind of witness, and
+    ``QualifyingCreation`` is still exactly two fields.
     """
     from kai.runtime import evidence as module
 
@@ -624,6 +631,7 @@ def test_the_model_cannot_be_widened_into_a_generic_evidence_language() -> None:
         "QualifyingCreation",
         "qualifying_creation",
         "qualifying_creations",
+        "undetermined_creations",
     }
     assert not {
         "Evidence",

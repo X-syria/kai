@@ -109,6 +109,7 @@ from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any, Final
 
+from kai.runtime.schemas import EXTERNAL_OUTCOME, EXTERNAL_OUTCOME_UNKNOWN
 from kai.tools.result import ToolOutcome
 
 __all__ = [
@@ -116,6 +117,7 @@ __all__ = [
     "QualifyingCreation",
     "qualifying_creation",
     "qualifying_creations",
+    "undetermined_creations",
 ]
 
 #: The one tool whose successful, verified, provider-identified attempts are what
@@ -229,6 +231,36 @@ def qualifying_creations(evidence: Iterable[Any]) -> tuple[QualifyingCreation, .
         witness
         for witness in (qualifying_creation(record) for record in evidence)
         if witness is not None
+    )
+
+
+def undetermined_creations(evidence: Iterable[Any]) -> tuple[Mapping[str, Any], ...]:
+    """The attempts to create whose external outcome KAI could not establish.
+
+    The complement of :func:`qualifying_creations`, and kept as its own set
+    rather than a flag on a witness. A creation attempt KAI cannot account for is
+    neither evidence that a meeting exists nor evidence that it does not; folding
+    it into the witness set would let an unknown be counted as either, and
+    dropping it would let an unknown be forgotten.
+
+    **Selection is by ``external_outcome``, never by ``error_code``.** The runtime
+    writes that field as its own conclusion after deciding that a side-effecting
+    run ended without a knowable outcome; ``error_code`` reports why the gateway
+    returned what it returned, which is a different question. In particular
+    ``APPROVAL_STALE`` is an authorization refusal and does not appear here: the
+    gateway consumes an approval immediately before dispatch, so that refusal
+    provably stopped the invocation before the provider was reached.
+
+    Scoped to :data:`MEETING_CREATION_TOOL` for the same reason
+    :func:`qualifying_creation` is scoped to it: a read KAI could not complete
+    says nothing about whether a meeting was created.
+    """
+    return tuple(
+        record
+        for record in evidence
+        if isinstance(record, Mapping)
+        and record.get("tool") == MEETING_CREATION_TOOL
+        and record.get(EXTERNAL_OUTCOME) == EXTERNAL_OUTCOME_UNKNOWN
     )
 
 

@@ -119,7 +119,11 @@ from typing import Any, Final, Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from kai.runtime.evidence import QualifyingCreation, qualifying_creations
+from kai.runtime.evidence import (
+    QualifyingCreation,
+    qualifying_creations,
+    undetermined_creations,
+)
 from kai.runtime.schemas import MeetingWindow
 from kai.runtime.send_evidence import QualifyingSend, qualifying_sends
 from kai.tasks.schemas import FulfillmentProfile
@@ -594,20 +598,30 @@ def evaluate_calendar_meeting(inputs: FulfillmentInput) -> FulfillmentVerdict:
     "a qualifying witness" cannot mean one thing to this evaluator and another to
     the code that decides which created event to read back.
 
-    This evaluator never returns ``INDETERMINATE``: every check is a decidable
-    comparison over durable scalars, and the runtime only enters ``VERIFYING``
-    once every action has succeeded, so on this domain the question always has
-    an answer. The value is implemented, routed, and reachable from the state
-    machine — no live path on this domain produces it, which is a property of the
-    domain rather than a gap in the binding.
+    **``INDETERMINATE`` is reserved for exactly one thing: a lost provider
+    answer.** Every criterion check here is a decidable comparison over durable
+    scalars, so the criteria themselves are never what is undecidable. What can
+    be is whether a creation happened at all, when the run lost the provider's
+    answer — an attempt whose single-use approval was spent and whose receipt
+    was never recorded, or a call that timed out with no response at all. The
+    witness set is then empty *for a reason that is not evidence of absence*, so
+    this evaluator returns ``INDETERMINATE`` rather than reading that emptiness
+    as ``NOT_FULFILLED``. The undetermined set comes from
+    :func:`undetermined_creations`, so the distinction is drawn from the durable
+    log rather than from anything this function infers.
     """
     qualifying = qualifying_creations(inputs.evidence)
+    undetermined = undetermined_creations(inputs.evidence)
 
-    # The empty set is an answer, not a gap. No verified meeting was ever
-    # created, so the "an event was created" condition is known to be false. That
-    # is ``NOT_FULFILLED``, never the empty ``all()`` reading as vacuous truth,
-    # and never ``INDETERMINATE``: nothing here is undecidable.
+    # The empty set is normally an answer, not a gap: no verified meeting was
+    # ever created, so the "an event was created" condition is known to be false.
+    # That is ``NOT_FULFILLED``, never the empty ``all()`` reading as vacuous
+    # truth. The single exception is an empty set sitting alongside a lost
+    # answer, where emptiness means "nobody recorded it" and not "it did not
+    # happen".
     if not qualifying:
+        if undetermined:
+            return FulfillmentVerdict.INDETERMINATE
         return FulfillmentVerdict.NOT_FULFILLED
 
     criteria = inputs.criteria.for_calendar_meeting()
@@ -622,6 +636,12 @@ def evaluate_calendar_meeting(inputs: FulfillmentInput) -> FulfillmentVerdict:
     for created in qualifying:
         if _meeting_satisfies_criteria(created, criteria=criteria):
             return FulfillmentVerdict.FULFILLED
+    # Proof outranks an unknown. A witness that satisfies every criterion settles
+    # the question however many other attempts went unanswered, because the
+    # question is whether such a meeting *exists*, not whether every attempt
+    # concluded. Only when no witness settles it can a lost answer decide.
+    if undetermined:
+        return FulfillmentVerdict.INDETERMINATE
     return FulfillmentVerdict.NOT_FULFILLED
 
 

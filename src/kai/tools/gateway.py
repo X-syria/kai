@@ -66,6 +66,7 @@ from kai.tools.context import ToolContext
 from kai.tools.definition import ToolDefinition
 from kai.tools.errors import (
     ACCOUNT_REQUIRED,
+    APPROVAL_STALE,
     CONTEXT_MISMATCH,
     RESERVED_ARGUMENT,
     TASK_UNRESOLVED,
@@ -158,7 +159,9 @@ class ToolGateway:
                 if approval.decision is ApprovalDecision.EXPIRED:
                     return self._denied(intent, tool, risk, approval)
                 if approval.decision is ApprovalDecision.STALE:
-                    return self._denied(intent, tool, risk, approval)
+                    return self._denied(
+                        intent, tool, risk, approval, APPROVAL_STALE
+                    )
                 # APPROVED: exact-intent binding was re-verified by the hash
                 # inside the manager's check; the single use is consumed below
                 # only once this invocation is actually about to execute.
@@ -419,6 +422,7 @@ class ToolGateway:
         tool: ToolDefinition | None,
         risk: RiskLevel,
         decision: Any,
+        error_code: str | None = None,
     ) -> ToolResult:
         return ToolResult(
             tool_name=tool.name if tool is not None else intent.tool_name,
@@ -428,6 +432,7 @@ class ToolGateway:
             risk_level=risk,
             message=str(decision),
             request_id=intent.request_id,
+            error_code=error_code,
         )
 
     @staticmethod

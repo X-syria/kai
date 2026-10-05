@@ -22,7 +22,7 @@ addresses stay inside the runtime (see :func:`redact_evidence` and
 from __future__ import annotations
 
 from datetime import date, time
-from typing import Literal, Self
+from typing import Final, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -135,6 +135,31 @@ class TriggerResponse(BaseModel):
     message: str
     approval_ids: list[str] = Field(default_factory=list)
     steps_used: int = 0
+
+
+#: The key under which the runtime records **its own conclusion** about what
+#: happened on the provider's side, for a side-effecting run whose outcome it
+#: could not establish.
+#:
+#: It is a separate field from ``error_code`` because the two answer different
+#: questions and must never be read as one:
+#:
+#: * ``error_code`` says **why the gateway returned what it returned** -- an
+#:   authorization refusal, a schema rejection, an unresolved provider answer.
+#:   ``APPROVAL_STALE`` is such a code, and it is an authorization fact: the
+#:   gateway consumes an approval immediately *before* dispatch, so that refusal
+#:   provably stopped the invocation before the provider was reached.
+#: * this key says **what the runtime concluded about the external world**. The
+#:   only value it ever takes is that the world is unestablished.
+#:
+#: Deriving the second from the first is the mistake this replaces: it made
+#: "this invocation was not permitted" indistinguishable from "a side effect may
+#: have occurred", and would let a policy refusal be reported as an undecidable
+#: external outcome. Living here, beside the record shape it annotates, it is
+#: readable by the evidence predicates without importing the runtime that writes
+#: it.
+EXTERNAL_OUTCOME: Final = "external_outcome"
+EXTERNAL_OUTCOME_UNKNOWN: Final = "UNKNOWN"
 
 
 class RuntimeEvidenceEntry(BaseModel):
