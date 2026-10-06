@@ -18,6 +18,7 @@ from contextlib import contextmanager
 from datetime import UTC, date, datetime, timedelta
 from typing import Final
 from uuid import UUID, uuid4
+from zoneinfo import ZoneInfo
 
 import httpx
 import pytest
@@ -44,6 +45,7 @@ from kai.runtime.models import RuntimeExecution
 from kai.runtime.schemas import UnderstandingOutput
 from kai.runtime.service import (
     RuntimeFatal,
+    _external_outcome_unestablished,
     _fulfillment_outcome,
     next_action_for,
 )
@@ -54,6 +56,7 @@ from kai.tasks.state import (
     COMPLETED,
     CREATED,
     ESCALATE,
+    EXECUTING,
     FAILED,
     REQUIRES_ATTENTION,
     RETRY,
@@ -62,7 +65,16 @@ from kai.tasks.state import (
     WAITING_APPROVAL,
     WAITING_EXTERNAL,
 )
-from tool_harness import GoogleBackend, contact_payload, insert_account
+from kai.tools.definition import VerificationContract
+from kai.tools.errors import (
+    APPROVAL_STALE,
+    PROVIDER_ERROR,
+    PROVIDER_NOT_CONTACTED,
+    PROVIDER_SERVER_ERROR,
+    PROVIDER_UNREACHABLE,
+)
+from kai.tools.result import RiskLevel, ToolOutcome, ToolResult
+from tool_harness import GoogleBackend, contact_payload, insert_account, make_gateway
 
 API_PREFIX: Final = "/api/v1"
 
@@ -442,7 +454,8 @@ async def test_happy_path_with_approval(
     for entry in evidence:
         assert entry["ir_action_id"] == entry["request_id"]
         assert entry["ir_action_id"].startswith("runtime-")
-    # The public projection stays redacted: no IR internals cross the boundary.
+    # The public projection stays redacted: no IR internals cross the boundary
+    # except the one content hash that makes a verdict auditable.
     assert all(
         set(record) == {
             "step_order",
@@ -452,9 +465,17 @@ async def test_happy_path_with_approval(
             "verified",
             "error_code",
             "request_id",
+            "ir_fingerprint",
+            "external_outcome",
         }
         for record in done["evidence"]
     )
+    # The published hash is the same one persisted, so the public view and the
+    # durable record agree on which sealed plan ran.
+    published = {record["ir_fingerprint"] for record in done["evidence"]}
+    assert published == {entry["ir_fingerprint"] for entry in evidence}
+    # The program *instance* id stays internal: content is what is auditable.
+    assert all("ir_program_id" not in record for record in done["evidence"])
 
 
 async def test_the_runtime_follows_the_programs_control_flow(
@@ -1646,6 +1667,76 @@ async def test_the_sealed_criteria_never_reach_a_new_evaluator_through_the_tool_
     )
 
 
+async def test_the_governed_runtime_cannot_reach_a_send_however_it_is_widened(
+    client: httpx.AsyncClient,
+    backend: GoogleBackend,
+) -> None:
+    """The Gmail ambiguous-outcome window is closed by never being opened.
+
+    ``gmail.send`` *is* a registered tool with a ``READ_AFTER_SEND`` contract, so
+    the Gateway would classify a lost answer from it as an unresolved external
+    outcome exactly as it does for ``calendar.create_event``, and
+    :mod:`kai.runtime.send_evidence` already implements the send-witness
+    boundary and the ``INDETERMINATE`` verdict for a lost answer. All of that is
+    correct and all of it is unreachable, which is a different fact and the one
+    that matters here: there is no provider mutation to duplicate, because the
+    governed runtime cannot dispatch a send at all.
+
+    Three independent seals close it, and this test widens the narrowest one it
+    can reach from the outside. The task row's ``allowed_tools`` is written
+    directly -- the strongest widening available, since it is the field
+    :func:`rule_allowed_tools` trusts -- and a send is still not dispatched,
+    because the IR's capability vocabulary is the slice's own and gmail has no
+    capability in it. The other two seals are asserted as constants because a
+    test cannot force the planner to plan something the slice cannot name.
+
+    The provider is the assertion, not the policy verdict. ``gmail_send_calls``
+    counts requests the fake Gmail actually received, so a refusal recorded as a
+    4xx and a send that happened would both be visible here and only one is
+    acceptable.
+    """
+    from kai.runtime.translator import (
+        CAPABILITY_TO_TOOL,
+        SLICE_ALLOWED_TOOLS,
+        SLICE_FULFILLMENT_PROFILE,
+    )
+
+# The seals the planner and the evaluator answer to.
+    assert "gmail.send" not in SLICE_ALLOWED_TOOLS
+    assert "gmail.send" not in set(CAPABILITY_TO_TOOL.values())
+    assert SLICE_FULFILLMENT_PROFILE == "calendar_meeting"
+
+    token, task_id, approval_id = await _ready_task(client, "khaled@example.com")
+    await _approve(client, token, approval_id)
+
+    async with async_session_factory() as session:
+        task = await session.get(Task, UUID(task_id))
+        assert task is not None
+        task.allowed_tools = [*list(task.allowed_tools), "gmail.send"]
+        await session.commit()
+
+    settled = await _trigger(client, token, task_id)
+
+    # Nothing was ever sent. Counted at the provider, on both its counters.
+    assert settled["outcome"] == "COMPLETED", settled
+    assert backend.gmail_send_calls == [], "the runtime dispatched a Gmail send"
+    assert backend.sent_messages == {}, backend.sent_messages
+    assert backend.send_raw is None
+
+    # And no send attempt is on the durable log to be mistaken for a witness.
+    logged = {
+        entry["tool"] for entry in (await _inspect(client, token, task_id))["evidence"]
+    }
+    assert "gmail.send" not in logged, logged
+
+    # The verdict came from the calendar evaluator, as the sealed profile says.
+    assert await _audit_row(UUID(task_id)) == (
+        "calendar_meeting",
+        CALENDAR_MEETING_EVALUATOR_VERSION,
+        "FULFILLED",
+    )
+
+
 # ----------------------------------------------------------------------------------
 # next_action: one mapping, derived from the state machine
 # ----------------------------------------------------------------------------------
@@ -1694,6 +1785,87 @@ async def test_a_task_waiting_on_someone_else_says_wait(
     assert snapshot["task_state"] == "WAITING_EXTERNAL"
     assert snapshot["next_action"] == "WAIT"
     assert backend.created_events == {}
+
+
+async def test_waiting_external_is_inert_even_for_a_reclaimable_stale_claim(
+    client: httpx.AsyncClient,
+    backend: GoogleBackend,
+) -> None:
+    """The one state named for an unresolved external answer cannot be driven.
+
+    ``WAITING_EXTERNAL`` reads like the state an ambiguous provider outcome
+    should park in, and it is not. Nothing in the runtime writes it: there is
+    no ``transition_task(..., target=WAITING_EXTERNAL)`` anywhere, and the
+    ``ToolOutcome.WAITING_EXTERNAL`` that would be the natural trigger for one
+    is declared in :mod:`kai.tools.result` and mapped as transient in
+    :mod:`kai.tools.errors` but produced by no adapter. So this test does not
+    ask the runtime to reach the state -- that would be a test of an
+    assumption. It places a task there the only way anything actually could,
+    by writing the row, and then establishes what the state *does* when it
+    exists.
+
+    Three claims are pinned, and each one is about a way this state could
+    quietly cause a duplicate or a lie:
+
+    1. It is not resumable. ``_RESUMABLE_STATES`` excludes it, so a trigger
+       refuses rather than re-driving the step that is supposedly waiting.
+    2. A stale, reclaimable claim does not change that. The trigger *does*
+       take the claim -- the check for ownership happens before the check for
+       resumability -- so this is the case where the takeover machinery runs
+       and still must not reach a provider. This is the assertion that would
+       move if claim reclamation ever started short-circuiting the refusal.
+    3. It cannot be reported as fulfilled. Nothing settles a task in this
+       state, so the audit triple stays null and the state is unchanged: not
+       ``COMPLETED``, not ``FAILED``. Absence of evidence is not turned into
+       either a success or a failure here.
+
+    It also cannot reach ``EXECUTING`` from where it sits, which
+    ``test_waiting_external_does_not_resume_by_re_executing`` pins directly on
+    the table; asserting it here too would only restate that in a second place.
+    """
+    token, task_id, approval_id = await _ready_task(client, "khaled@example.com")
+    await _approve(client, token, approval_id)
+
+    async with async_session_factory() as session:
+        task = await session.scalar(select(Task).where(Task.id == UUID(task_id)))
+        assert task is not None
+        task.state = WAITING_EXTERNAL
+        await session.commit()
+
+    # A claim this old is reclaimable by the next trigger, which is what makes
+    # the takeover path below actually run rather than being short-circuited.
+    await _set_claim(task_id, claimed_at=datetime.now(UTC) - timedelta(minutes=30))
+    assert (await _row(task_id))[3] == 1, "the stale claim must be present to be stolen"
+
+    dispatches_before = backend.next_event_id
+
+    resp = await client.post(
+        f"{API_PREFIX}/runtime/tasks/{task_id}/trigger",
+        headers=_auth(token),
+    )
+    assert resp.status_code == 409, resp.text
+
+    # The provider was never asked, before or after the claim handover.
+    assert backend.next_event_id == dispatches_before, backend.next_event_id
+    assert backend.created_events == {}, backend.created_events
+
+    # Still exactly where it was: not a success, and not a failure either.
+    assert await _task_state(task_id) == WAITING_EXTERNAL
+    assert await _audit_row(UUID(task_id)) == (None, None, None)
+
+    snapshot = await _inspect(client, token, task_id)
+    assert snapshot["task_state"] == "WAITING_EXTERNAL"
+    assert snapshot["next_action"] == "WAIT"
+
+    # Repeating the attempt changes nothing, and still never reaches a provider.
+    again = await client.post(
+        f"{API_PREFIX}/runtime/tasks/{task_id}/trigger",
+        headers=_auth(token),
+    )
+    assert again.status_code == 409, again.text
+    assert backend.next_event_id == dispatches_before, backend.next_event_id
+    assert await _task_state(task_id) == WAITING_EXTERNAL
+    assert await _audit_row(UUID(task_id)) == (None, None, None)
 
 
 async def test_a_resumed_task_does_not_understand_itself_twice(
@@ -2196,6 +2368,163 @@ def datetime_parse(raw: str) -> datetime:
 
 
 # ----------------------------------------------------------------------------------
+# R?: a spent approval may only park a write, never a read
+# ----------------------------------------------------------------------------------
+
+
+def _lost_answer(tool_name: str, error_code: str) -> ToolResult:
+    """A tool run that never learned what the provider did."""
+    return ToolResult(
+        tool_name=tool_name,
+        outcome=ToolOutcome.EXECUTION_FAILED,
+        ok=False,
+        verified=False,
+        risk_level=RiskLevel.MEDIUM,
+        error_code=error_code,
+        message="the provider never answered",
+        request_id="req-lost",
+    )
+
+
+@pytest.mark.parametrize(
+    "error_code",
+    [
+        APPROVAL_STALE,
+        PROVIDER_UNREACHABLE,
+        PROVIDER_SERVER_ERROR,
+    ],
+)
+@pytest.mark.parametrize(
+    "tool_name",
+    ["calendar.create_event", "gmail.send"],
+)
+def test_a_world_changing_tool_is_parked_when_its_outcome_is_unestablished(
+    tool_name: str, error_code: str
+) -> None:
+    """Every write in the catalog parks when the external world is unestablished.
+
+    Three different failures, one consequence. ``PROVIDER_UNREACHABLE`` means the
+    request went out and no answer came back. ``PROVIDER_SERVER_ERROR`` means the
+    provider failed *after* accepting, which does not say whether it committed.
+    ``APPROVAL_STALE`` means this invocation was refused before dispatch — but the
+    approval's single use was already spent, so an *earlier* attempt reached the
+    point of dispatch and left no receipt. None of them is a refusal of the write,
+    so none may be reported as one.
+    """
+    gateway, _ = make_gateway()
+    assert (
+        _external_outcome_unestablished(gateway, _lost_answer(tool_name, error_code))
+        is True
+    )
+
+
+@pytest.mark.parametrize(
+    "error_code",
+    [
+        PROVIDER_NOT_CONTACTED,
+        PROVIDER_ERROR,
+    ],
+)
+def test_a_write_is_not_parked_when_the_outcome_is_already_known(
+    error_code: str,
+) -> None:
+    """The overreach guard: not every failure on a write is an unknown one.
+
+    A connection that was never established is positive knowledge that the
+    provider never received the request, and a 4xx is positive knowledge that the
+    provider declined it. Parking either would tell a human that the external
+    world is undecidable when KAI actually knows what happened, and would bury a
+    plain misconfiguration behind ``REQUIRES_ATTENTION``.
+    """
+    gateway, _ = make_gateway()
+    assert (
+        _external_outcome_unestablished(
+            gateway, _lost_answer("calendar.create_event", error_code)
+        )
+        is False
+    )
+
+
+@pytest.mark.parametrize(
+    "tool_name",
+    [
+        "contacts.match",
+        "calendar.read_slots",
+        "calendar.get_event",
+        "gmail.search",
+        "gmail.read",
+    ],
+)
+def test_a_read_only_tool_is_never_an_unknown_outcome(tool_name: str) -> None:
+    """Repeating a read is harmless, so a lost answer stays a plain failure.
+
+    This is the guard against the fix overreaching: if every lost answer were
+    parked, an ordinary read timeout would be reported to a human as
+    "undecidable" when nothing about the world is in doubt at all.
+    """
+    gateway, _ = make_gateway()
+    assert (
+        _external_outcome_unestablished(gateway, _lost_answer(tool_name, APPROVAL_STALE))
+        is False
+    )
+    definition = gateway.registry.get_if_present(tool_name)
+    assert definition is not None
+    assert definition.verification_contract is VerificationContract.READ_BACKED
+
+
+def test_a_provider_refusal_is_an_answer_and_not_an_unknown_outcome() -> None:
+    """A negative response is a result; only a lost answer is undetermined.
+
+    Without this the fix would swallow real provider failures on writes and
+    report them as undecidable, which is the same error in the opposite
+    direction: asserting doubt where the record is certain.
+    """
+    gateway, _ = make_gateway()
+    assert (
+        _external_outcome_unestablished(
+            gateway, _lost_answer("calendar.create_event", PROVIDER_ERROR)
+        )
+        is False
+    )
+
+
+def test_a_successful_run_is_never_an_unknown_outcome() -> None:
+    """No error code means no lost answer, however the run ended."""
+    gateway, _ = make_gateway()
+    result = ToolResult(
+        tool_name="calendar.create_event",
+        outcome=ToolOutcome.EXECUTION_SUCCEEDED,
+        ok=True,
+        verified=True,
+        risk_level=RiskLevel.MEDIUM,
+        request_id="req-ok",
+    )
+    assert _external_outcome_unestablished(gateway, result) is False
+
+
+def test_an_unknown_or_absent_tool_is_not_an_unknown_outcome() -> None:
+    """Only a real catalog entry can be left undetermined."""
+    gateway, _ = make_gateway()
+    assert (
+        _external_outcome_unestablished(
+            gateway, _lost_answer("calendar.delete_everything", APPROVAL_STALE)
+        )
+        is False
+    )
+
+    class _NoRegistry:
+        registry = None
+
+    assert (
+        _external_outcome_unestablished(
+            _NoRegistry(),  # type: ignore[arg-type]
+            _lost_answer("calendar.create_event", APPROVAL_STALE),
+        )
+        is False
+    )
+
+
+# ----------------------------------------------------------------------------------
 # R1: the cursor is bound to the plan version it counts
 # ----------------------------------------------------------------------------------
 
@@ -2491,7 +2820,9 @@ async def test_public_snapshot_never_exposes_raw_evidence_or_attendee_data(
     assert snapshot["identities"][0]["email"] == "a***@example.com"
 
     # Every published record is exactly the redacted shape: no arguments, no
-    # provider payload, no verification evidence, no free-text message.
+    # provider payload, no verification evidence, no free-text message. The one
+    # addition is the sealed plan's content hash, which is what makes a verdict
+    # auditable; it is a digest, so it cannot carry any of the content below.
     allowed = {
         "step_order",
         "tool",
@@ -2500,6 +2831,8 @@ async def test_public_snapshot_never_exposes_raw_evidence_or_attendee_data(
         "verified",
         "error_code",
         "request_id",
+        "ir_fingerprint",
+        "external_outcome",
     }
     assert snapshot["evidence"]
     for entry in snapshot["evidence"]:
@@ -2507,6 +2840,8 @@ async def test_public_snapshot_never_exposes_raw_evidence_or_attendee_data(
         # The content those removed keys held is nowhere in the publication.
         for leaked in ("args", "data", "message", "attendees", "title"):
             assert leaked not in entry
+        # The program instance id stays internal; only its content is published.
+        assert "ir_program_id" not in entry
     published = json.dumps(
         {"evidence": snapshot["evidence"], "identities": snapshot["identities"]},
         ensure_ascii=False,
@@ -2556,6 +2891,63 @@ async def test_redaction_is_presentation_only_and_internal_evidence_is_intact(
         if entry["tool"] == "calendar.get_event" and entry["ok"]
     ]
     assert verify_call, "the read-back verification call is still recorded"
+
+
+async def test_the_published_evidence_names_the_sealed_plan_that_produced_it() -> None:
+    """A verdict is auditable only if it says which sealed plan produced it.
+
+    ``ir_fingerprint`` is already persisted on every record; before this it
+    stopped at the projection, so a client could read "calendar.create_event ok"
+    with no way to tell which sealed IR it came from. Only the fingerprint
+    crosses: it is a content hash, so it discloses nothing about the arguments
+    or the provider, and it pins the plan's *content* rather than an instance.
+    """
+    from kai.runtime.schemas import redact_evidence
+
+    fingerprint = "b" * 64
+    stored = [
+        {
+            "step_order": order,
+            "tool": tool,
+            "outcome": "EXECUTION_SUCCEEDED",
+            "ok": True,
+            "verified": True,
+            "ir_fingerprint": fingerprint,
+            "ir_program_id": f"3f1c0f9a-6a1e-4f0b-9a2f-00000000000{order}",
+        }
+        for order, tool in enumerate(
+            ["calendar.read_slots", "calendar.create_event"], start=1
+        )
+    ]
+
+    published = redact_evidence(stored)
+
+    # The whole run reports one plan, so a reader can tell two executions of the
+    # same task apart from two different plans.
+    assert {entry.ir_fingerprint for entry in published} == {fingerprint}
+
+    # The instance id stays internal: it is strictly less auditable than the
+    # content hash it sits next to.
+    assert all("ir_program_id" not in entry.model_dump() for entry in published)
+
+    # A record with no plan identity publishes as None rather than being dropped
+    # or given an invented one.
+    bare = redact_evidence([{"step_order": 1, "tool": "t", "outcome": "o"}])
+    assert len(bare) == 1
+    assert bare[0].ir_fingerprint is None
+
+    # A malformed fingerprint is dropped, never echoed as-is.
+    wrong = redact_evidence(
+        [
+            {
+                "step_order": 1,
+                "tool": "t",
+                "outcome": "o",
+                "ir_fingerprint": 12345,
+            }
+        ]
+    )
+    assert wrong[0].ir_fingerprint is None
 
 
 async def test_redaction_never_widens_on_unexpected_stored_shapes() -> None:
@@ -2611,7 +3003,10 @@ async def test_redaction_never_widens_on_unexpected_stored_shapes() -> None:
         "verified",
         "error_code",
         "request_id",
+        "ir_fingerprint",
+        "external_outcome",
     }
+    assert published[0].ir_fingerprint is None
     assert "secret@example.com" not in json.dumps(
         [entry.model_dump() for entry in published]
     )
@@ -2864,7 +3259,11 @@ async def test_past_window_understanding_fails(
     token = await _register(client, "khaled@example.com")
     tenant_id, user_id = await _user_scope("khaled@example.com")
     await insert_account(tenant_id=tenant_id, user_id=user_id, email="khaled@example.com")
-    start = date.today() - timedelta(days=1)
+    # Computed in the *scenario's* timezone, not the host's. ``understand_scenario``
+    # compares against ``_today_in(timezone)``; deriving "yesterday" from the host
+    # clock makes the strict ``<`` silently not fire whenever the host date runs
+    # ahead of ``TIMEZONE`` (any local evening, or any host east of it).
+    start = datetime.now(ZoneInfo(TIMEZONE)).date() - timedelta(days=1)
     stub.understanding = _valid_understanding(
         window={
             "start_date": start.isoformat(),
@@ -3125,3 +3524,175 @@ async def test_an_orphan_left_by_a_crash_is_never_created_a_second_time(
     assert (await _inspect(client, token, task_id))["task_state"] == "REQUIRES_ATTENTION"
     assert backend.next_event_id == 1, backend.next_event_id
     assert list(backend.created_events) == [orphan_id], backend.created_events
+
+
+# ----------------------------------------------------------------------------------
+# The critical crash window, injected for real
+# ----------------------------------------------------------------------------------
+
+
+class _ProcessDied(BaseException):
+    """The runtime stopped existing. Nothing above it is allowed to catch this.
+
+    Deliberately not an ``Exception``. The failure being reproduced is a worker
+    vanishing between two durable writes, not a fault the request pipeline
+    converts into a 500: an ``Exception`` would be caught by FastAPI, answered,
+    and the process would carry on holding the very transaction whose loss is
+    under test. Only a ``BaseException`` reproduces the window faithfully --
+    the work vanishes, and the transaction goes with it.
+
+    It is still worth noticing that what comes back out is not this class. The
+    ASGI middleware runs the application inside a TaskGroup, so anything that
+    escapes the route is reassembled into a ``BaseExceptionGroup`` and finally
+    into the ``RuntimeError`` that group is reported as. The death is real; only
+    its packaging is the harness's, which is why :func:`_crashed` looks for it
+    instead of the test asserting on a type.
+    """
+
+
+def _crashed(exc: BaseException) -> bool:
+    """Whether the injected process death is anywhere in an exception tree."""
+    pending: list[BaseException] = [exc]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if isinstance(current, _ProcessDied):
+            return True
+        pending.extend(current.exceptions if isinstance(current, BaseExceptionGroup) else ())
+        for linked in (current.__cause__, current.__context__):
+            if linked is not None:
+                pending.append(linked)
+    return False
+
+
+async def _task_state(task_id: str) -> str:
+    """The committed ``Task.state``, read on a fresh session."""
+    async with async_session_factory() as session:
+        task = await session.scalar(select(Task).where(Task.id == UUID(task_id)))
+        assert task is not None
+        return task.state
+
+
+async def test_a_crash_after_the_provider_answered_never_lets_the_write_happen_twice(
+    client: httpx.AsyncClient,
+    backend: GoogleBackend,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The ambiguous window, produced by an actual crash rather than by setup.
+
+    ``test_crash_after_create_before_persist_never_duplicates`` and its orphan
+    sibling both *reconstruct* the state a crash leaves behind: the approval
+    marked consumed, the cursor moved, the create step never persisted. That is
+    the right shape for those tests and the wrong proof for this one, because
+    it presumes the post-crash database instead of deriving it. This test makes
+    the crash happen and then reads whatever the database was actually left
+    holding.
+
+    The window it opens is the one nothing can close from the inside. The
+    provider answered and applied the write; KAI then stopped existing before
+    the first durable write of the settlement. So the provider holds an event
+    that no KAI row has any record of, and the transaction that was about to
+    record it is gone. Nothing in this process can ever learn the provider's
+    event id again -- not by retrying, because retrying is the one thing that
+    would turn an unknown into a duplicate.
+
+    What has to hold is therefore not "the run completes" but the weaker and
+    more important claim: the external side effect happened exactly once, and
+    KAI says so honestly. It reports INDETERMINATE and parks for a human
+    instead of either claiming a success it cannot prove or asserting a
+    failure the provider has already contradicted.
+    """
+    token, task_id, approval_id = await _ready_task(client, "khaled@example.com")
+    await _approve(client, token, approval_id)
+
+    before = await _inspect(client, token, task_id)
+    before_row = await _row(task_id)
+    assert backend.created_events == {}, "the provider must be empty before the write"
+    # The harness numbers create POSTs from 1, so this value is 1 plus the number
+    # of times the provider was actually asked to create an event. Seeding
+    # ``created_events`` directly does not move it, which is what makes it a
+    # dispatch counter rather than a mirror of the provider's contents.
+    assert backend.next_event_id == 1, backend.next_event_id
+
+    # The seam, and it is deliberately the crudest one available: the process
+    # stops at the *first durable write after the provider answered*. Patching a
+    # named function instead would only prove that particular line is early
+    # enough, which is a fact about today's call graph and not about the window
+    # itself. Evidence reaches the database through whatever commits happen to
+    # be next -- the settlement's transition and the fence's claim renewal both
+    # commit -- so the honest boundary is "before any of them", not "before a
+    # particular one".
+    import sqlalchemy.ext.asyncio as sa_asyncio
+
+    real_commit = sa_asyncio.AsyncSession.commit
+    died = False
+
+    async def _commit_or_die(self: object, *args: object, **kwargs: object) -> None:
+        nonlocal died
+        if not died and backend.created_events:
+            died = True
+            raise _ProcessDied("worker lost after the provider answered")
+        await real_commit(self, *args, **kwargs)
+
+    monkeypatch.setattr(sa_asyncio.AsyncSession, "commit", _commit_or_die)
+
+    with pytest.raises(BaseException) as crashed:
+        await _trigger(client, token, task_id)
+    assert _crashed(crashed.value), crashed.value
+
+    # --- The crash window, as it was actually left ---
+
+    # The write happened. This is the fact that makes the situation ambiguous
+    # and the reason nothing downstream may treat it as "did not happen".
+    assert len(backend.created_events) == 1, backend.created_events
+    assert backend.next_event_id == 2, backend.next_event_id
+    orphan_id = next(iter(backend.created_events))
+
+    # ...and KAI durably knows nothing about it. The evidence existed only in
+    # the transaction that the crash took with it, so the execution envelope is
+    # byte-for-byte what it was before the provider was called.
+    after_crash = await _inspect(client, token, task_id)
+    assert _create_attempts(after_crash) == _create_attempts(before)
+    assert await _row(task_id) == before_row, (await _row(task_id), before_row)
+
+    # Absence of evidence is not proof of failure. The task is not FAILED, and
+    # it is not COMPLETED either: nothing was settled, so nothing may be
+    # reported.
+    crashed_state = await _task_state(task_id)
+    assert crashed_state not in (COMPLETED, FAILED), crashed_state
+    assert crashed_state == EXECUTING, crashed_state
+
+    # --- Recovery, against the orphan that really is there ---
+
+    monkeypatch.undo()
+
+    recovered = await _trigger(client, token, task_id)
+
+    # The honest answer, reached by the real settlement path from the real
+    # durable state -- not by re-running anything.
+    assert recovered["task_state"] == "REQUIRES_ATTENTION", recovered
+    assert "INDETERMINATE" in recovered["message"], recovered
+    assert await _audit_row(UUID(task_id)) == (
+        "calendar_meeting",
+        "calendar_meeting:v1",
+        "INDETERMINATE",
+    )
+
+    # The load-bearing assertion: the provider was never asked a second time.
+    # Measured at the provider, not inferred from the refusal above.
+    assert backend.next_event_id == 2, "the create POST must never be re-dispatched"
+    assert list(backend.created_events) == [orphan_id], backend.created_events
+
+    # And the refusal is durable: replay still cannot mutate the provider, and
+    # still cannot turn the unknown into a success.
+    replay = await client.post(
+        f"{API_PREFIX}/runtime/tasks/{task_id}/trigger",
+        headers=_auth(token),
+    )
+    assert replay.status_code == 409, replay.text
+    assert (await _inspect(client, token, task_id))["task_state"] == "REQUIRES_ATTENTION"
+    assert backend.next_event_id == 2, backend.next_event_id
+    assert len(backend.created_events) == 1

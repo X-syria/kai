@@ -1,11 +1,17 @@
-"""Calendar vertical slice endpoints.
+"""Calendar read endpoints.
 
 Every operation resolves the user's Google account through
 ``(current.tenant_id, current.user_id)`` — an ``account_id`` from another
 tenant simply does not resolve. Times are validated into explicit,
 timezone-aware datetimes; availability is candidate free slots in the request
-timezone; event creation is reported as success only after a deterministic
-read-after-create verification passes. No token or credential is ever echoed.
+timezone. No token or credential is ever echoed.
+
+**This module performs no external side effect.** Event creation was removed
+from the public API because it reached ``create_and_verify_event`` directly,
+skipping the ToolGateway — and with it policy, approval, identity resolution,
+durable evidence, audit and alerting. ``POST /calendar/events`` now answers
+``410 Gone`` and names the governed path. Calendar writes go through
+``POST /runtime/tasks``; see ``kai.runtime`` for the only execution boundary.
 """
 
 from datetime import date as date_type
@@ -14,7 +20,6 @@ from uuid import UUID
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -28,10 +33,8 @@ from kai.calendar.client import (
 from kai.calendar.models import CalendarEvent
 from kai.calendar.service import (
     AccountNotFoundError,
-    create_and_verify_event,
     list_events,
 )
-from kai.calendar.service_models import CreateEventRequest, FieldMismatch
 from kai.calendar.slots import (
     DEFAULT_DAY_END,
     DEFAULT_DAY_START,
@@ -47,13 +50,10 @@ from kai.google.deps import get_google_http_client
 router = APIRouter(prefix="/calendar", tags=["calendar"])
 
 
-class CreateEventBody(BaseModel):
-    title: str = Field(min_length=1, max_length=255)
-    date: str = Field(examples=["2026-06-24"])
-    start_time: str = Field(examples=["10:00"])
-    end_time: str = Field(examples=["11:00"])
-    timezone: str = Field(examples=["Europe/Berlin"])
-    attendees: list[EmailStr] = Field(default_factory=list, max_length=50)
+#: The single governed path to an external calendar write. Named here so a
+#: caller that used this endpoint is told where to go rather than only that it
+#: failed.
+GOVERNED_WRITE_PATH = "/runtime/tasks"
 
 
 async def _resolve_account(
@@ -87,43 +87,6 @@ def _serialize_event(event: CalendarEvent) -> dict:
         "attendees": [attendee.email for attendee in event.attendees],
     }
 
-
-def _build_create_request(body: CreateEventBody) -> CreateEventRequest:
-    try:
-        day = date_type.fromisoformat(body.date)
-    except ValueError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="date must be a valid YYYY-MM-DD date",
-        ) from exc
-    try:
-        start_time = time.fromisoformat(body.start_time)
-        end_time = time.fromisoformat(body.end_time)
-    except ValueError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="start_time/end_time must be valid HH:MM times",
-        ) from exc
-    try:
-        tz = parse_timezone(body.timezone)
-    except ValueError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
-        ) from exc
-    start = datetime.combine(day, start_time, tzinfo=tz)
-    end = datetime.combine(day, end_time, tzinfo=tz)
-    if end <= start:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="end_time must be after start_time",
-        )
-    return CreateEventRequest(
-        title=body.title.strip(),
-        start=start,
-        end=end,
-        timezone=body.timezone.strip(),
-        attendees=tuple(str(email) for email in body.attendees),
-    )
 
 
 def _serialize_availability(availability: Availability, day: date_type) -> dict:
@@ -214,64 +177,28 @@ async def calendar_slots(
     return _serialize_availability(availability, day)
 
 
+
 @router.post("/events")
-async def calendar_create_event(
-    body: CreateEventBody,
-    account_id: UUID | None = None,
-    current: User = Depends(get_current_user),
-    session: AsyncSession = Depends(get_session),
-    transport: httpx.AsyncClient = Depends(get_google_http_client),
-) -> dict:
-    account = await _resolve_account(session, current, account_id)
-    req = _build_create_request(body)
-    try:
-        outcome = await create_and_verify_event(
-            session,
-            transport,
-            account_id=account.id,
-            tenant_id=current.tenant_id,
-            req=req,
-        )
-    except AccountNotFoundError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)
-        ) from exc
-    except GoogleInvalidTokenError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED, detail=str(exc)
-        ) from exc
-    except GoogleRateLimitError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(exc)
-        ) from exc
-    except GoogleForbiddenError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)
-        ) from exc
-    except GoogleApiError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)
-        ) from exc
+async def calendar_create_event_retired() -> None:
+    """Refuse the retired direct calendar write and name the governed path.
 
-    if not outcome.verified:
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail={
-                "verified": False,
-                "mismatches": [
-                    _mismatch_payload(mismatch) for mismatch in outcome.mismatches
-                ],
-            },
-        )
-    return {
-        "verified": True,
-        "event": _serialize_event(outcome.event) if outcome.event else None,
-    }
+    This endpoint used to call ``create_and_verify_event`` directly. That made
+    it a second, ungoverned route to the same provider write the runtime
+    already performs through ``ToolGateway``: no policy, no approval, no
+    identity resolution, no durable evidence, no audit, no alerting. It is
+    kept as an explicit ``410`` rather than deleted so a caller is told where
+    the capability went instead of only receiving a bare ``404``.
 
-
-def _mismatch_payload(mismatch: FieldMismatch) -> dict:
-    return {
-        "field": mismatch.field,
-        "expected": mismatch.expected,
-        "actual": mismatch.actual,
-    }
+    It performs no external side effect, so it cannot reintroduce the bypass.
+    """
+    raise HTTPException(
+        status_code=status.HTTP_410_GONE,
+        detail={
+            "error": "direct_calendar_write_removed",
+            "reason": (
+                "this endpoint bypassed the governed execution boundary "
+                "(policy, approval, identity, evidence, audit)"
+            ),
+            "use": GOVERNED_WRITE_PATH,
+        },
+    )

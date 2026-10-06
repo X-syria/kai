@@ -226,13 +226,16 @@ def allow_decision(input: PolicyInput) -> PolicyDecision:
 def _task_allows(tool: ToolDefinition, task: Task) -> bool:
     """Whether ``task.allowed_tools`` mentions the tool.
 
-    An empty list is a contract without a capability fixture and permits any
-    application-registered tool. Otherwise the list is compared by capability
-    prefix or exact tool/capability name, mirroring the old stub semantics.
+    An empty list names no capability, so it permits none: the task contract is
+    the authority on what may be invoked, and a contract that names nothing
+    grants nothing. ``ir.build.allowed_capabilities_from_task`` already refuses
+    the same empty set for the same reason. Otherwise the list is compared by
+    capability prefix or exact tool/capability name, mirroring the old stub
+    semantics.
     """
     allowed = task.allowed_tools or ()
     if not allowed:
-        return True
+        return False
     for permitted in allowed:
         if permitted == tool.capability or permitted == tool.name:
             return True

@@ -168,11 +168,25 @@ class RuntimeEvidenceEntry(BaseModel):
     The durable record kept for resume and verification is far richer: it also
     holds the tool arguments, the provider payload, and the verification
     evidence. None of that crosses this boundary. Only the run's identity
-    (which step, which tool, which request) and its verdict are published, so
-    a client can follow *what ran and how it went* without receiving the
-    arguments it passed, the provider's response, or the attendee addresses it
-    carried. ``message`` is deliberately absent: an adapter can surface raw
-    provider text in it, and ``error_code`` is a stable application string.
+    (which step, which tool, which request, which sealed plan) and its verdict
+    are published, so a client can follow *what ran, under which approved plan,
+    and how it went* without receiving the arguments it passed, the provider's
+    response, or the attendee addresses it carried. ``message`` is deliberately
+    absent: an adapter can surface raw provider text in it, and ``error_code``
+    is a stable application string.
+
+    ``ir_fingerprint`` is the one IR field that crosses, because a verdict is
+    only auditable if it names the plan that produced it. It is a content hash
+    over the sealed program, so it discloses no argument, recipient, or provider
+    payload, and it lets a reader prove that two runs of the same task executed
+    the same plan rather than merely asserting it. ``ir_program_id`` stays
+    internal: it identifies a program *instance*, which is strictly less
+    auditable than its content, and the fingerprint already pins the content.
+
+    ``external_outcome`` is published because it changes how a reader must
+    interpret the run: it says the external result is unestablished, so a
+    failure here is not evidence that nothing happened. It is absent on every
+    ordinary run rather than defaulted, so its presence is itself the signal.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -184,6 +198,8 @@ class RuntimeEvidenceEntry(BaseModel):
     verified: bool
     error_code: str | None = None
     request_id: str | None = None
+    ir_fingerprint: str | None = None
+    external_outcome: Literal["UNKNOWN"] | None = None
 
 
 class RuntimeIdentity(BaseModel):
@@ -232,6 +248,7 @@ def redact_evidence(records: list) -> list[RuntimeEvidenceEntry]:
             continue
         error_code = record.get("error_code")
         request_id = record.get("request_id")
+        ir_fingerprint = record.get("ir_fingerprint")
         published.append(
             RuntimeEvidenceEntry(
                 step_order=step_order,
@@ -241,6 +258,9 @@ def redact_evidence(records: list) -> list[RuntimeEvidenceEntry]:
                 verified=bool(record.get("verified")),
                 error_code=error_code if isinstance(error_code, str) else None,
                 request_id=request_id if isinstance(request_id, str) else None,
+                ir_fingerprint=(
+                    ir_fingerprint if isinstance(ir_fingerprint, str) else None
+                ),
             )
         )
     return published

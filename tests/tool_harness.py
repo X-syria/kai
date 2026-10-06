@@ -290,6 +290,16 @@ async def insert_account(
         return account
 
 
+#: The capabilities ``make_task`` grants by default: every capability the sealed
+#: MVP catalog declares. The default has to *name* them, because
+#: ``policy.rules._task_allows`` is fail-closed on an empty ``allowed_tools`` —
+#: a contract naming nothing permits nothing. A test that drives a tool outside
+#: this catalog (a synthetic ``finance``/``demo``/``test`` definition) must pass
+#: its own ``allowed_tools``, so that a rule ordering below ``allowed_tools`` is
+#: the one under test rather than an allowlist refusal masking it.
+DEFAULT_ALLOWED_TOOLS: list[str] = ["calendar", "contacts", "gmail"]
+
+
 async def make_task(
     *,
     tenant_id: uuid.UUID,
@@ -307,13 +317,19 @@ async def make_task(
     allows tool execution; callers that need an earlier state pass
     ``state="CREATED"`` etc. The walk goes through real ``transition_task``
     calls so a test fixture is always in a machine-legal state.
+
+    ``allowed_tools`` defaults to :data:`DEFAULT_ALLOWED_TOOLS`, never to an
+    empty list: the empty contract is a real, refused state, so defaulting to it
+    would make every fixture task permit nothing.
     """
     contract = TaskContractInput.model_validate(
         {
             "goal": "Assist the user",
             "success_criteria": ["done"],
             "fulfillment_profile": "calendar_meeting",
-            "allowed_tools": allowed_tools or [],
+            "allowed_tools": (
+                DEFAULT_ALLOWED_TOOLS if allowed_tools is None else allowed_tools
+            ),
             "risk_policy": risk_policy,
             "deadline": deadline,
             "max_cost": max_cost,
@@ -510,6 +526,7 @@ async def session_scope() -> AsyncIterator[AsyncSession]:
 
 __all__ = [
     "ACCESS_TOKEN",
+    "DEFAULT_ALLOWED_TOOLS",
     "GoogleBackend",
     "contact_payload",
     "event_payload",

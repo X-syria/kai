@@ -193,7 +193,9 @@ async def test_manual_contract_never_claims_verification() -> None:
 
     backend = GoogleBackend()
     tenant, user = await make_tenant_user("acme@corp.example")
-    task = await make_task(tenant_id=tenant.id, user_id=user.id)
+    task = await make_task(
+        tenant_id=tenant.id, user_id=user.id, allowed_tools=["demo"]
+    )
 
     gateway, _ = make_gateway(registry=registry)
     async with session_scope() as session:
@@ -249,7 +251,9 @@ async def test_read_contract_without_provider_id_is_not_verified() -> None:
 
     backend = GoogleBackend()
     tenant, user = await make_tenant_user("acme@corp.example")
-    task = await make_task(tenant_id=tenant.id, user_id=user.id)
+    task = await make_task(
+        tenant_id=tenant.id, user_id=user.id, allowed_tools=["demo"]
+    )
 
     gateway, _ = make_gateway(registry=registry)
     async with session_scope() as session:
@@ -286,7 +290,9 @@ async def test_verified_read_claim_with_provider_id_passes() -> None:
 
     backend = GoogleBackend()
     tenant, user = await make_tenant_user("acme@corp.example")
-    task = await make_task(tenant_id=tenant.id, user_id=user.id)
+    task = await make_task(
+        tenant_id=tenant.id, user_id=user.id, allowed_tools=["demo"]
+    )
 
     gateway, _ = make_gateway(registry=registry)
     async with session_scope() as session:

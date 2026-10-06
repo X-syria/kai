@@ -11,6 +11,7 @@ adapter adds serialization and deterministic error classification.
 from __future__ import annotations
 
 from collections.abc import Mapping
+from typing import Final
 from uuid import UUID
 
 import httpx
@@ -19,6 +20,10 @@ from kai.tools.context import ToolContext
 from kai.tools.errors import (
     ACCOUNT_REQUIRED,
     NOT_IMPLEMENTED,
+    PROVIDER_ERROR,
+    PROVIDER_NOT_CONTACTED,
+    PROVIDER_SERVER_ERROR,
+    PROVIDER_UNREACHABLE,
     TRANSPORT_REQUIRED,
     ToolContextError,
     ToolExecutionError,
@@ -67,17 +72,89 @@ class AdapterBase:
         )
 
 
+#: Transport failures after which **no connection was ever established**, so the
+#: request provably never left this process.
+#:
+#: The claim is narrow and is stated as narrowly as it can be: httpx raises
+#: these when it could not obtain a usable connection to the provider endpoint,
+#: which means no request bytes were written to a socket carrying them. It is a
+#: statement about this client's socket, not about every hop in between \u2014 it
+#: assumes, correctly for a direct TLS call to a Google API, that no
+#: intermediary is buffering a request on our behalf.
+#:
+#: :data:`~kai.tools.errors.PROVIDER_NOT_CONTACTED` is therefore a *known*
+#: outcome: not an unknown one. Reporting it as unresolved would be inventing
+#: doubt about an operation that provably did not happen.
+_NOT_CONTACTED: Final = (
+    httpx.ConnectTimeout,
+    httpx.ConnectError,
+    httpx.PoolTimeout,
+    httpx.ProxyError,
+    httpx.UnsupportedProtocol,
+)
+
+#: Transport failures **after** a connection existed and bytes were being sent.
+#:
+#: Here the request may or may not have reached the provider and been applied,
+#: and nothing in this process can tell. A read timeout, a reset mid-response, or
+#: a server that hung up after acting are all indistinguishable from the client
+#: side, which is exactly why they are unresolved rather than failed.
+_DISPATCHED_UNRESOLVED: Final = (
+    httpx.ReadTimeout,
+    httpx.WriteTimeout,
+    httpx.ReadError,
+    httpx.WriteError,
+    httpx.CloseError,
+    httpx.RemoteProtocolError,
+)
+
+
 def provider_failure(
     exception: Exception,
     *,
     codes: Mapping[type[Exception], str],
-    default: str = "PROVIDER_ERROR",
+    default: str = PROVIDER_ERROR,
 ) -> ToolExecutionError:
     """Classify an integration exception into a stable adapter error code.
 
     Callers list their most specific provider errors first; ``GoogleApiError``
     (the common base) is always a reasonable fallback.
+
+    **The classification is by what can be established about the request, not by
+    which exception was raised.** Three cases are separated, because collapsing
+    any two of them asserts something this process cannot know:
+
+    1. *Never contacted* \u2014 no connection was established, so nothing was sent.
+       :data:`~kai.tools.errors.PROVIDER_NOT_CONTACTED`, a known outcome.
+    2. *Dispatched, answer unresolved* \u2014 the request went out and no complete
+       response came back, or a server error came back that does not say whether
+       the operation was applied. :data:`PROVIDER_UNREACHABLE` /
+       :data:`PROVIDER_SERVER_ERROR`.
+    3. *Answered* \u2014 the provider replied and the reply is conclusive; a 4xx is
+       the provider rejecting the request, which for a write is positive evidence
+       that it did not take effect. The caller's own codes, unchanged.
+
+    A generic :class:`httpx.TransportError` with no more specific type is treated
+    as case 2 rather than case 1: httpx names the sub-type precisely when it can,
+    and assuming the request stayed home would be the unsafe direction to be
+    wrong in.
     """
+    if isinstance(exception, _NOT_CONTACTED):
+        return ToolExecutionError(
+            str(exception), error_code=PROVIDER_NOT_CONTACTED
+        )
+    if isinstance(exception, (*_DISPATCHED_UNRESOLVED, httpx.TransportError)):
+        return ToolExecutionError(
+            str(exception), error_code=PROVIDER_UNREACHABLE
+        )
+    # A provider error that carries a 5xx was answered, but the answer does not
+    # establish whether a side effect was applied. Read from the status the client
+    # attached, never parsed back out of the message text.
+    status = getattr(exception, "status_code", None)
+    if isinstance(status, int) and status >= 500:
+        return ToolExecutionError(
+            str(exception), error_code=PROVIDER_SERVER_ERROR
+        )
     for exc_type, error_code in codes.items():
         if isinstance(exception, exc_type):
             return ToolExecutionError(str(exception), error_code=error_code)

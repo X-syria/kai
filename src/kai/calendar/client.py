@@ -29,22 +29,52 @@ MAX_EVENTS = 10_000
 
 
 class GoogleApiError(RuntimeError):
+    """A Google API request failed. Carries the HTTP status, when there was one.
+
+    ``status_code`` is what lets a caller tell a rejection from a server-side
+    failure **without parsing the message**. That distinction decides whether a
+    write can be reported as definitely-not-applied, so it has to be data rather
+    than prose: a 4xx is the provider saying no, while a 5xx says nothing about
+    whether the operation was committed before the error came back. ``None``
+    means no response was ever received, which is a third case again and not a
+    missing detail.
+    """
+
+    def __init__(self, message: str, *, status_code: int | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
+    @property
+    def is_server_failure(self) -> bool:
+        """Did the provider answer, but with an error that does not settle it?
+
+        True only for a status that exists — a 5xx. A 4xx is excluded because
+        it is a rejection, and ``None`` is excluded because there was no answer
+        to classify.
+        """
+        return self.status_code is not None and self.status_code >= 500
+
+
+class _TypedStatusError(GoogleApiError):
+    """A named status whose class already says what the status was."""
+
+
     """Raised when Google's Calendar API rejects or fails a request."""
 
 
-class GoogleInvalidTokenError(GoogleApiError):
+class GoogleInvalidTokenError(_TypedStatusError):
     """HTTP 401: the stored access token is invalid or expired."""
 
 
-class GoogleForbiddenError(GoogleApiError):
+class GoogleForbiddenError(_TypedStatusError):
     """HTTP 403: scope is missing or consent was revoked."""
 
 
-class GoogleRateLimitError(GoogleApiError):
+class GoogleRateLimitError(_TypedStatusError):
     """HTTP 429: quota/rate limit exceeded."""
 
 
-class GoogleNotFoundError(GoogleApiError):
+class GoogleNotFoundError(_TypedStatusError):
     """HTTP 404: the requested event does not exist."""
 
 
@@ -52,18 +82,29 @@ def _raise_for_status(resp: httpx.Response) -> None:
     """Map Google's failure modes onto typed errors (never echoes tokens)."""
     if resp.status_code == 401:
         raise GoogleInvalidTokenError(
-            "google access token is invalid or expired (consent may be revoked)"
+            "google access token is invalid or expired (consent may be revoked)",
+            status_code=resp.status_code,
         )
     if resp.status_code == 403:
         raise GoogleForbiddenError(
-            "google denied the request; calendar.events scope may be missing"
+            "google denied the request; calendar.events scope may be missing",
+            status_code=resp.status_code,
         )
     if resp.status_code == 404:
-        raise GoogleNotFoundError("google calendar event was not found")
+        raise GoogleNotFoundError(
+            "google calendar event was not found",
+            status_code=resp.status_code,
+        )
     if resp.status_code == 429:
-        raise GoogleRateLimitError("google api rate limit exceeded, try again later")
+        raise GoogleRateLimitError(
+            "google api rate limit exceeded, try again later",
+            status_code=resp.status_code,
+        )
     if resp.status_code >= 400:
-        raise GoogleApiError(f"google calendar api request failed ({resp.status_code})")
+        raise GoogleApiError(
+            f"google calendar api request failed ({resp.status_code})",
+            status_code=resp.status_code,
+        )
 
 
 async def fetch_events_page(

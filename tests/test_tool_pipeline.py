@@ -273,7 +273,9 @@ async def test_critical_risk_tool_is_denied_by_mvp_policy() -> None:
     )
     registry.lock()
     tenant, user = await make_tenant_user("acme@corp.example")
-    task = await make_task(tenant_id=tenant.id, user_id=user.id)
+    task = await make_task(
+        tenant_id=tenant.id, user_id=user.id, allowed_tools=["finance"]
+    )
 
     gateway, parts = make_gateway(registry=registry)
     async with session_scope() as session:

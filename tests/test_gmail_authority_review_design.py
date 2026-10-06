@@ -56,6 +56,7 @@ the premises a round that settles A, B, D and E has to move on purpose.
 
 from __future__ import annotations
 
+import ast
 import inspect
 import textwrap
 from datetime import date, timedelta
@@ -211,8 +212,8 @@ def test_the_send_tool_admits_no_sender_field() -> None:
     ``GmailSendArgs`` is exactly ``{to, subject, body}``, all required. There is no
     ``from``, so the sender cannot be an argument, cannot be a model output, and
     cannot be a policy input. It is read from the connected account — the module
-    docstring says so, and the API resolves the account by ``(tenant, user)`` before
-    building the request. Provider handshake is therefore the *only* defensible author
+    docstring says so, and the account is resolved by ``(tenant, user)`` before the
+    request is built. Provider handshake is therefore the *only* defensible author
     of ``From:``, and the repository already holds that position.
     """
     assert set(GmailSendArgs.model_fields) == {"to", "subject", "body"}
@@ -221,21 +222,27 @@ def test_the_send_tool_admits_no_sender_field() -> None:
 
     api = _repo_text("api", "gmail.py")
     assert "the sender is taken from the stored account, never from the request" in api
-    assert "SendRequest(to=str(body.to), subject=body.subject, body=body.body)" in api
 
     # The sender is read off the account inside the service, not off the request.
     service = _repo_text("gmail", "service.py")
     assert "account.email" in service
 
 
-def test_the_only_live_send_path_is_the_authenticated_client_and_it_skips_the_gateway() -> None:
-    """``send_and_verify`` has two call sites, and the one that works is not the agent's.
+def test_the_only_live_send_path_is_the_governed_adapter() -> None:
+    """``send_and_verify`` has exactly one call site, and it is the governed one.
 
-    The direct endpoint builds a ``SendRequest`` from the HTTP body and calls the Gmail
-    service. No gateway, no policy, no approval, no task, no evidence, no evaluator —
-    because the caller *is* the authenticated user acting on their own account. That
-    is a different authority question from the one the runtime poses, and it is the
-    only Gmail send the repository performs today.
+    This test previously asserted the defect: ``send_and_verify`` had two call
+    sites, the one that worked was ``POST /gmail/send``, and it skipped the
+    gateway entirely. The reasoning in the old docstring was that the caller *was*
+    the authenticated user acting on their own account, so the runtime's authority
+    question was deemed not to apply. That reasoning was the bug — it let an
+    external side effect reach the provider without policy, approval, a task,
+    durable evidence, an evaluator, or audit, and therefore without anything that
+    could later reconstruct or reverse what happened.
+
+    The direct endpoint is now a ``410 Gone`` tombstone. What remains is the
+    governed adapter, and with it the whole chain: policy, approval, task,
+    evidence, verification, audit.
     """
     service = _repo_text("gmail", "service.py")
     call_sites = sorted(
@@ -244,11 +251,49 @@ def test_the_only_live_send_path_is_the_authenticated_client_and_it_skips_the_ga
         if path.name != "service.py"
         and "await send_and_verify(" in path.read_text(encoding="utf-8")
     )
-    assert call_sites == ["api/gmail.py", "tools/adapters/gmail.py"]
+    assert call_sites == ["tools/adapters/gmail.py"]
     assert "async def send_and_verify" in service
 
-    api = _repo_text("api", "gmail.py")
+    api_path = SRC / "api" / "gmail.py"
+    api = api_path.read_text(encoding="utf-8")
+
+    # Assert on the parsed imports, not on raw text: the read endpoints legitimately
+    # import from ``kai.gmail.service``. What must be absent is the send function.
+    imported: set[str] = set()
+    tree = ast.parse(api)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module == "kai.gmail.service":
+            imported.update(alias.asname or alias.name for alias in node.names)
+    assert "send_and_verify" not in imported
+    assert imported  # the read path is genuinely still wired
+
+    calls = {
+        node.func.attr
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+    }
+    assert "send_and_verify" not in calls
+
+    # The docstrings name what the module no longer reaches, so the substring checks
+    # run against the code with every docstring line removed.
+    prose: set[int] = set()
+    holders = (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)
+    for node in ast.walk(tree):
+        if not isinstance(node, holders) or not node.body:
+            continue
+        first = node.body[0]
+        if (
+            isinstance(first, ast.Expr)
+            and isinstance(first.value, ast.Constant)
+            and isinstance(first.value.value, str)
+        ):
+            prose.update(range(first.lineno, first.end_lineno + 1))
+    code = "\n".join(
+        line for number, line in enumerate(api.splitlines(), start=1) if number not in prose
+    )
+    assert "410" in code, "the retired endpoint must still answer Gone"
     for absent in (
+        "SendRequest",
         "ToolGateway",
         "PolicyEngine",
         "ApprovalService",
@@ -257,11 +302,14 @@ def test_the_only_live_send_path_is_the_authenticated_client_and_it_skips_the_ga
         "from kai.policy",
         "from kai.approvals",
     ):
-        assert absent not in api, f"the direct send path must not reach {absent}"
-    assert "send_and_verify" in api
+        assert absent not in code, f"the retired send path must not reach {absent}"
 
-    # So the agent-side path is closed three times over, and the closure is what makes
-    # the authoring question hypothetical rather than current.
+    # The tombstone must name the governed path rather than simply refusing, so a
+    # caller that reads the failure is told where the write actually lives.
+    assert "/runtime/tasks" in code
+
+    # And the agent side is still closed, so no runtime intent can reach the one
+    # remaining call site.
     translator = _repo_text("runtime", "translator.py")
     assert "gmail" not in _source_of_intents_for()
     assert "gmail" not in translator.split("SLICE_ALLOWED_TOOLS")[1].split(")")[0]

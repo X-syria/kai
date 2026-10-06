@@ -118,7 +118,6 @@ async def test_medium_risk_tool_requires_approval_by_risk() -> None:
 
 async def test_critical_risk_tool_is_denied() -> None:
     tenant_id, user_id, _ = await _registered_with_account()
-    task = await make_task(tenant_id=tenant_id, user_id=user_id)
     critical = ToolDefinition(
         name="finance.transfer",
         description="transfer money (never shipped in the MVP)",
@@ -127,6 +126,12 @@ async def test_critical_risk_tool_is_denied() -> None:
         capability="finance",
         executor=_NeverExecutor(),
         verification_contract=VerificationContract.MANUAL,
+    )
+    # The CRITICAL rule is what this asserts, and it is sequenced *after*
+    # ``allowed_tools`` — so the contract has to name ``finance`` or the
+    # allowlist refusal would decide the case first and mask it.
+    task = await make_task(
+        tenant_id=tenant_id, user_id=user_id, allowed_tools=["finance"]
     )
 
     engine = PolicyEngine()

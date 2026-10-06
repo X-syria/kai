@@ -304,6 +304,73 @@ async def test_slots_require_authentication(
     assert resp.status_code == 401
 
 
+async def test_public_calendar_write_cannot_bypass_governance(
+    client: httpx.AsyncClient,
+    google_settings: None,
+    google_transport: httpx.AsyncClient,
+    stub: CalendarStub,
+) -> None:
+    """A public endpoint must not be able to create a calendar event unguarded.
+
+    This endpoint used to call ``create_and_verify_event`` directly, which made
+    it a second route to the same provider write the runtime already performs
+    through ``ToolGateway`` — skipping policy, approval, identity resolution,
+    durable evidence, audit and alerting.
+
+    The status code alone proves nothing, so the assertions are on the controls:
+    the response names the governed path, and **no request reached Google at
+    all**. A handler that wrote first and refused afterwards would still pass a
+    status-only test.
+    """
+    token = await _register(client)
+    await _bind(client, token)
+    calls_before = len(stub.calendar_calls)
+
+    resp = await _create(client, token)
+
+    assert resp.status_code == 410
+    detail = resp.json()["detail"]
+    assert detail["error"] == "direct_calendar_write_removed"
+    assert detail["use"] == "/runtime/tasks"
+
+    # The actual control: not one provider request was issued.
+    assert len(stub.calendar_calls) == calls_before
+    assert stub.create_body is None
+    assert stub.last_created is None
+
+
+async def test_public_calendar_write_is_refused_before_any_authorization(
+    client: httpx.AsyncClient,
+    google_settings: None,
+    google_transport: httpx.AsyncClient,
+    stub: CalendarStub,
+) -> None:
+    """Retirement must not become a new information or side-effect surface.
+
+    The refusal happens before authentication, so it cannot be used to probe
+    whether an account exists, and it cannot be used to write. A garbage token
+    and a valid one must be indistinguishable here.
+    """
+    calls_before = len(stub.calendar_calls)
+
+    with_garbage = await _create(client, "invalid-token")
+    anonymous = await client.post(
+        f"{API_PREFIX}/calendar/events",
+        json={
+            "title": "Team Sync",
+            "date": TEST_DAY,
+            "start_time": "10:00",
+            "end_time": "11:00",
+            "timezone": BERLIN,
+        },
+    )
+
+    assert with_garbage.status_code == 410
+    assert anonymous.status_code == 410
+    assert with_garbage.json() == anonymous.json()
+    assert len(stub.calendar_calls) == calls_before
+
+
 async def test_slots_without_connected_account_is_404(
     client: httpx.AsyncClient, google_settings: None, google_transport: httpx.AsyncClient
 ) -> None:
@@ -311,14 +378,7 @@ async def test_slots_without_connected_account_is_404(
     assert (await _slots(client, token)).status_code == 404
 
 
-async def test_slots_and_create_without_account_are_404(
-    client: httpx.AsyncClient, google_settings: None, google_transport: httpx.AsyncClient
-) -> None:
-    token = await _register(client)
-    assert (await _create(client, token)).status_code == 404
-
-
-async def test_events_and_slots_never_leak_tokens(
+async def test_slots_never_leak_tokens(
     client: httpx.AsyncClient,
     google_settings: None,
     google_transport: httpx.AsyncClient,
@@ -327,14 +387,11 @@ async def test_events_and_slots_never_leak_tokens(
     token = await _register(client)
     await _bind(client, token)
     slot_resp = await _slots(client, token)
-    create_resp = await _create(client, token, attendees=("alice@example.com",))
     assert slot_resp.status_code == 200
-    assert create_resp.status_code == 200
-    for body in (slot_resp.text, create_resp.text):
-        assert stub.access_token not in body
-        assert stub.refresh_token not in body
-        assert "credentials_encrypted" not in body
-        assert "test-client-secret" not in body
+    assert stub.access_token not in slot_resp.text
+    assert stub.refresh_token not in slot_resp.text
+    assert "credentials_encrypted" not in slot_resp.text
+    assert "test-client-secret" not in slot_resp.text
     assert (
         stub.calendar_calls[0].headers["Authorization"]
         == f"Bearer {stub.access_token}"
@@ -359,23 +416,6 @@ async def test_slots_account_id_is_tenant_scoped(
     account_a = await _account_id(client, token_a)
     assert (await _slots(client, token_a, account_id=account_a)).status_code == 200
     assert (await _slots(client, token_b, account_id=account_a)).status_code == 404
-
-
-async def test_create_account_id_is_tenant_scoped(
-    client: httpx.AsyncClient,
-    google_settings: None,
-    google_transport: httpx.AsyncClient,
-    stub: CalendarStub,
-) -> None:
-    token_a = await _register(client, "alice@example.com")
-    token_b = await _register(client, "bob@example.com")
-    stub.sub = "sub-a"
-    await _bind(client, token_a)
-    stub.sub = "sub-b"
-    await _bind(client, token_b)
-
-    account_a = await _account_id(client, token_a)
-    assert (await _create(client, token_b, account_id=account_a)).status_code == 404
 
 
 # --- availability: empty / busy / timezone ---------------------------------
@@ -632,200 +672,7 @@ async def test_non_json_events_list_is_502(
 
 # --- event creation + deterministic verification ---------------------------
 
-async def test_create_event_is_verified_and_read_back(
-    client: httpx.AsyncClient,
-    google_settings: None,
-    google_transport: httpx.AsyncClient,
-    stub: CalendarStub,
-) -> None:
-    token = await _register(client)
-    await _bind(client, token)
-    resp = await _create(
-        client,
-        token,
-        title="Team Sync",
-        start_time="10:30",
-        end_time="11:30",
-        attendees=("alice@example.com", "bob@example.com"),
-    )
-    assert resp.status_code == 200
-    body = resp.json()
-    assert body["verified"] is True
-    event = body["event"]
-    assert event["event_id"] == "new-event-1"
-    assert event["title"] == "Team Sync"
-    assert event["start"] == "2026-06-24T10:30:00+02:00"
-    assert event["end"] == "2026-06-24T11:30:00+02:00"
-    assert event["start_timezone"] == BERLIN
-    assert set(event["attendees"]) == {"alice@example.com", "bob@example.com"}
-
-    sent = stub.create_body
-    assert isinstance(sent, dict)
-    assert sent["summary"] == "Team Sync"
-    assert sent["start"] == {"dateTime": "2026-06-24T10:30:00+02:00", "timeZone": BERLIN}
-    assert sent["end"] == {"dateTime": "2026-06-24T11:30:00+02:00", "timeZone": BERLIN}
-    assert sent["attendees"] == [
-        {"email": "alice@example.com"},
-        {"email": "bob@example.com"},
-    ]
-    assert stub.last_created is not None
-    # read-after-create actually hit Google: one POST then one GET
-    assert len(stub.calendar_calls) == 2
-    assert stub.calendar_calls[1].method == "GET"
-
-
-async def test_create_invalid_date_is_400(
-    client: httpx.AsyncClient, google_settings: None, google_transport: httpx.AsyncClient
-) -> None:
-    token = await _register(client)
-    await _bind(client, token)
-    assert (await _create(client, token, date="not-a-date")).status_code == 400
-
-
-async def test_create_end_before_start_is_400(
-    client: httpx.AsyncClient, google_settings: None, google_transport: httpx.AsyncClient
-) -> None:
-    token = await _register(client)
-    await _bind(client, token)
-    assert (
-        await _create(client, token, start_time="12:00", end_time="11:00")
-    ).status_code == 400
-
-
-async def test_create_invalid_timezone_is_400(
-    client: httpx.AsyncClient, google_settings: None, google_transport: httpx.AsyncClient
-) -> None:
-    token = await _register(client)
-    await _bind(client, token)
-    assert (
-        await _create(client, token, timezone="Mars/Olympus")
-    ).status_code == 400
-
-
 # --- verification mismatch ------------------------------------------------
-
-async def test_read_after_create_title_mismatch_fails_verification(
-    client: httpx.AsyncClient,
-    google_settings: None,
-    google_transport: httpx.AsyncClient,
-    stub: CalendarStub,
-) -> None:
-    token = await _register(client)
-    await _bind(client, token)
-    resp = await _create(client, token)
-    assert resp.status_code == 200 and resp.json()["verified"] is True
-    stub.readback = {**stub.last_created, "summary": "Wrong Title"}
-    resp = await _create(client, token)
-    assert resp.status_code == 502
-    detail = resp.json()["detail"]
-    assert detail["verified"] is False
-    assert {m["field"] for m in detail["mismatches"]} == {"title"}
-
-
-async def test_read_after_create_time_mismatch_fails_verification(
-    client: httpx.AsyncClient,
-    google_settings: None,
-    google_transport: httpx.AsyncClient,
-    stub: CalendarStub,
-) -> None:
-    token = await _register(client)
-    await _bind(client, token)
-    await _create(client, token, start_time="10:00", end_time="11:00")
-    assert isinstance(stub.last_created, dict)
-    shifted = {**stub.last_created}
-    shifted["start"] = {"dateTime": "2026-06-24T11:00:00+02:00", "timeZone": BERLIN}
-    shifted["end"] = {"dateTime": "2026-06-24T12:00:00+02:00", "timeZone": BERLIN}
-    stub.readback = shifted
-    resp = await _create(client, token, start_time="10:00", end_time="11:00")
-    assert resp.status_code == 502
-    fields = {m["field"] for m in resp.json()["detail"]["mismatches"]}
-    assert "start_time" in fields and "end_time" in fields
-
-
-async def test_read_after_create_timezone_mismatch_fails_verification(
-    client: httpx.AsyncClient,
-    google_settings: None,
-    google_transport: httpx.AsyncClient,
-    stub: CalendarStub,
-) -> None:
-    token = await _register(client)
-    await _bind(client, token)
-    await _create(client, token, start_time="10:00", end_time="11:00")
-    assert isinstance(stub.last_created, dict)
-    readback = {**stub.last_created}
-    readback["start"] = {"dateTime": "2026-06-24T08:00:00+00:00", "timeZone": "UTC"}
-    readback["end"] = {"dateTime": "2026-06-24T09:00:00+00:00", "timeZone": "UTC"}
-    stub.readback = readback
-    resp = await _create(client, token, start_time="10:00", end_time="11:00")
-    assert resp.status_code == 502
-    fields = {m["field"] for m in resp.json()["detail"]["mismatches"]}
-    assert "timezone" in fields
-
-
-async def test_read_after_create_attendee_mismatch_fails_verification(
-    client: httpx.AsyncClient,
-    google_settings: None,
-    google_transport: httpx.AsyncClient,
-    stub: CalendarStub,
-) -> None:
-    token = await _register(client)
-    await _bind(client, token)
-    resp = await _create(client, token, attendees=("alice@example.com",))
-    assert resp.status_code == 200 and resp.json()["verified"] is True
-    assert isinstance(stub.last_created, dict)
-    stub.readback = {
-        **stub.last_created,
-        "attendees": [{"email": "attacker@example.com"}],
-    }
-    resp = await _create(client, token, attendees=("alice@example.com",))
-    assert resp.status_code == 502
-    fields = {m["field"] for m in resp.json()["detail"]["mismatches"]}
-    assert "attendees" in fields
-
-
-async def test_event_missing_after_create_is_not_verified(
-    client: httpx.AsyncClient,
-    google_settings: None,
-    google_transport: httpx.AsyncClient,
-    stub: CalendarStub,
-) -> None:
-    token = await _register(client)
-    await _bind(client, token)
-    await _create(client, token)
-    stub.read_status = 404
-    resp = await _create(client, token)
-    assert resp.status_code == 502
-    fields = {m["field"] for m in resp.json()["detail"]["mismatches"]}
-    assert "retrieval" in fields
-
-
-async def test_malformed_readback_is_not_verified(
-    client: httpx.AsyncClient,
-    google_settings: None,
-    google_transport: httpx.AsyncClient,
-    stub: CalendarStub,
-) -> None:
-    token = await _register(client)
-    await _bind(client, token)
-    await _create(client, token)
-    stub.readback = {"id": "new-event-1"}  # no start/end: unparseable
-    resp = await _create(client, token)
-    assert resp.status_code == 502
-    assert resp.json()["detail"]["verified"] is False
-
-
-async def test_malformed_create_response_is_502(
-    client: httpx.AsyncClient,
-    google_settings: None,
-    google_transport: httpx.AsyncClient,
-    stub: CalendarStub,
-) -> None:
-    token = await _register(client)
-    await _bind(client, token)
-    stub.create_payload = {"id": "new-event-1"}  # no start/end: unparseable
-    resp = await _create(client, token)
-    assert resp.status_code == 502
-
 
 # --- API errors / rate limit ----------------------------------------------
 
@@ -880,46 +727,6 @@ async def test_slots_5xx_is_502(
     stub.events_status = 500
     resp = await _slots(client, token)
     assert resp.status_code == 502
-
-
-async def test_create_401_is_401(
-    client: httpx.AsyncClient,
-    google_settings: None,
-    google_transport: httpx.AsyncClient,
-    stub: CalendarStub,
-) -> None:
-    token = await _register(client)
-    await _bind(client, token)
-    stub.create_status = 401
-    resp = await _create(client, token)
-    assert resp.status_code == 401
-
-
-async def test_create_429_is_429(
-    client: httpx.AsyncClient,
-    google_settings: None,
-    google_transport: httpx.AsyncClient,
-    stub: CalendarStub,
-) -> None:
-    token = await _register(client)
-    await _bind(client, token)
-    stub.create_status = 429
-    resp = await _create(client, token)
-    assert resp.status_code == 429
-
-
-async def test_read_after_create_401_propagates(
-    client: httpx.AsyncClient,
-    google_settings: None,
-    google_transport: httpx.AsyncClient,
-    stub: CalendarStub,
-) -> None:
-    token = await _register(client)
-    await _bind(client, token)
-    await _create(client, token)
-    stub.read_status = 401
-    resp = await _create(client, token)
-    assert resp.status_code == 401
 
 
 # --- pagination -----------------------------------------------------------

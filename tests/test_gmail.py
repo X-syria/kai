@@ -321,6 +321,73 @@ async def _send(
     )
 
 
+# --- the governed execution boundary ---------------------------------------
+
+async def test_public_gmail_write_cannot_bypass_governance(
+    client: httpx.AsyncClient,
+    google_settings: None,
+    google_transport: httpx.AsyncClient,
+    stub: GmailStub,
+) -> None:
+    """A public endpoint must not be able to send a message unguarded.
+
+    This endpoint used to call ``send_and_verify`` directly. The catalog rates
+    ``gmail.send`` MEDIUM and ``rule_risk_approval`` requires human approval at
+    MEDIUM, so the direct route skipped policy, approval, identity resolution,
+    durable evidence, audit and alerting. A send is also not repeatable, which
+    makes it the worst operation to leave unguarded.
+
+    The status code alone proves nothing, so the assertions are on the controls:
+    the response names the governed path, and **no request reached Google at
+    all**. A handler that sent first and refused afterwards would still pass a
+    status-only test.
+    """
+    token = await _register(client)
+    await _bind(client, token)
+    send_calls_before = len(stub.send_calls)
+    all_calls_before = len(stub.search_calls) + len(stub.read_calls)
+
+    resp = await _send(client, token)
+
+    assert resp.status_code == 410
+    detail = resp.json()["detail"]
+    assert detail["error"] == "direct_gmail_send_removed"
+    assert detail["use"] == "/runtime/tasks"
+
+    # The actual control: not one provider request was issued.
+    assert len(stub.send_calls) == send_calls_before
+    assert stub.send_raw is None
+    assert stub.sent_payload is None
+    assert len(stub.search_calls) + len(stub.read_calls) == all_calls_before
+
+
+async def test_public_gmail_write_is_refused_before_any_authorization(
+    client: httpx.AsyncClient,
+    google_settings: None,
+    google_transport: httpx.AsyncClient,
+    stub: GmailStub,
+) -> None:
+    """Retirement must not become a new information or side-effect surface.
+
+    The refusal happens before authentication, so a garbage token and no token
+    at all must be indistinguishable, and neither can write. If this ever
+    answered 401 for one and 410 for the other, it would become an oracle for
+    "is this a real session" while still refusing to send.
+    """
+    send_calls_before = len(stub.send_calls)
+
+    with_garbage = await _send(client, "invalid-token")
+    anonymous = await client.post(
+        f"{API_PREFIX}/gmail/send",
+        json={"to": "bob@example.com", "subject": "s", "body": "b"},
+    )
+
+    assert with_garbage.status_code == 410
+    assert anonymous.status_code == 410
+    assert with_garbage.json() == anonymous.json()
+    assert len(stub.send_calls) == send_calls_before
+
+
 # --- least-privilege scopes ------------------------------------------------
 
 async def test_connect_requests_read_and_send_scopes_separately(
@@ -353,19 +420,12 @@ async def test_search_requires_authentication(
     assert (await _search(client, "invalid-token")).status_code == 401
 
 
-async def test_send_requires_authentication(
-    client: httpx.AsyncClient, google_settings: None, google_transport: httpx.AsyncClient
-) -> None:
-    assert (await _send(client, "invalid-token")).status_code == 401
-
-
 async def test_endpoints_without_connected_account_are_404(
     client: httpx.AsyncClient, google_settings: None, google_transport: httpx.AsyncClient
 ) -> None:
     token = await _register(client)
     assert (await _search(client, token)).status_code == 404
     assert (await _read(client, token, message_id="m1")).status_code == 404
-    assert (await _send(client, token)).status_code == 404
 
 
 async def test_no_tokens_leak_in_any_response(
@@ -386,10 +446,7 @@ async def test_no_tokens_leak_in_any_response(
     read_resp = await _read(client, token, message_id="m1")
     assert search_resp.status_code == 200
     assert read_resp.status_code == 200
-    stub.read_return = None  # let read-after-send observe the sent message
-    send_resp = await _send(client, token)
-    assert send_resp.status_code == 200
-    for body in (search_resp.text, read_resp.text, send_resp.text):
+    for body in (search_resp.text, read_resp.text):
         assert stub.access_token not in body
         assert stub.refresh_token not in body
         assert "credentials_encrypted" not in body
@@ -418,7 +475,6 @@ async def test_account_id_is_tenant_scoped(
     assert (await _search(client, token_a, account_id=account_a)).status_code == 200
     assert (await _search(client, token_b, account_id=account_a)).status_code == 404
     assert (await _read(client, token_b, message_id="m1", account_id=account_a)).status_code == 404
-    assert (await _send(client, token_b, account_id=account_a)).status_code == 404
 
 
 # --- search / read ---------------------------------------------------------
@@ -582,214 +638,6 @@ async def test_injected_email_content_is_data_not_instructions(
     assert stub.send_raw is None
 
 
-# --- send ------------------------------------------------------------------
-
-async def test_send_is_verified_with_provider_evidence(
-    client: httpx.AsyncClient,
-    google_settings: None,
-    google_transport: httpx.AsyncClient,
-    stub: GmailStub,
-) -> None:
-    token = await _register(client)
-    await _bind(client, token)
-    resp = await _send(
-        client,
-        token,
-        to="bob@example.com",
-        subject="Meeting tomorrow",
-        body="Hi Bob, let's sync at 10.",
-    )
-    assert resp.status_code == 200
-    body = resp.json()
-    assert body["verified"] is True
-    assert body["read_by_recipient"] is None
-    evidence = body["evidence"]
-    assert evidence["message_id"] == "sent-message-1"
-    assert evidence["thread_id"] == "sent-thread-1"
-    assert evidence["label_ids"] == ["SENT"]
-    assert body["message"]["message_id"] == "sent-message-1"
-
-    # read-after-send actually happened: one POST then one GET
-    assert len(stub.send_calls) == 1
-    assert len(stub.read_calls) == 1
-
-    raw = _decode_raw(stub.send_raw)
-    assert "From: alice@example.com" in raw
-    assert "To: bob@example.com" in raw
-    assert "Subject: Meeting tomorrow" in raw
-    assert "Hi Bob, let's sync at 10." in raw
-
-
-def _decode_raw(raw: str | None) -> str:
-    assert raw is not None
-    padded = raw.replace("-", "+").replace("_", "/")
-    padded += "=" * (-len(padded) % 4)
-    return base64.b64decode(padded).decode("utf-8")
-
-
-async def test_send_uses_account_email_as_sender_never_request_input(
-    client: httpx.AsyncClient,
-    google_settings: None,
-    google_transport: httpx.AsyncClient,
-    stub: GmailStub,
-) -> None:
-    stub.email = "mailbox@example.com"  # the Google account, not the app user
-    token = await _register(client, "attacker@example.com")
-    await _bind(client, token)
-    resp = await _send(client, token, to="victim@example.com")
-    assert resp.status_code == 200
-    raw = _decode_raw(stub.send_raw)
-    assert "From: mailbox@example.com" in raw
-    assert "From: victim@example.com" not in raw
-    assert "From: attacker@example.com" not in raw
-
-
-async def test_send_recipient_validation_rejects_invalid_email(
-    client: httpx.AsyncClient, google_settings: None, google_transport: httpx.AsyncClient
-) -> None:
-    token = await _register(client)
-    await _bind(client, token)
-    resp = await _send(client, token, to="not-an-email")
-    assert resp.status_code == 422
-
-
-async def test_send_subject_with_line_break_is_400(
-    client: httpx.AsyncClient,
-    google_settings: None,
-    google_transport: httpx.AsyncClient,
-    stub: GmailStub,
-) -> None:
-    token = await _register(client)
-    await _bind(client, token)
-    resp = await _send(client, token, subject="Subject\r\nBcc: evil@example.com")
-    assert resp.status_code == 400
-    assert stub.send_calls == []
-
-
-async def test_send_evidence_carries_message_id(
-    client: httpx.AsyncClient,
-    google_settings: None,
-    google_transport: httpx.AsyncClient,
-    stub: GmailStub,
-) -> None:
-    token = await _register(client)
-    await _bind(client, token)
-    stub.sent_id = "provider-accepted-42"
-    stub.sent_thread = "provider-thread-42"
-    resp = await _send(client, token)
-    assert resp.status_code == 200
-    assert resp.json()["evidence"]["message_id"] == "provider-accepted-42"
-
-
-async def test_send_provider_rejection_missing_id_is_502(
-    client: httpx.AsyncClient,
-    google_settings: None,
-    google_transport: httpx.AsyncClient,
-    stub: GmailStub,
-) -> None:
-    token = await _register(client)
-    await _bind(client, token)
-    stub.send_return = {"threadId": "t-x"}  # no id: not accepted evidence
-    assert (await _send(client, token)).status_code == 502
-
-
-# --- send verification failures --------------------------------------------
-
-async def test_read_after_send_missing_is_not_verified(
-    client: httpx.AsyncClient,
-    google_settings: None,
-    google_transport: httpx.AsyncClient,
-    stub: GmailStub,
-) -> None:
-    token = await _register(client)
-    await _bind(client, token)
-    stub.read_status = 404
-    resp = await _send(client, token)
-    assert resp.status_code == 502
-    assert resp.json()["detail"]["verified"] is False
-
-
-async def test_read_after_send_id_mismatch_is_not_verified(
-    client: httpx.AsyncClient,
-    google_settings: None,
-    google_transport: httpx.AsyncClient,
-    stub: GmailStub,
-) -> None:
-    token = await _register(client)
-    await _bind(client, token)
-    await _send(client, token)
-    altered = {**stub.sent_payload, "id": "different-message"}
-    stub.read_return = altered
-    resp = await _send(client, token)
-    assert resp.status_code == 502
-    fields = {m["field"] for m in resp.json()["detail"]["mismatches"]}
-    assert "message_id" in fields
-
-
-async def test_read_after_send_missing_sent_label_is_not_verified(
-    client: httpx.AsyncClient,
-    google_settings: None,
-    google_transport: httpx.AsyncClient,
-    stub: GmailStub,
-) -> None:
-    token = await _register(client)
-    await _bind(client, token)
-    await _send(client, token)
-    assert stub.sent_payload is not None
-    altered = {**stub.sent_payload, "labelIds": ["INBOX"]}
-    stub.read_return = altered
-    resp = await _send(client, token)
-    assert resp.status_code == 502
-    fields = {m["field"] for m in resp.json()["detail"]["mismatches"]}
-    assert "label_ids" in fields
-
-
-async def test_read_after_send_recipient_mismatch_is_not_verified(
-    client: httpx.AsyncClient,
-    google_settings: None,
-    google_transport: httpx.AsyncClient,
-    stub: GmailStub,
-) -> None:
-    token = await _register(client)
-    await _bind(client, token)
-    await _send(client, token, to="bob@example.com")
-    assert stub.sent_payload is not None
-    altered = {**stub.sent_payload}
-    altered["payload"]["headers"] = [
-        {"name": "To", "value": "mallory@example.com"},
-        {"name": "From", "value": "alice@example.com"},
-        {"name": "Subject", "value": "Meeting tomorrow"},
-    ]
-    stub.read_return = altered
-    resp = await _send(client, token)
-    assert resp.status_code == 502
-    fields = {m["field"] for m in resp.json()["detail"]["mismatches"]}
-    assert "recipient" in fields
-
-
-async def test_read_after_send_sender_mismatch_is_not_verified(
-    client: httpx.AsyncClient,
-    google_settings: None,
-    google_transport: httpx.AsyncClient,
-    stub: GmailStub,
-) -> None:
-    token = await _register(client)
-    await _bind(client, token)
-    await _send(client, token)
-    assert stub.sent_payload is not None
-    altered = {**stub.sent_payload}
-    altered["payload"]["headers"] = [
-        {"name": "From", "value": "mallory@example.com"},
-        {"name": "To", "value": "bob@example.com"},
-        {"name": "Subject", "value": "Meeting tomorrow"},
-    ]
-    stub.read_return = altered
-    resp = await _send(client, token)
-    assert resp.status_code == 502
-    fields = {m["field"] for m in resp.json()["detail"]["mismatches"]}
-    assert "sender" in fields
-
-
 # --- API errors / rate limit ----------------------------------------------
 
 async def test_search_401_403_429_502(
@@ -818,20 +666,6 @@ async def test_read_401_403_429_502(
     for status_code, expected in ((401, 401), (403, 403), (429, 429), (500, 502)):
         stub.read_status = status_code
         resp = await _read(client, token, message_id="m1")
-        assert resp.status_code == expected, status_code
-
-
-async def test_send_401_403_429_502(
-    client: httpx.AsyncClient,
-    google_settings: None,
-    google_transport: httpx.AsyncClient,
-    stub: GmailStub,
-) -> None:
-    token = await _register(client)
-    await _bind(client, token)
-    for status_code, expected in ((401, 401), (403, 403), (429, 429), (500, 502)):
-        stub.send_status = status_code
-        resp = await _send(client, token)
         assert resp.status_code == expected, status_code
 
 
