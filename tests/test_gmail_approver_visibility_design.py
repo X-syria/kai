@@ -237,15 +237,18 @@ def _conflicting_resolver_input() -> tuple[list[Any], list[Any]]:
     return claims, contacts
 
 
-def test_a_conflicting_verdict_still_carries_an_address_out_of_the_resolver() -> None:
-    """``_has_conflict`` promises CONFLICTING never picks a winner. ``_build`` does.
+def test_a_conflicting_verdict_carries_no_address_out_of_the_resolver() -> None:
+    """``_has_conflict`` promises CONFLICTING never picks a winner. ``_build`` keeps it.
 
-    This is the producer half the authority round did not measure. It built the bad
-    rows by hand for its reader test; here the row is produced by the real resolver
-    helper. ``_build`` computes ``email`` in the ``else`` branch of a condition that
-    excludes only ``PROVIDER_VERIFIED`` and ``CHANNEL_VERIFIED``, so a CONFLICTING
-    verdict is handed a concrete address — and ``contact_id`` is correctly withheld,
-    which is what makes the leak easy to miss: the result looks half-resolved.
+    This was measured as a defect and has been fixed at the producer. The row comes
+    from the real resolver helper rather than a hand-written one: ``_build`` used to
+    compute ``email`` in the ``else`` branch of a condition excluding only
+    ``PROVIDER_VERIFIED`` and ``CHANNEL_VERIFIED``, so a CONFLICTING verdict was
+    handed a concrete address. Withholding ``contact_id`` while publishing the
+    address is what made it easy to miss — the result looked half-resolved.
+
+    The contract is now that a verdict which selected nothing publishes no
+    identifier at all, so no reader has to distrust the shape it is given.
     """
     claims, contacts = _conflicting_resolver_input()
     query = IdentityQuery(email=ALICE)
@@ -268,29 +271,35 @@ def test_a_conflicting_verdict_still_carries_an_address_out_of_the_resolver() ->
     )
 
     assert result.status is IdentityStatus.CONFLICTING
-    assert result.email == ALICE, "the conflicting verdict manufactured an address"
-    assert result.contact_id is None, "but it names no contact, so the leak is quiet"
+    assert result.email is None, "a conflicting verdict must publish no address"
+    assert result.phone is None, "nor a phone number"
+    assert result.contact_id is None
+    assert result.display_name is None
     assert result.confidence == 0.0
+    # The evidence is still reported: the conflict is auditable even though no
+    # candidate is selected. Losing the address must not lose the finding.
+    assert result.evidence
 
-    # The docstring is the promise the implementation breaks.
+    # The docstring is the promise, and the producer is what enforces it.
     assert "CONFLICTING never picks a winner" in _source(_has_conflict)
     build = _source(IdentityResolver._build)
-    assert (
-        "if status in (IdentityStatus.PROVIDER_VERIFIED, IdentityStatus.CHANNEL_VERIFIED):"
-        in build
-    )
-    assert "email = email_claims[0].value" in build
+    assert "selects_entity = status in _SELECTING_STATUSES" in build
+    assert "if selects_entity and len(distinct_ids) == 1" in build
 
 
-def test_that_manufactured_address_satisfies_a_criteria_that_never_reads_the_status() -> None:
+def test_the_conflict_no_longer_reaches_a_criteria_as_a_required_recipient() -> None:
     """The producer and the consumer compose into a chain the previous round split.
 
-    The address the resolver emitted for a CONFLICTING verdict is precisely the
-    field the criteria reader takes, and the reader takes it without consulting the
-    status that would have disqualified it. Sealed as a *required* recipient, an
-    unresolved identity becomes an obligation the run is measured against. Both
-    halves are already tested; pinning them as one chain is the point, because a fix
-    applied to either end alone leaves the other half standing.
+    The address the resolver used to emit for a CONFLICTING verdict was precisely
+    the field the criteria reader takes, and the reader takes it without consulting
+    the status that would have disqualified it. Sealed as a *required* recipient, an
+    unresolved identity became an obligation the run was measured against.
+
+    Both halves were tested separately, which is why a fix at one end left the other
+    standing. With the producer corrected, the chain is broken at its source: the
+    criteria reader still does not read the status, and still would take an address
+    if one were offered, but the resolver no longer offers one. The residual reader
+    weakness is recorded rather than relied upon.
     """
     claims, contacts = _conflicting_resolver_input()
     resolver = IdentityResolver.__new__(IdentityResolver)
@@ -321,14 +330,16 @@ def test_that_manufactured_address_satisfies_a_criteria_that_never_reads_the_sta
         ],
     )
 
-    # A CONFLICTING identity contributed a required recipient.
-    assert criteria.for_gmail_send().required_recipients == frozenset({ALICE})
+    # A CONFLICTING identity contributes no recipient, because it carries no
+    # address to contribute.
+    assert criteria.for_gmail_send().required_recipients == frozenset()
     # And the reader that made that possible never mentions the status.
     assert 'item.get("status")' not in _source(gmail_send_criteria)
     assert 'str(item["email"]).casefold()' in _source(gmail_send_criteria)
 
-    # The contrast that makes the fix decidable: a resolved identity seals the same
-    # way, so the reader cannot distinguish the two by its own output.
+    # The contrast that makes the fix decidable. The reader is unchanged and still
+    # takes whatever address it is handed, so the only reason a conflict now
+    # seals differently is that the resolver declined to name one.
     resolved = resolver._build(
         IdentityStatus.CONTACT_MATCH,
         tuple(claim.evidence for claim in claims[:1]),
@@ -336,13 +347,14 @@ def test_that_manufactured_address_satisfies_a_criteria_that_never_reads_the_sta
         None,
     )
     assert resolved.status is IdentityStatus.CONTACT_MATCH
+    assert resolved.email == ALICE, "a selected entity still publishes its address"
     resolved_criteria = gmail_send_criteria(
         profile="gmail_send",
         identities=[{"status": resolved.status.value, "email": resolved.email}],
     )
-    assert (
+    assert resolved_criteria.for_gmail_send().required_recipients == frozenset({ALICE})
+    assert criteria.for_gmail_send().required_recipients != (
         resolved_criteria.for_gmail_send().required_recipients
-        == criteria.for_gmail_send().required_recipients
     )
 
 

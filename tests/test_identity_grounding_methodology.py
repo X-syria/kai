@@ -37,9 +37,13 @@ from __future__ import annotations
 import inspect
 import textwrap
 from typing import Any, Final
+from uuid import uuid4
 
+import pytest
 from pydantic import BaseModel
 
+from kai.contacts.models import Contact
+from kai.db.models import GoogleAccount
 from kai.identity import IdentityQuery, IdentityResolver, IdentityStatus
 from kai.identity.service import _exact_claims, _has_conflict
 from kai.policy.models import IdentityStatus as PolicyIdentityStatus
@@ -304,11 +308,12 @@ async def test_no_exact_claim_is_unknown_and_a_name_never_grounds() -> None:
 async def test_a_populated_address_cannot_override_the_identity_decision() -> None:
     """Case 5 — the address is a payload, never a source of authority.
 
-    Two entities matched on two identifiers still carry the queried email on the
-    result, because ``_build`` populates the address from the claims before the
-    conflict verdict is applied. That populated address must not promote the
-    result: ``CONFLICTING`` stands, confidence stays zero, and no entity is named.
-    The runtime's single writer refuses the row on status, not on the address.
+    Two entities matched on two identifiers resolve to ``CONFLICTING``. The
+    resolver no longer carries the queried email out on that verdict at all:
+    a status that selected nothing publishes no identifier, which is the same
+    rule the ambiguous-name case below already relied on. Confidence stays zero
+    and no entity is named. The runtime's single writer refuses the row on
+    status, and there is now no address for a downstream reader to seize on.
     """
     async with session_scope() as session:
         tenant, user = await make_tenant_user("owner-6@corp.example")
@@ -329,10 +334,11 @@ async def test_a_populated_address_cannot_override_the_identity_decision() -> No
                 account_id=account.id, identity=query,
             ),
         )
-        # The address is there...
-        assert result.email == ALICE
-        # ...and the decision is unaffected by it.
+        # No winner, so nothing that would name one leaves the resolver.
         assert result.status is IdentityStatus.CONFLICTING
+        assert result.email is None
+        assert result.phone is None
+        assert result.contact_id is None
         assert result.confidence == 0.0
 
         # The same must hold when the only thing supplied is a display name that
@@ -514,3 +520,102 @@ def test_the_status_predicate_and_the_conflict_rule_are_the_same_rule() -> None:
     assert resolve.count(ENTITY_METRIC) == 1
     assert conflict.count(ENTITY_METRIC) == 1
     assert build.count(ENTITY_METRIC) == 1
+
+
+# ---------------------------------------------------------------------------
+# The producer contract: a verdict that selected nothing names nothing
+# ---------------------------------------------------------------------------
+
+
+_SELECTING: Final = (
+    IdentityStatus.PROVIDER_VERIFIED,
+    IdentityStatus.CHANNEL_VERIFIED,
+    IdentityStatus.CONTACT_MATCH,
+)
+_NOT_SELECTING: Final = (IdentityStatus.CONFLICTING, IdentityStatus.UNKNOWN)
+
+
+def _claims_for(*contacts: Contact) -> list[Any]:
+    """Exact claims over real ``Contact`` rows, as the resolver sees them."""
+    return _exact_claims(IdentityQuery(email=ALICE), list(contacts))
+
+
+def _entity(resource_name: str, display_name: str, *emails: str) -> Contact:
+    return Contact(
+        resource_name=resource_name,
+        display_name=display_name,
+        emails=emails,
+        phone_numbers=(),
+    )
+
+
+@pytest.mark.parametrize("status", _NOT_SELECTING)
+def test_a_verdict_that_selected_nothing_publishes_no_identifier(
+    status: IdentityStatus,
+) -> None:
+    """The contract, stated once: no winner means no address, phone, or contact.
+
+    ``_has_conflict`` promises CONFLICTING never picks a winner. UNKNOWN never
+    picked one either; it is the verdict for "nothing constrained the answer".
+    Both used to publish identifiers anyway, because ``_build`` populated them
+    from the claims without asking the status. Enforcing it at the producer is
+    what lets every downstream reader keep treating the shape as trustworthy
+    instead of defensively re-deriving whether a value may be consumed.
+    """
+    resolver = IdentityResolver.__new__(IdentityResolver)
+    claims = _claims_for(
+        _entity("people/1", "Alice", ALICE),
+        _entity("people/2", "Alice too", ALICE),
+    )
+
+    result = resolver._build(status, tuple(c.evidence for c in claims), claims, None)
+
+    assert result.status is status
+    assert result.email is None
+    assert result.phone is None
+    assert result.contact_id is None
+    assert result.display_name is None
+    # Confidence was already zero for both verdicts and stays derived from
+    # evidence, never hand-set to make this test pass.
+    assert result.confidence == 0.0
+    # Refusing to select is not the same as forgetting: the evidence survives so
+    # the conflict remains auditable.
+    assert result.evidence
+
+
+@pytest.mark.parametrize("status", _SELECTING)
+def test_a_verdict_that_selected_an_entity_still_names_it(status: IdentityStatus) -> None:
+    """The other half of the contract, so the fix cannot be over-applied.
+
+    A tightening that silenced every status would satisfy the CONFLICTING rule
+    and quietly break every positive resolution, leaving nothing able to fulfil
+    anything. These three must keep publishing, and they must keep publishing an
+    address: the account-bound pair from the account, the contact-bound one from
+    the claim that established it.
+    """
+    resolver = IdentityResolver.__new__(IdentityResolver)
+    claims = _claims_for(_entity("people/1", "Alice", ALICE))
+    account = GoogleAccount(
+        id=uuid4(),
+        tenant_id=uuid4(),
+        user_id=uuid4(),
+        google_sub="sub-owner",
+        email="owner@corp.example",
+        scopes="https://www.googleapis.com/auth/calendar",
+        credentials_encrypted="{}",
+    )
+
+    result = resolver._build(
+        status, tuple(c.evidence for c in claims), claims, account
+    )
+
+    assert result.status is status
+    assert result.contact_id == "people/1"
+    assert result.display_name == "Alice"
+    assert result.confidence > 0.0
+    assert result.email is not None
+    if status is IdentityStatus.CONTACT_MATCH:
+        assert result.email == ALICE
+    else:
+        # Account-bound verdicts name the connected account, not the claim.
+        assert result.email == "owner@corp.example"

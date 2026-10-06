@@ -382,9 +382,12 @@ async def test_same_entity_corroboration_is_grounded_and_distinct_entities_are_n
         assert len([e for e in corroborated.evidence if e.contact_id is not None]) == 2
 
         # Case B: two entities. Still CONFLICTING, and still not a recipient — the
-        # correction did not relax the conflict rule.
+        # correction did not relax the conflict rule. It also tightened the
+        # shape: a verdict that names no entity carries no address either, so
+        # a conflict cannot leak outward through a required recipient.
         assert distinct.status is IdentityStatus.CONFLICTING
-        assert distinct.email == ALICE, "and it still carries an address to the reader"
+        assert distinct.email is None
+        assert distinct.phone is None
         assert distinct.contact_id is None
 
         # And one claim on one entity remains positive, which is why the criteria

@@ -56,6 +56,16 @@ if TYPE_CHECKING:
 
 ContactsLoader = Callable[..., Awaitable[Sequence[Contact]]]
 
+#: The statuses that name one resolved entity. A verdict outside this set decided
+#: nothing, so it publishes no identifier of any kind; see ``_build``.
+_SELECTING_STATUSES: Final[frozenset[IdentityStatus]] = frozenset(
+    {
+        IdentityStatus.PROVIDER_VERIFIED,
+        IdentityStatus.CHANNEL_VERIFIED,
+        IdentityStatus.CONTACT_MATCH,
+    }
+)
+
 
 @dataclass(frozen=True)
 class ChannelRule:
@@ -248,8 +258,19 @@ class IdentityResolver:
         exact_claims: list[_Claim],
         account: GoogleAccount | None,
     ) -> IdentityResult:
+        # A verdict that selected an entity may name it. UNKNOWN and CONFLICTING
+        # select nothing, so they publish no contact, no address, and no phone:
+        # a resolver that cannot decide between referents must not hand one
+        # candidate's details outward as though it had. This is the promise
+        # ``_has_conflict`` states, enforced here at the producer so no reader
+        # downstream has to distrust the shape it is given.
+        selects_entity = status in _SELECTING_STATUSES
         distinct_ids = {claim.contact.resource_name for claim in exact_claims}
-        contact = exact_claims[0].contact if len(distinct_ids) == 1 else None
+        contact = (
+            exact_claims[0].contact
+            if selects_entity and len(distinct_ids) == 1
+            else None
+        )
 
         email: str | None = None
         phone: str | None = None
@@ -257,12 +278,24 @@ class IdentityResolver:
             if account is not None and account.email:
                 email = account.email.strip() or None
         else:
-            email_claims = [
-                claim for claim in exact_claims if claim.kind is EvidenceKind.CONTACT_EMAIL
-            ]
-            phone_claims = [
-                claim for claim in exact_claims if claim.kind is EvidenceKind.CONTACT_PHONE
-            ]
+            email_claims = (
+                [
+                    claim
+                    for claim in exact_claims
+                    if claim.kind is EvidenceKind.CONTACT_EMAIL
+                ]
+                if selects_entity
+                else []
+            )
+            phone_claims = (
+                [
+                    claim
+                    for claim in exact_claims
+                    if claim.kind is EvidenceKind.CONTACT_PHONE
+                ]
+                if selects_entity
+                else []
+            )
             if email_claims:
                 email = email_claims[0].value
             if phone_claims:
