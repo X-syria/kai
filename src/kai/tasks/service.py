@@ -21,6 +21,8 @@ from uuid import UUID
 from sqlalchemy import Select, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from kai.alerts import classification
+from kai.alerts import service as alert_service
 from kai.observability import metrics
 from kai.observability.metrics import TASK_FAILURE_STATES
 from kai.observability.tracing import span
@@ -295,6 +297,7 @@ async def _transition_task_locked(
     task = await _load_task_for_update(
         session, task_id=task_id, tenant_id=tenant_id, user_id=user_id
     )
+    previous_state = task.state
     if actor == EXTERNAL_ACTOR and target not in CLIENT_TRANSITION_TARGETS:
         raise InvalidActorError(
             f"state {target} is asserted by the agent runtime, not by a client; "
@@ -337,6 +340,31 @@ async def _transition_task_locked(
         metrics.record_task_event("completed", profile=task.fulfillment_profile)
     elif next_state in TASK_FAILURE_STATES:
         metrics.record_task_event("failed", profile=task.fulfillment_profile)
+
+    # Write the durable intent to notify into the *same* transaction as the
+    # state change, before the commit. That is the whole point of the outbox:
+    # "the failure is durable" and "an operator is owed an alert" become one
+    # commit, so a process that dies immediately afterwards leaves a durable
+    # failure *and* a durable reminder, not a failure nobody was ever told
+    # about. Delivery is a separate process (kai.maintenance.alert_dispatch);
+    # this function never opens a socket and so cannot be slowed down by one.
+    #
+    # An enqueue that raises (a deterministic-id collision with a different
+    # incident) propagates here and rolls the state change back with it, rather
+    # than committing a change whose alert could not be recorded. A duplicate of
+    # an already-recorded incident is a no-op inside enqueue.
+    kind = classification.classify_transition(previous_state, next_state)
+    if kind is not None:
+        moment = task.failed_at or datetime.now(UTC)
+        await alert_service.enqueue_transition_alert(
+            session,
+            task=task,
+            kind=kind,
+            from_state=previous_state,
+            to_state=next_state,
+            occurred_at=moment,
+            schema_version=classification.ALERT_SCHEMA,
+        )
 
     await session.commit()
     await session.refresh(task)
