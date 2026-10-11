@@ -33,6 +33,7 @@ from prometheus_client import (
     generate_latest,
 )
 
+from kai.alerts.classification import ALERT_KIND_FAILURE, ALERT_KIND_RESOLUTION
 from kai.config import get_settings
 from kai.tasks.schemas import FulfillmentProfile
 
@@ -108,6 +109,22 @@ RATE_LIMIT_REJECTION_REASONS: Final[frozenset[str]] = frozenset(
 #: never a SQL statement or a driver message.
 DB_ERROR_OPERATIONS: Final[frozenset[str]] = frozenset({"execute", "commit", "transaction"})
 
+#: The two external alert kinds are the classification contract's, defined once
+#: in :mod:`kai.alerts.classification` and imported here so the metric label
+#: vocabulary cannot drift from the kinds the delivery path actually emits.
+
+#: Whether the delivery itself worked. ``disabled`` is recorded rather than
+#: skipped so that "alerting is off" is visible on the exposition instead of
+#: looking identical to "nothing ever failed".
+ALERT_OUTCOME_SENT: Final[str] = "sent"
+ALERT_OUTCOME_FAILED: Final[str] = "failed"
+ALERT_OUTCOME_DISABLED: Final[str] = "disabled"
+
+ALERT_KINDS: Final[frozenset[str]] = frozenset({ALERT_KIND_FAILURE, ALERT_KIND_RESOLUTION})
+ALERT_OUTCOMES: Final[frozenset[str]] = frozenset(
+    {ALERT_OUTCOME_SENT, ALERT_OUTCOME_FAILED, ALERT_OUTCOME_DISABLED}
+)
+
 #: HTTP methods this service labels. A closed set for the same cardinality
 #: reason as every other label: an ASGI server can hand a middleware any token
 #: in the request line, so the method is untrusted input too.
@@ -162,6 +179,14 @@ class _MetricSet:
     db_errors_total: Counter
     revocation_purge_runs_total: Counter
     revocation_purged_rows_total: Counter
+    alerts_delivered_total: Counter
+    alerts_queue_pending: Gauge
+    alerts_queue_retryable: Gauge
+    alerts_queue_oldest_seconds: Gauge
+    alerts_delivering: Gauge
+    alerts_permanently_failed: Gauge
+    alerts_dispatcher_last_success_age_seconds: Gauge
+    alerts_dispatcher_last_start_age_seconds: Gauge
     process_up: Gauge
 
 
@@ -258,6 +283,57 @@ def _build() -> _MetricSet:
         revocation_purged_rows_total=Counter(
             "kai_revocation_purged_rows_total",
             "Expired revoked_tokens rows deleted by the purge.",
+            registry=registry,
+        ),
+        alerts_delivered_total=Counter(
+            "kai_alerts_delivered_total",
+            "External operational alerts, by bounded kind and delivery outcome.",
+            ["kind", "outcome"],
+            registry=registry,
+        ),
+        # The durable outbox is written by the application and drained by a
+        # separate one-shot dispatcher, so these are read from the database at
+        # scrape time (see kai.api.metrics) rather than incremented in-process:
+        # the process that delivers an alert is not the process that is scraped.
+        # Unlabelled on purpose - they are counts of a single queue, and a label
+        # would only invite a cardinality that nothing needs.
+        alerts_queue_pending=Gauge(
+            "kai_alerts_queue_pending",
+            "Alerts recorded and not yet delivered, with no attempt in flight.",
+            registry=registry,
+        ),
+        alerts_queue_retryable=Gauge(
+            "kai_alerts_queue_retryable",
+            "Failed alerts a dispatcher will retry (next_attempt_at is set).",
+            registry=registry,
+        ),
+        alerts_queue_oldest_seconds=Gauge(
+            "kai_alerts_queue_oldest_seconds",
+            "Age of the oldest undelivered alert; 0 when the queue is empty.",
+            registry=registry,
+        ),
+        alerts_delivering=Gauge(
+            "kai_alerts_delivering",
+            "Alerts currently claimed by a dispatcher under a live lease.",
+            registry=registry,
+        ),
+        alerts_permanently_failed=Gauge(
+            "kai_alerts_permanently_failed",
+            "Alerts parked at FAILED with no further attempt scheduled.",
+            registry=registry,
+        ),
+        # The dispatcher is one-shot, so it cannot expose its own liveness; it
+        # stamps a database row instead and the application turns the age of
+        # that row into these two gauges. +Inf means no sweep has ever
+        # completed/started, which is maximally stale, not unknown.
+        alerts_dispatcher_last_success_age_seconds=Gauge(
+            "kai_alerts_dispatcher_last_success_age_seconds",
+            "Seconds since the alert dispatcher last completed a clean sweep.",
+            registry=registry,
+        ),
+        alerts_dispatcher_last_start_age_seconds=Gauge(
+            "kai_alerts_dispatcher_last_start_age_seconds",
+            "Seconds since the alert dispatcher last began a sweep.",
             registry=registry,
         ),
         process_up=Gauge(
@@ -455,6 +531,68 @@ def record_db_error(operation: str) -> None:
     metric = get_metrics().db_errors_total
     label = {"operation": _bounded(operation, DB_ERROR_OPERATIONS)}
     _safe("kai_db_errors_total", lambda: metric.labels(**label).inc())
+
+
+def record_alert_delivery(kind: str, outcome: str) -> None:
+    """Record one external alert and whether it was actually delivered.
+
+    An alerting path whose own failures are invisible is not an alerting path:
+    a receiver that started returning 500 would otherwise look exactly like a
+    quiet night. Both label values are bounded, so a future call site cannot
+    invent a cardinality.
+    """
+    metric = get_metrics().alerts_delivered_total
+    label = {
+        "kind": _bounded(kind, ALERT_KINDS),
+        "outcome": _bounded(outcome, ALERT_OUTCOMES),
+    }
+    _safe("kai_alerts_delivered_total", lambda: metric.labels(**label).inc())
+
+
+def set_alert_queue(
+    *,
+    pending: float,
+    retryable: float,
+    in_flight: float,
+    permanently_failed: float,
+    oldest_pending_age_seconds: float,
+) -> None:
+    """Set the outbox depth gauges from a database snapshot.
+
+    Called by the metrics endpoint on each scrape, not by the dispatcher: the
+    dispatcher is a one-shot process whose counters would die with it.
+    """
+    m = get_metrics()
+    _safe("kai_alerts_queue_pending", lambda: m.alerts_queue_pending.set(pending))
+    _safe("kai_alerts_queue_retryable", lambda: m.alerts_queue_retryable.set(retryable))
+    _safe("kai_alerts_delivering", lambda: m.alerts_delivering.set(in_flight))
+    _safe(
+        "kai_alerts_permanently_failed",
+        lambda: m.alerts_permanently_failed.set(permanently_failed),
+    )
+    _safe(
+        "kai_alerts_queue_oldest_seconds",
+        lambda: m.alerts_queue_oldest_seconds.set(oldest_pending_age_seconds),
+    )
+
+
+def set_alert_dispatcher_freshness(
+    *,
+    last_success_age_seconds: float,
+    last_start_age_seconds: float,
+) -> None:
+    """Set the dispatcher-freshness gauges. ``inf`` means no sweep on record."""
+    m = get_metrics()
+    _safe(
+        "kai_alerts_dispatcher_last_success_age_seconds",
+        lambda: m.alerts_dispatcher_last_success_age_seconds.set(
+            last_success_age_seconds
+        ),
+    )
+    _safe(
+        "kai_alerts_dispatcher_last_start_age_seconds",
+        lambda: m.alerts_dispatcher_last_start_age_seconds.set(last_start_age_seconds),
+    )
 
 
 def record_purge_run(result: str, *, purged: int = 0) -> None:

@@ -175,5 +175,49 @@ services:
         condition: service_completed_successfully
     restart: "no"
 
+  # One-shot alert-outbox dispatcher. The same image and code as the app, a
+  # different entrypoint, for the same reason as the purge above: the application
+  # must not own a schedule, and a task transition must never wait on a socket.
+  #
+  #   docker compose run --rm dispatch-alerts
+  #
+  # and schedule that command every minute in whatever already runs scheduled
+  # jobs. The shipped schedule is deploy/scheduler/kai.cron, which calls
+  # deploy/scheduler/run-dispatch-alerts.sh.
+  #
+  # Alerting is armed by the SAME two variables the app validates
+  # (ALERTING_ENABLED and ALERT_WEBHOOK_URL). When they are unset the dispatcher
+  # claims nothing: queued alerts stay PENDING and deliver once a destination
+  # exists. It does not discard them, because the queue is the durable record
+  # that the notification is owed.
+  #
+  # RATE_LIMIT_BACKEND and REDIS_URL are here for the same reason as on migrate:
+  # process-wide fail-closed validation would otherwise stop this job from
+  # starting under ENVIRONMENT=production.
+  dispatch-alerts:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["kai-dispatch-alerts"]
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-kai}:${POSTGRES_PASSWORD:-kai}@db:5432/${POSTGRES_DB:-kai}
+      ENVIRONMENT: ${ENVIRONMENT:-production}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      JWT_SECRET: ${JWT_SECRET:-change-me-in-production}
+      GOOGLE_CREDS_ENCRYPTION_SECRET: ${GOOGLE_CREDS_ENCRYPTION_SECRET:-change-me-google-token-encryption}
+      RATE_LIMIT_BACKEND: ${RATE_LIMIT_BACKEND:-redis}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      ALERTING_ENABLED: ${ALERTING_ENABLED:-false}
+      ALERT_WEBHOOK_URL: ${ALERT_WEBHOOK_URL:-}
+      ALERT_TIMEOUT_SECONDS: ${ALERT_TIMEOUT_SECONDS:-5.0}
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    restart: "no"
+
 volumes:
   kai_pgdata:

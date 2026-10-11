@@ -1199,6 +1199,14 @@ def test_the_exposed_metric_set_is_a_declared_and_bounded_one() -> None:
         "kai_db_errors_total",
         "kai_revocation_purge_runs_total",
         "kai_revocation_purged_rows_total",
+        "kai_alerts_delivered_total",
+        "kai_alerts_queue_pending",
+        "kai_alerts_queue_retryable",
+        "kai_alerts_queue_oldest_seconds",
+        "kai_alerts_delivering",
+        "kai_alerts_permanently_failed",
+        "kai_alerts_dispatcher_last_success_age_seconds",
+        "kai_alerts_dispatcher_last_start_age_seconds",
         "kai_process_up",
     }
     exposed = {

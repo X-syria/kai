@@ -1,6 +1,7 @@
 import json
 from functools import lru_cache
 from typing import Annotated, Any, Final, Literal
+from urllib.parse import urlparse
 
 from pydantic import BeforeValidator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -192,6 +193,33 @@ class Settings(BaseSettings):
     tracing_accept_inbound: bool = False
     tracing_sample_ratio: float = 1.0
 
+    # ------------------------------------------------------------------
+    # External operational alerting
+    # ------------------------------------------------------------------
+    # Metrics and traces are *pulled* by something else, so on their own they
+    # cannot tell an operator that a specific execution failed. This is the one
+    # place KAI pushes: a single JSON POST to a webhook the operator already
+    # owns, fired when a task's durable state enters a failure and again when
+    # it leaves one.
+    #
+    # Off unless explicitly enabled. A URL alone sends nothing, so a deployment
+    # cannot leak task identifiers to a third party by accident, and
+    # production refuses a URL configured with the switch off (see
+    # ``_validate_production_observability_settings``) because that is a
+    # control that looks armed while doing nothing.
+    #
+    # Like every other observability path here, alerting is never allowed to
+    # become a dependency of the operation it observes: a webhook that is down,
+    # slow, or misconfigured must not fail the transition that raised the alert.
+    alerting_enabled: bool = False
+    # Treated as a secret. Incoming-webhook URLs for Slack, PagerDuty and most
+    # SaaS receivers embed a token in the path, so it is never logged, never
+    # echoed into a payload, and never included in an error message.
+    alert_webhook_url: str = ""
+    # Short, because the alert is emitted inline with a state transition that
+    # holds a row lock. A slow receiver must not hold that lock open.
+    alert_timeout_seconds: float = 5.0
+
 
 @lru_cache
 def get_settings() -> Settings:
@@ -277,6 +305,11 @@ def _validate_production_observability_settings(settings: Settings) -> None:
     endpoint. Telemetry never becomes a hard dependency: none of these checks
     can stop the service from serving traffic.
     """
+    _validate_production_metrics_settings(settings)
+    _validate_production_alerting_settings(settings)
+
+
+def _validate_production_metrics_settings(settings: Settings) -> None:
     if not settings.metrics_enabled:
         return
     path = settings.metrics_path
@@ -291,6 +324,45 @@ def _validate_production_observability_settings(settings: Settings) -> None:
             f"METRICS_PATH must not shadow a built-in endpoint ({path!r}). Serve "
             "observability on its own path, e.g. /api/v1/metrics."
         )
+
+
+def _validate_production_alerting_settings(settings: Settings) -> None:
+    """Refuse production alerting that is silently disarmed or sent in the clear.
+
+    Three ways this can look configured and still not page anyone:
+
+    * a URL set with ``ALERTING_ENABLED`` left off - the operator pasted the
+      webhook, believed alerts were flowing, and nothing was ever sent;
+    * the switch on with no URL - alerting is on and can only ever fail;
+    * ``http`` - the payload names which tenant and which task failed, so
+      putting it on the wire in plaintext hands that to anyone on the path. An
+      operator who needs a plaintext receiver terminates TLS in front of it.
+
+    The URL itself is never quoted in these messages: for every common receiver
+    it embeds a live token in its path.
+    """
+    url = settings.alert_webhook_url.strip()
+    if url and not settings.alerting_enabled:
+        raise RuntimeError(
+            "ALERT_WEBHOOK_URL is set but ALERTING_ENABLED is false, so no alert "
+            "would ever be sent; set ALERTING_ENABLED=true or clear the URL"
+        )
+    if not settings.alerting_enabled:
+        return
+    if not url:
+        raise RuntimeError(
+            "ALERTING_ENABLED=true requires ALERT_WEBHOOK_URL in production; "
+            "without it every alert is discarded"
+        )
+    parsed = urlparse(url)
+    if parsed.scheme != "https":
+        raise RuntimeError(
+            f"ALERT_WEBHOOK_URL must use https in production; got {parsed.scheme!r}. "
+            "The payload identifies the tenant and the failed task, so plaintext "
+            "http discloses it to every hop on the path."
+        )
+    if not parsed.netloc:
+        raise RuntimeError("ALERT_WEBHOOK_URL must include a host")
 
 
 #: Built-in routes a metrics path must never collide with.

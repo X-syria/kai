@@ -46,3 +46,11 @@ COMPOSE_PROJECT_NAME=kai
 #: the deployment's .env (its real secrets) without this file containing any.
 #: Every run is also timed out, so a wedged database cannot overlap the next one.
 */15 * * * * TZ=UTC KAI_COMPOSE_PROJECT_NAME=$COMPOSE_PROJECT_NAME cd $KAI_HOME && TZ=UTC ./deploy/scheduler/run-purge-revocations.sh >> $KAI_HOME/var/purge-scheduler.log 2>&1
+
+#: Alert-outbox dispatch. Every minute, not every 15: a task failure is an
+#: operator-facing commitment and the delivery latency is the whole point of the
+#: path. The job is a single indexed claim (ix_alerts_due) in the common case of
+#: an empty queue, and the stale-worker alert (KaiAlertDispatchWorkerStale) has a
+#: 5-minute threshold derived from this cadence, so the interval and the rule move
+#: together.
+* * * * * TZ=UTC KAI_COMPOSE_PROJECT_NAME=$COMPOSE_PROJECT_NAME cd $KAI_HOME && TZ=UTC ./deploy/scheduler/run-dispatch-alerts.sh >> $KAI_HOME/var/dispatch-scheduler.log 2>&1

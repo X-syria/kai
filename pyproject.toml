@@ -64,8 +64,15 @@ dev = [
 # (cron / Kubernetes CronJob / systemd timer) invokes this and it exits. It
 # takes a PostgreSQL transaction-scoped advisory lock, so overlapping replicas'
 # runs collapse into one purge and the losers exit 0 without doing work.
+#
+# The alert dispatcher is the same shape for the same reason: it drains the
+# durable alert outbox that task transitions fill, and it must not run inside the
+# process that raises alerts. Its concurrency guard is a per-row claim lease
+# rather than an advisory lock, so two runs deliver different rows instead of one
+# run doing nothing.
 [project.scripts]
 kai-purge-revocations = "kai.maintenance.revocation_purge:main"
+kai-dispatch-alerts = "kai.maintenance.alert_dispatch:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/kai"]

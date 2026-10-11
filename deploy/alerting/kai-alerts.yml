@@ -1,10 +1,16 @@
 # Alert rules for KAI.
 #
-# Scope: this file is the *rules*. It is not a monitoring system, and KAI
-# contains no notification code. Loading this file requires a Prometheus that
-# already scrapes KAI's metrics endpoint; delivering the alerts requires a
-# notification target that already exists in the deployment. See
-# docs/ALERTING.md for both wirings.
+# Scope: this file is the *rules*. It is not a monitoring system. Loading this
+# file requires a Prometheus that already scrapes KAI's metrics endpoint;
+# delivering the alerts requires a notification target that already exists in
+# the deployment. See docs/ALERTING.md for both wirings.
+#
+# These rules watch the *service*: whether it is up, whether its database is
+# reachable, whether errors are spiking. They cannot know that one specific task
+# failed. That is a separate, in-process path - KAI pushes an alert itself when
+# a task's durable state enters an unresolved failure (ALERTING_ENABLED and
+# ALERT_WEBHOOK_URL in .env.example). The two are complementary: these rules
+# catch the instance, the other catches the individual operation.
 #
 #   promtool check rules deploy/alerting/kai-alerts.yml
 #
@@ -283,3 +289,56 @@ groups:
           description: >-
             Task failure ratio has exceeded 25% for 15 minutes. Expressed as a
             ratio against tasks actually run, so a quiet hour cannot fire it.
+
+      - alert: KaiAlertDispatchWorkerStale
+        # kai_alerts_dispatcher_last_success_age_seconds is
+        # (now - last completed sweep), computed by the APPLICATION process from
+        # the alert_dispatcher_state table. It is the one signal for the outbox
+        # that does not die with the dispatcher: a one-shot process's own
+        # counters are destroyed on exit, exactly like the purge's.
+        #
+        # 300s = five scheduler ticks. deploy/scheduler/kai.cron runs the
+        # dispatcher every minute, so one missed run (a slow deploy, a transient
+        # database fault) does not fire it; five in a row means the scheduled job
+        # is not running. If the cadence changes, this threshold moves with it.
+        #
+        # +Inf appears when no sweep has *ever* completed: a deployment that has
+        # never installed the schedule, and one whose dispatcher has never
+        # reached the database, are the same condition and both are caught here.
+        #
+        # Alerting being disabled is not this condition: the disabled sweep still
+        # stamps a completion, so this rule does not fire merely because no
+        # webhook is configured.
+        expr: kai_alerts_dispatcher_last_success_age_seconds > 300
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: The alert dispatcher has not completed a sweep
+          description: >-
+            No alert-outbox sweep has completed in over 5 minutes while the
+            schedule is set to run one every minute. The scheduled job is not
+            running, is crashing before it reaches the database, or the database
+            is unreachable. Alerts may be queued and undelivered; check
+            kai_alerts_queue_pending and the dispatch-scheduler log.
+
+      - alert: KaiUndeliveredAlerts
+        # A permanent failure is a durable row the dispatcher has stopped trying
+        # to deliver: the destination refused it in a way retries cannot fix
+        # (a non-retryable 4xx), or the attempt budget was exhausted. Either way
+        # an operator was never told about a task failure, which is the one
+        # outcome the outbox exists to prevent - so this is a warning to
+        # investigate, not noise. It only rises when something was actually owed.
+        expr: kai_alerts_permanently_failed > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: Alerts could not be delivered
+          description: >-
+            One or more alerts have permanently failed delivery and will not be
+            retried without operator action. The destination URL is wrong, the
+            receiver rejected the payload, or the retry budget was exhausted
+            while the receiver was down. Inspect the alerts table for the
+            last_error and re-arm the destination; do not assume the affected
+            task failures were benign.

@@ -5,4 +5,4 @@ provides minimal, deterministic, production-safe instrumentation that never
 leaks sensitive identifiers into metric labels.
 """ 
 
-__all__ = ["metrics", "tracing"]
+__all__ = ["alerting", "metrics", "tracing"]
