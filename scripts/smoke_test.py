@@ -29,7 +29,7 @@ REGISTER_URL = "http://127.0.0.1:8000/api/v1/auth/register"
 METRICS_URL = "http://127.0.0.1:8000/api/v1/metrics"
 DB_NAME = "kai_smoke"
 DB_USER = "kai"
-EXPECTED_HEAD = "d4e5f6a7b8c9"
+EXPECTED_HEAD = "e6f7a8b9c0d1"
 
 failures: list[str] = []
 

@@ -3294,7 +3294,7 @@ async def test_trigger_rejects_unknown_task(client: httpx.AsyncClient) -> None:
 
 REVISION_PREV = "d1a2b3c4e5f6"
 # The repository head, which moves as later rounds add migrations.
-REVISION_HEAD = "d4e5f6a7b8c9"
+REVISION_HEAD = "e6f7a8b9c0d1"
 
 
 def _alembic(*args: str) -> subprocess.CompletedProcess[str]:

@@ -26,8 +26,20 @@ from __future__ import annotations
 import pytest
 from sqlalchemy import text
 
+# Every model module registers its tables on ``Base.metadata`` as a side effect of
+# being imported, so the parity below is only true if all of them are loaded.
+# This mirrors ``alembic/env.py``: a module that exists and declares a table but
+# is never imported here would report as drift the other way — the database holding
+# a comment no model claims.
+from kai.alerts import models as alert_models  # noqa: F401
+from kai.approvals import models as approval_models  # noqa: F401
+from kai.db import models as db_models  # noqa: F401
 from kai.db.base import Base
 from kai.db.engine import engine
+from kai.memory import models as memory_models  # noqa: F401
+from kai.planner import models as planner_models  # noqa: F401
+from kai.runtime import models as runtime_models  # noqa: F401
+from kai.tasks import models as task_models  # noqa: F401
 
 #: Alembic's bookkeeping table. It is created by the migration runner, is not
 #: part of application metadata, and carries no comments, so including it would

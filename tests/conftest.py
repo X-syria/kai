@@ -90,7 +90,8 @@ async def _clean_state() -> AsyncIterator[None]:
                 "TRUNCATE TABLE tenants, users, google_accounts, tasks, task_plans,"
                 " approvals, approval_rule_suggestions, runtime_executions,"
                 " memory_entries,"
-                " memory_preferences, revoked_tokens"
+                " memory_preferences, revoked_tokens,"
+                " alerts, alert_dispatcher_state"
                 " RESTART IDENTITY CASCADE"
             )
         )
@@ -101,7 +102,8 @@ async def _clean_state() -> AsyncIterator[None]:
                 "TRUNCATE TABLE tenants, users, google_accounts, tasks, task_plans,"
                 " approvals, approval_rule_suggestions, runtime_executions,"
                 " memory_entries,"
-                " memory_preferences, revoked_tokens"
+                " memory_preferences, revoked_tokens,"
+                " alerts, alert_dispatcher_state"
                 " RESTART IDENTITY CASCADE"
             )
         )

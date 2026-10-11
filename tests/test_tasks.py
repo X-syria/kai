@@ -937,7 +937,9 @@ async def test_responses_never_expose_internal_metadata(
 REVISION_PREV = "5f3e1d2c4b6a"
 # The repository head, which moves as later rounds add migrations. This test
 # only cares that downgrade -> upgrade is clean and that the head is applied.
-REVISION_HEAD = "d4e5f6a7b8c9"
+# Head is ``e6f7a8b9c0d1`` (``add_alert_outbox``), which chains off
+# ``a1b2c3d4e5f7`` (``add_alerts``).
+REVISION_HEAD = "e6f7a8b9c0d1"
 
 
 def _alembic(*args: str) -> subprocess.CompletedProcess[str]:

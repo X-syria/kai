@@ -6,6 +6,7 @@ from sqlalchemy import pool
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
 # Import models so their tables are registered on Base.metadata.
+from kai.alerts import models as alert_models  # noqa: F401
 from kai.approvals import models as approval_models  # noqa: F401
 from kai.config import get_settings
 from kai.db import models  # noqa: F401
