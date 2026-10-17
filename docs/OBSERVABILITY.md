@@ -66,7 +66,20 @@ two.
 | `kai_db_errors_total` | counter | `operation` |
 | `kai_revocation_purge_runs_total` | counter | `result` |
 | `kai_revocation_purged_rows_total` | counter | none |
+| `kai_alerts_queue_pending` | gauge | none |
+| `kai_alerts_queue_retryable` | gauge | none |
+| `kai_alerts_queue_oldest_seconds` | gauge | none |
+| `kai_alerts_delivering` | gauge | none |
+| `kai_alerts_permanently_failed` | gauge | none |
+| `kai_alerts_dispatcher_last_success_age_seconds` | gauge | none |
+| `kai_alerts_dispatcher_last_start_age_seconds` | gauge | none |
 | `kai_process_up` | gauge | none |
+
+The `kai_alerts_*` gauges are the outbox view of task-execution alerting. Unlike
+the counters above, they are not incremented in-process: they are queried from the
+database when the metrics route is scraped, so they describe the queue even though
+the `kai-dispatch-alerts` worker that drains it is a short-lived, separate
+process. See `docs/ALERTING.md`.
 
 Closed label sets:
 
@@ -87,6 +100,8 @@ Closed label sets:
 | `kai_revocation_purge_runs_total{result="failed"}` rising | The purge has stopped working and the table is growing |
 | `kai_revocation_purge_runs_total{result="purged"}` flat while rows exist | Same failure, seen from the other side |
 | `rate(kai_auth_failures_total{reason="revoked"}[5m])` rising | Either a token-reuse pattern or a purge that deleted too early |
+| `kai_alerts_dispatcher_last_success_age_seconds > 300` | The alert dispatcher has stopped completing sweeps while alerting is owed |
+| `kai_alerts_permanently_failed > 0` | A task-execution alert was owed and is no longer being retried |
 
 There is no alerting hook in this service. These are thresholds for whatever
 already watches your infrastructure.

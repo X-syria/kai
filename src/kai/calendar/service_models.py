@@ -29,10 +29,17 @@ class FieldMismatch:
 @dataclass(frozen=True)
 class CreateEventOutcome:
     """The read-after-create result. ``verified`` is True only when the event
-    read back from Google matches every requested field exactly."""
+    read back from Google matches every requested field exactly.
+
+    ``created_event_id`` is the id the provider returned for the accepted write.
+    It is retained even when the read-back could not confirm the event, so an
+    accepted creation is never silently forgotten just because it could not be
+    read back.
+    """
 
     event: CalendarEvent | None
     mismatches: tuple[FieldMismatch, ...] = field(default_factory=tuple)
+    created_event_id: str | None = None
 
     @property
     def verified(self) -> bool:

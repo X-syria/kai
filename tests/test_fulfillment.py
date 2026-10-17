@@ -42,9 +42,16 @@ from kai.runtime.fulfillment import (
     calendar_meeting_criteria,
     evaluate_calendar_meeting,
 )
-from kai.runtime.schemas import MeetingWindow
+from kai.runtime.schemas import EXTERNAL_OUTCOME_UNKNOWN, MeetingWindow
 from kai.runtime.service import RuntimeFatal, _fulfillment_outcome
 from kai.tasks.schemas import TaskContractInput
+from kai.tools.errors import (
+    APPROVAL_STALE,
+    PROVIDER_ERROR,
+    PROVIDER_NOT_CONTACTED,
+    PROVIDER_SERVER_ERROR,
+    PROVIDER_UNREACHABLE,
+)
 
 WINDOW: Final = MeetingWindow(
     start_date=date(2026, 6, 22),
@@ -116,7 +123,6 @@ def _inputs(*evidence: dict[str, Any], identities: Any = IDENTITIES) -> Fulfillm
     )
 
 
-
 # --- helpers for describing the relevant evidence set -------------------------
 
 
@@ -153,6 +159,206 @@ def _misplaced_creation(**overrides: Any) -> dict[str, Any]:
     }
     values.update(overrides)
     return _created(**values)
+
+
+def _lost_answer(**overrides: Any) -> dict[str, Any]:
+    """A creation attempt whose external outcome KAI could not establish.
+
+    Deliberately shaped like a *refused* run in every respect except the one that
+    matters: ``ok`` is false and there is no provider event id, so it cannot
+    become a witness by accident.
+
+    **The field that makes it unknown is ``external_outcome``, not
+    ``error_code``.** The runtime writes that key as its own conclusion about the
+    provider's side; ``error_code`` reports why the gateway returned what it
+    returned, which is a different question. So the default here pairs a
+    known refusal code with an unestablished world — the exact combination that
+    was unrepresentable before, and the reason the two were being conflated.
+    """
+    entry: dict[str, Any] = {
+        "tool": "calendar.create_event",
+        "outcome": "EXECUTION_FAILED",
+        "ok": False,
+        "verified": False,
+        "error_code": APPROVAL_STALE,
+        "external_outcome": EXTERNAL_OUTCOME_UNKNOWN,
+        "args": {
+            "date": "2026-06-24",
+            "start_time": "17:30",
+            "attendees": ["ahmed@example.com"],
+        },
+        "evidence": {},
+    }
+    entry.update(overrides)
+    return entry
+
+
+# --- an unestablished outcome is its own answer, not a failure --------------------
+
+
+@pytest.mark.parametrize(
+    "error_code",
+    [APPROVAL_STALE, PROVIDER_UNREACHABLE, PROVIDER_SERVER_ERROR],
+)
+def test_an_unestablished_external_outcome_is_indeterminate_not_not_fulfilled(
+    error_code: str,
+) -> None:
+    """The empty witness set does not prove absence when the outcome is unknown.
+
+    This is the distinction the whole phase exists for. Read naively, "no
+    verified event in the log" means the meeting was not created, and the run
+    reports failure. That is a claim the durable record does not support: the
+    write may well have landed and lost its receipt.
+    """
+    assert (
+        _verdict(_lost_answer(error_code=error_code))
+        is FulfillmentVerdict.INDETERMINATE
+    )
+
+
+def test_a_provider_refusal_is_still_not_fulfilled() -> None:
+    """The unknown must not swallow failures that really are failures.
+
+    ``PROVIDER_ERROR`` means the provider answered, and a negative answer to a
+    write means the write did not take effect. Reporting that as undecidable
+    would be the same error in the opposite direction: manufacturing doubt where
+    the record is certain, and hiding a real defect behind a human.
+
+    Note the ``external_outcome=None``: the runtime only writes the marker when it
+    actually concluded the world was unestablished, so a known refusal carries no
+    marker at all. That absence is the signal, which is why the fixture has to
+    clear it deliberately.
+    """
+    assert (
+        _verdict(_lost_answer(error_code=PROVIDER_ERROR, external_outcome=None))
+        is FulfillmentVerdict.NOT_FULFILLED
+    )
+
+
+def test_a_write_that_never_reached_the_provider_is_not_fulfilled() -> None:
+    """A connection that was never established is a *known* non-attempt.
+
+    ``PROVIDER_NOT_CONTACTED`` is the strongest negative evidence the system can
+    hold about a write: nothing left the process. Parking it would tell a human
+    the world is undecidable when KAI knows the request was never sent.
+    """
+    assert (
+        _verdict(_lost_answer(error_code=PROVIDER_NOT_CONTACTED, external_outcome=None))
+        is FulfillmentVerdict.NOT_FULFILLED
+    )
+
+
+def test_a_read_that_lost_its_answer_does_not_make_the_verdict_unknown() -> None:
+    """Only a write's unknown is undecidable; a read's is just retryable.
+
+    The record below belongs to no witnessed tool, so it is not an undetermined
+    creation. Nothing about the *meeting* became undecidable \u2014 only a lookup did.
+    """
+    assert (
+        _verdict(_lost_answer(tool="calendar.read_slots", external_outcome=None))
+        is FulfillmentVerdict.NOT_FULFILLED
+    )
+
+
+def test_an_unverified_creation_with_an_unknown_outcome_is_indeterminate() -> None:
+    """The provider answered but could not confirm it \u2014 still not proof of absence.
+
+    Read-after-create that finds nothing is an answer the *verification boundary*
+    gave, but it does not say the event does not exist; it says the event could
+    not be vouched for. Paired with an unestablished outcome the honest verdict is
+    the third one.
+    """
+    record = _lost_answer(outcome="EXECUTION_SUCCEEDED", error_code=PROVIDER_UNREACHABLE)
+    assert _verdict(record) is FulfillmentVerdict.INDETERMINATE
+
+
+def test_a_proven_witness_outranks_an_unknown_outcome() -> None:
+    """Proof settles the question even when another attempt never concluded.
+
+    The question is whether such a meeting *exists*, not whether every attempt
+    finished. Once a witness satisfies every criterion, the unknown cannot
+    un-prove it, and reporting INDETERMINATE here would park a task that is
+    demonstrably done.
+    """
+    assert (
+        _verdict(_created(), _lost_answer())
+        is FulfillmentVerdict.FULFILLED
+    )
+    assert (
+        _verdict(_lost_answer(), _created())
+        is FulfillmentVerdict.FULFILLED
+    )
+
+
+def test_a_witness_on_the_wrong_day_does_not_outrank_an_unknown_outcome() -> None:
+    """Proof only counts when it satisfies the criteria.
+
+    A qualifying creation that booked the wrong day proves the provider responded
+    and that *this* meeting was not created. An unknown remains possible, so the
+    verdict cannot collapse to either certainty.
+    """
+    assert (
+        _verdict(_misplaced_creation(), _lost_answer())
+        is FulfillmentVerdict.INDETERMINATE
+    )
+
+
+def test_the_unknown_is_never_itself_a_witness() -> None:
+    """An unestablished record cannot be promoted into evidence that it happened.
+
+    The record that reports an unknown carries no provider event id. If it could
+    qualify, a run that reached nothing would be able to satisfy the ``event_id``
+    criterion with its own failure.
+    """
+    from kai.runtime.evidence import qualifying_creations, undetermined_creations
+
+    record = _lost_answer()
+    assert qualifying_creations([record]) == ()
+    assert len(undetermined_creations([record])) == 1
+
+
+def test_no_relevant_evidence_at_all_is_still_not_fulfilled() -> None:
+    """Indeterminacy needs an unknown; silence on its own is a decision.
+
+    An empty log means nothing was attempted, which is decidable, and reading it
+    as INDETERMINATE would make the third value the default for every run that
+    never started.
+    """
+    assert _verdict() is FulfillmentVerdict.NOT_FULFILLED
+
+
+def test_an_unknown_outcome_is_not_a_vacuous_fulfillment() -> None:
+    """The empty-set-is-not-fulfilled rule still binds when nothing is known."""
+    assert _verdict(_lost_answer()) is not FulfillmentVerdict.FULFILLED
+
+
+def test_the_verdict_is_invariant_to_where_the_unknown_sits() -> None:
+    """Undeterminacy is a property of the set, not of the log's order."""
+    first = _lost_answer()
+    second = _lost_answer(error_code=PROVIDER_UNREACHABLE)
+    verdicts = {
+        _verdict(first, second),
+        _verdict(second, first),
+    }
+    assert verdicts == {FulfillmentVerdict.INDETERMINATE}
+
+
+@pytest.mark.parametrize("marker", [42, "unknown", "UNKNOWN ", None, True, []])
+def test_only_the_exact_marker_value_makes_a_record_unknown(marker: object) -> None:
+    """The marker is matched exactly; nothing near-miss counts as unknown.
+
+    ``external_outcome`` is compared against one literal. A malformed or
+    near-miss value is treated as absent rather than coerced, because coercing it
+    would let a corrupt record manufacture doubt about a write that the record
+    otherwise says nothing about.
+    """
+    record = _lost_answer(error_code=APPROVAL_STALE, external_outcome=marker)
+    expected = (
+        FulfillmentVerdict.INDETERMINATE
+        if marker == EXTERNAL_OUTCOME_UNKNOWN
+        else FulfillmentVerdict.NOT_FULFILLED
+    )
+    assert _verdict(record) is expected
 
 
 # --- the verdict is a pure function of the durable inputs ------------------------
@@ -1185,20 +1391,21 @@ def test_the_model_cannot_add_a_condition_by_describing_one() -> None:
 
 
 def test_the_dispatch_stays_a_closed_vocabulary_and_not_a_registry() -> None:
-    """The dispatch is still written out, and now answers two closed questions.
+    """The dispatch is still written out, and now answers three closed questions.
 
     This began as a guard against the temptation to make the criteria generic
     *just in case* while only one domain existed. A second domain arrived — the
-    ``gmail_send`` experiment — and the temptation is the same and one step
-    closer, because two domains that *look* alike invite the rule that would
-    generate the third. So the guard is kept and re-aimed rather than deleted:
+    ``gmail_send`` experiment — and then a third, the ``task_preparation`` local
+    slice — and the temptation is the same and one step closer each time, because
+    domains that *look* alike invite the rule that would generate the next one.
+    So the guard is kept and re-aimed rather than deleted:
 
-    * both evaluators are called once each, from an explicit branch — a registry
-      would replace the two counts with one lookup;
+    * every evaluator is called once each, from an explicit branch — a registry
+      would replace the counts with one lookup;
     * the forbidden machinery is still absent, so a resolution hook cannot be
       introduced quietly;
-    * the vocabulary is still a ``Literal`` of exactly the two sealed questions.
-      Asserting *two* rather than a lower bound is the point: the day a third
+    * the vocabulary is still a ``Literal`` of exactly the three sealed questions.
+      Asserting *three* rather than a lower bound is the point: the day a fourth
       profile appears without a deliberate edit here, this fails.
     """
     from typing import get_args
@@ -1208,12 +1415,18 @@ def test_the_dispatch_stays_a_closed_vocabulary_and_not_a_registry() -> None:
     source = _code_of(_fulfillment_outcome)
     assert source.count("evaluate_calendar_meeting(") == 1
     assert source.count("evaluate_gmail_send(") == 1
+    assert source.count("evaluate_task_preparation(") == 1
     assert source.count("calendar_meeting_criteria(") == 1
     assert source.count("gmail_send_criteria(") == 1
+    assert source.count("task_preparation_criteria(") == 1
     for forbidden in ("importlib", "getattr(", "registry", "__subclasses__"):
         assert forbidden not in source
-    # Both questions the runtime can be asked are named, and nothing else is.
-    assert set(get_args(FulfillmentProfile)) == {"calendar_meeting", "gmail_send"}
+    # Every question the runtime can be asked is named, and nothing else is.
+    assert set(get_args(FulfillmentProfile)) == {
+        "calendar_meeting",
+        "gmail_send",
+        "task_preparation",
+    }
 
 
 def test_the_criteria_need_no_new_persistence() -> None:
@@ -1262,6 +1475,7 @@ def test_the_criteria_carry_no_identifier_because_they_are_sealed_into_a_row() -
         "profile",
         "calendar_meeting",
         "gmail_send",
+        "task_preparation",
     }
 
 

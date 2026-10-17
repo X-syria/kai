@@ -89,7 +89,25 @@ TRANSITIONS: Final[dict[str, frozenset[str]]] = {
             REQUIRES_ATTENTION,
         }
     ),
-    WAITING_EXTERNAL: frozenset({EXECUTING, FAILED, REQUIRES_ATTENTION}),
+    # ``WAITING_EXTERNAL`` deliberately has no edge back to ``EXECUTING``.
+    #
+    # ``EXECUTING -> WAITING_EXTERNAL`` was the natural way to park a task whose
+    # outcome depends on something outside this process, and the return edge was
+    # then written by symmetry. That symmetry is the problem: the return edge
+    # said exactly one thing \u2014 resume by re-driving the step that is waiting \u2014
+    # which for a write whose provider answer was lost is the duplicate this
+    # machine exists to prevent. Nothing can wait here today either, so the edge
+    # had no reader and only the wrong meaning.
+    #
+    # What this does *not* do is make ``EXECUTING`` unreachable from here:
+    # ``WAITING_EXTERNAL -> REQUIRES_ATTENTION -> RETRY -> EXECUTING`` is a legal
+    # route, and it is meant to be. A retry is a deliberate decision by a caller,
+    # not something this machine may do on its own. The duplicate is prevented
+    # one layer down instead, and not by this graph at all: the approval behind a
+    # write is single-use, so any re-drive is refused by the gateway before the
+    # provider is reached. A transition table is not where that is enforced, and
+    # claiming otherwise here would document a protection that does not exist.
+    WAITING_EXTERNAL: frozenset({FAILED, REQUIRES_ATTENTION}),
     VERIFYING: frozenset({COMPLETED, EXECUTING, FAILED, REQUIRES_ATTENTION}),
     COMPLETED: frozenset(),
     # --- failure path (KAI v0.5) -------------------------------------------

@@ -19,6 +19,7 @@ ALLOWED_CATEGORIES = frozenset(
         "reschedule_meeting",
         "cancel_meeting",
         "short_courtesy_message",
+        "prepare_task",
     }
 )
 ESCALATION_CATEGORIES = frozenset(
@@ -43,6 +44,7 @@ class ContentCategory(StrEnum):
     """
 
     PROPOSE_TIME = "propose_time"
+    PREPARE_TASK = "prepare_task"
     CONFIRM_MEETING = "confirm_meeting"
     RESCHEDULE_MEETING = "reschedule_meeting"
     CANCEL_MEETING = "cancel_meeting"
@@ -73,6 +75,7 @@ class ContentMode(StrEnum):
 
 CATEGORY_MODE: dict[ContentCategory, ContentMode] = {
     ContentCategory.PROPOSE_TIME: ContentMode.ALLOW,
+    ContentCategory.PREPARE_TASK: ContentMode.ALLOW,
     ContentCategory.CONFIRM_MEETING: ContentMode.ALLOW,
     ContentCategory.RESCHEDULE_MEETING: ContentMode.ALLOW,
     ContentCategory.CANCEL_MEETING: ContentMode.ALLOW,

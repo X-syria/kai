@@ -540,9 +540,14 @@ def test_five_sealing_points_exist_and_not_one_of_them_carries_content() -> None
     # Point 5: authorisation, at the gateway, over validated arguments.
     assert "def intent_hash(" in _repo_text("approvals", "service.py")
 
-    # And the sealing gate itself is still closed for this domain.
-    assert frozenset({"calendar_meeting"}) == LIVE_SEALABLE_PROFILES
-    assert get_args(FulfillmentProfile) == ("calendar_meeting", "gmail_send")
+    # And the sealing gate itself is still closed for this domain. The local
+    # ``task_preparation`` profile joined the vocabulary in Stage 2E; gmail did not.
+    assert frozenset({"calendar_meeting", "task_preparation"}) == LIVE_SEALABLE_PROFILES
+    assert get_args(FulfillmentProfile) == (
+        "calendar_meeting",
+        "gmail_send",
+        "task_preparation",
+    )
     assert "gmail_send" not in LIVE_SEALABLE_PROFILES
 
 

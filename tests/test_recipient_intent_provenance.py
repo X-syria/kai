@@ -544,10 +544,12 @@ def test_live_sealing_requires_an_intent_projected_criterion_value() -> None:
     the sealed user-intent understanding — a builder input the understanding
     stage produced, which its evaluator then decides on. ``calendar_meeting``
     has ``window`` (:= ``scenario.window``) and the calendar decision reads it;
+    ``task_preparation`` has ``objective_digest`` (:= the persisted ``task.goal``,
+    the sealed user intent fixed at submission) and its evaluator decides on it;
     ``gmail_send`` has no intent-class input at all, so it stays out and a
     contract naming it is refused at ``create_task``.
     """
-    assert frozenset({"calendar_meeting"}) == LIVE_SEALABLE_PROFILES
+    assert frozenset({"calendar_meeting", "task_preparation"}) == LIVE_SEALABLE_PROFILES
 
     # calendar: a builder input that is a projection of the sealed understanding.
     assert "window" in inspect.signature(calendar_meeting_criteria).parameters

@@ -341,3 +341,16 @@ class PlanResponse(BaseModel):
 
 class PlanListResponse(BaseModel):
     plans: list[PlanResponse]
+
+
+# Added for Stage 2E (prepare task) - re-exported helpers if needed elsewhere
+__all__ = [
+    "PlanStep",
+    "PlanCondition",
+    "PlanBranch",
+    "PlanProposal",
+    "domain_errors",
+    "plan_json",
+    "PlanResponse",
+    "PlanListResponse",
+]

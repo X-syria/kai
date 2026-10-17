@@ -33,7 +33,7 @@ from kai.calendar.service_models import CreateEventRequest
 from kai.calendar.slots import compute_availability, iso_interval
 from kai.tools.adapters.base import AdapterBase, provider_failure
 from kai.tools.context import ToolContext
-from kai.tools.errors import ToolExecutionError
+from kai.tools.errors import PROVIDER_UNREACHABLE, ToolExecutionError
 from kai.tools.execution import ToolExecutionOutcome, VerificationMismatch
 from kai.tools.schemas import CalendarCreateEventArgs
 
@@ -41,6 +41,7 @@ _PROVIDER_CODES: dict[type[Exception], str] = {
     calendar_client.GoogleInvalidTokenError: "TOKEN_INVALID",
     calendar_client.GoogleForbiddenError: "PERMISSION_DENIED",
     calendar_client.GoogleRateLimitError: "RATE_LIMITED",
+    calendar_client.GoogleUnreadableResultError: PROVIDER_UNREACHABLE,
     calendar_client.GoogleApiError: "PROVIDER_ERROR",
 }
 
@@ -191,6 +192,12 @@ class CalendarAdapter(AdapterBase):
         evidence: dict[str, Any] = {}
         if outcome.event is not None:
             evidence["event_id"] = outcome.event.event_id
+            evidence["mismatch_count"] = len(outcome.mismatches)
+        elif outcome.created_event_id is not None:
+            # The provider accepted the write but the event could not be read
+            # back; keep the id it returned so the accepted creation is still
+            # recorded as evidence rather than lost.
+            evidence["event_id"] = outcome.created_event_id
             evidence["mismatch_count"] = len(outcome.mismatches)
         return ToolExecutionOutcome(
             ok=True,

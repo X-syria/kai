@@ -291,6 +291,8 @@ These are open, and none of them are closed by a passing test suite:
   cannot be pointed at `tests/` at all. Tightening that is separate work; every
   test still runs in CI.
 - **`gmail_send` is not live-sealable.** `LIVE_SEALABLE_PROFILES` is
-  `{"calendar_meeting"}` only, and this is intentional. Recipient intent is
-  unresolved, so Gmail send is refused at the sealing gate. Do not add it to that
-  set without a separate semantic review.
+  `{"calendar_meeting", "task_preparation"}`. `task_preparation` was added after
+  semantic review confirmed its criterion (`objective_digest` from the sealed
+  `task.goal`) satisfies the §10.10 anchor requirement. `gmail_send` remains
+  refused at the sealing gate because recipient intent is unresolved. Do not add
+  it to that set without a separate semantic review.

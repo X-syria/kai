@@ -133,6 +133,7 @@ from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any, Final
 
+from kai.runtime.schemas import EXTERNAL_OUTCOME, EXTERNAL_OUTCOME_UNKNOWN
 from kai.tools.result import ToolOutcome
 
 __all__ = [
@@ -140,6 +141,7 @@ __all__ = [
     "QualifyingSend",
     "qualifying_send",
     "qualifying_sends",
+    "undetermined_sends",
 ]
 
 #: The one tool whose successful, verified, provider-identified attempts are what
@@ -264,6 +266,43 @@ def qualifying_sends(evidence: Iterable[Any]) -> tuple[QualifyingSend, ...]:
         witness
         for witness in (qualifying_send(record) for record in evidence)
         if witness is not None
+    )
+
+
+def undetermined_sends(evidence: Iterable[Any]) -> tuple[Mapping[str, Any], ...]:
+    """The attempts to send whose outcome nobody ever recorded.
+
+    The complement of :func:`qualifying_sends`, and deliberately the same shape:
+    a filter that returns the **whole** set of records that say *this send may or
+    may not have gone out*, in log order, with nothing truncated.
+
+    **These records are not witnesses and are never converted into one.** A
+    missing provider message id is not a message that was not sent; it is a
+    message whose existence this run cannot vouch for. Keeping them as their own
+    set, rather than folding them into the witness set with a flag, is what stops
+    an unknown from being counted as evidence either way.
+
+    Scoped to :data:`MESSAGE_SEND_TOOL` for the same reason
+    :func:`qualifying_send` is: a read that timed out says nothing about whether
+    a send happened, and this evaluator is not asked about reads. Which error
+    **Selection is by ``external_outcome``, never by ``error_code``.** The runtime
+    writes that field as its own conclusion after deciding that a side-effecting
+    run ended without a knowable outcome; ``error_code`` reports why the gateway
+    returned what it returned, which is a different question. In particular
+    ``APPROVAL_STALE`` is an authorization refusal and does not appear here: the
+    gateway consumes an approval immediately before dispatch, so that refusal
+    provably stopped the invocation before the provider was reached.
+
+    Scoped to :data:`MESSAGE_SEND_TOOL` for the same reason
+    :func:`qualifying_send` is: a read KAI could not complete says nothing about
+    whether a send happened, and this evaluator is not asked about reads.
+    """
+    return tuple(
+        record
+        for record in evidence
+        if isinstance(record, Mapping)
+        and record.get("tool") == MESSAGE_SEND_TOOL
+        and record.get(EXTERNAL_OUTCOME) == EXTERNAL_OUTCOME_UNKNOWN
     )
 
 

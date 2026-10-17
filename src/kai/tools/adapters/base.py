@@ -126,10 +126,11 @@ def provider_failure(
 
     1. *Never contacted* \u2014 no connection was established, so nothing was sent.
        :data:`~kai.tools.errors.PROVIDER_NOT_CONTACTED`, a known outcome.
-    2. *Dispatched, answer unresolved* \u2014 the request went out and no complete
-       response came back, or a server error came back that does not say whether
-       the operation was applied. :data:`PROVIDER_UNREACHABLE` /
-       :data:`PROVIDER_SERVER_ERROR`.
+    2. *Dispatched, answer unresolved* \u2014 the request went out and no usable
+       answer establishing the outcome came back: no complete response, or a
+       success reply whose body cannot be read as the accepted result, or a
+       server error that does not say whether the operation was applied.
+       :data:`PROVIDER_UNREACHABLE` / :data:`PROVIDER_SERVER_ERROR`.
     3. *Answered* \u2014 the provider replied and the reply is conclusive; a 4xx is
        the provider rejecting the request, which for a write is positive evidence
        that it did not take effect. The caller's own codes, unchanged.

@@ -18,6 +18,7 @@ from kai.tasks.state import (
     RETRY,
     TRANSITIONS,
     VERIFYING,
+    WAITING_EXTERNAL,
     apply_retry_budget,
     is_retryable_failure,
     is_terminal,
@@ -33,11 +34,11 @@ HAPPY_PATH = [
     (EXECUTING, "WAITING_APPROVAL"),
     ("WAITING_APPROVAL", EXECUTING),
     ("WAITING_APPROVAL", "POLICY_CHECK"),
-    (EXECUTING, "WAITING_EXTERNAL"),
+(EXECUTING, "WAITING_EXTERNAL"),
     (EXECUTING, "VERIFYING"),
-    ("WAITING_EXTERNAL", EXECUTING),
+    ("WAITING_EXTERNAL", "REQUIRES_ATTENTION"),
     (VERIFYING, COMPLETED),
-    (VERIFYING, EXECUTING),
+    (VERIFYING, "EXECUTING"),
 ]
 
 FAILURE_EDGES = [
@@ -94,12 +95,42 @@ def test_skipping_states_is_refused() -> None:
         ("PLANNING", COMPLETED),         # terminal without execution
         ("POLICY_CHECK", "VERIFYING"),   # skip approval/execution
         (EXECUTING, COMPLETED),          # no verification
-        ("WAITING_EXTERNAL", "VERIFYING"),  # must resume executing first
+        ("WAITING_EXTERNAL", "VERIFYING"),  # no route forward to verification
     ]
     for current, target in illegal:
         decision = resolve_transition(current, target)
         assert not decision.ok, (current, target)
         assert "illegal transition" in (decision.error or "")
+
+
+def test_waiting_external_does_not_resume_by_re_executing() -> None:
+    """The edge whose only meaning was "wait, then drive the step again" is gone.
+
+    ``WAITING_EXTERNAL -> EXECUTING`` existed by symmetry with
+    ``EXECUTING -> WAITING_EXTERNAL``, and it said precisely one thing: resume by
+    re-driving the step that is waiting. For a task whose provider answer was
+    lost, that is the duplicate this machine exists to prevent, and no caller
+    needs it \u2014 nothing enters this state at all.
+
+    **Graph reachability is deliberately not what is asserted here, because it is
+    not what the architecture guarantees.** ``WAITING_EXTERNAL`` still reaches
+    ``EXECUTING`` by way of ``REQUIRES_ATTENTION -> RETRY -> EXECUTING``, and
+    that is intended: a retry is an explicit decision to try again, taken by a
+    caller rather than by this state machine.
+
+    What actually prevents the duplicate is one layer down and is not a graph
+    property: the approval behind a write is single-use, so a re-drive is
+    *refused by the gateway* with ``APPROVAL_STALE`` and cannot reach the
+    provider. A test that pretended the state graph made re-execution impossible
+    would be asserting a protection that does not exist, and would therefore
+    pass for the wrong reason.
+    """
+    assert EXECUTING not in TRANSITIONS[WAITING_EXTERNAL]
+    assert resolve_transition(WAITING_EXTERNAL, EXECUTING).ok is False
+    # The two exits that remain both stop the task instead of resuming it.
+    assert TRANSITIONS[WAITING_EXTERNAL] == frozenset(
+        {FAILED, REQUIRES_ATTENTION}
+    )
 
 
 def test_terminal_to_terminal_is_refused() -> None:

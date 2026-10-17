@@ -42,7 +42,7 @@ VerificationMethod = Literal["automatic", "manual", "ai_review"]
 #: supported, or that a profile can be derived rather than declared — the
 #: runtime still seals ``calendar_meeting`` for every task it drives, and
 #: ``gmail_send`` is reachable only where a contract already names it.
-FulfillmentProfile = Literal["calendar_meeting", "gmail_send"]
+FulfillmentProfile = Literal["calendar_meeting", "gmail_send", "task_preparation"]
 
 _MAX_CRITERIA = 50
 _MAX_TOOLS = 50

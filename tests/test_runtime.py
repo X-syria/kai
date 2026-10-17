@@ -1055,6 +1055,33 @@ async def test_an_indeterminate_verdict_stops_for_a_human_not_a_failure(
     assert len(backend.created_events) == 1
 
 
+async def test_an_accepted_write_with_a_failed_readback_parks_the_task_not_fails_it(
+    client: httpx.AsyncClient,
+    backend: GoogleBackend,
+) -> None:
+    """NEW-STATIC-01: an accepted create whose read-back 401s is not a ``FAILED`` task.
+
+    The provider accepted the write, so reporting the run as a clean failure
+    would invite a blind retry and a duplicate event. The task must stop for a
+    human instead, with the work that already happened left intact.
+    """
+    token, task_id, approval_id = await _ready_task(client, "khaled@example.com")
+    await _approve(client, token, approval_id)
+
+    # The provider accepts the create but refuses to read it back.
+    backend.calendar_read_status = 401
+
+    settled = await _trigger(client, token, task_id)
+
+    assert settled["outcome"] == "REQUIRES_ATTENTION", settled
+    assert settled["task_state"] == "REQUIRES_ATTENTION", settled
+    assert (await _inspect(client, token, task_id))["task_state"] == "REQUIRES_ATTENTION"
+    # Exactly one write reached the provider: the read-back failure never retried it.
+    posts = [call for call in backend.calendar_calls if call.method == "POST"]
+    assert len(posts) == 1
+    assert len(backend.created_events) == 1
+
+
 async def test_settlement_dispatches_on_the_persisted_contract_not_the_run(
     client: httpx.AsyncClient,
     backend: GoogleBackend,
@@ -1621,8 +1648,9 @@ async def test_a_criteria_cannot_redirect_the_evaluator_on_a_live_run(
     """The sealed profile selects the evaluator; nothing else can reach it.
 
     Even with the contract's profile rewritten to an unknown value *after* sealing,
-    the run stops rather than falling back to the calendar evaluator — and the
-    recorded identity names the profile the dispatch actually used.
+    the run stops before any step is dispatched: the runtime's execution gate
+    refuses the profile by name, rather than falling back to the calendar
+    evaluator. Nothing is recorded for an evaluation that did not happen.
     """
     token, task_id, approval_id = await _ready_task(client, "khaled@example.com")
     await _approve(client, token, approval_id)
@@ -1635,7 +1663,11 @@ async def test_a_criteria_cannot_redirect_the_evaluator_on_a_live_run(
 
     settled = await _trigger(client, token, task_id)
     assert settled["outcome"] == "FAILED", settled
-    assert "no fulfillment evaluator" in settled["message"]
+    # The unknown profile is refused by the pre-dispatch licence gate — the
+    # profile, by name — instead of being dispatched and then refused later by
+    # the fulfillment evaluator's "no fulfillment evaluator".
+    assert "invoice_paid" in settled["message"]
+    assert "not licensed" in settled["message"]
     # Nothing was recorded for an evaluation that did not happen.
     assert await _audit_row(task_id) == (None, None, None)
 
@@ -2361,6 +2393,61 @@ async def test_a_lost_answer_is_re_derived_identically_after_a_crash(
     )
     # Re-deriving the verdict must not re-drive the step that lost its answer.
     assert len(backend.created_events) == before_creates
+
+
+async def test_a_create_whose_success_body_is_unreadable_parks_instead_of_failing(
+    client: httpx.AsyncClient,
+    backend: GoogleBackend,
+) -> None:
+    """A 2xx whose body cannot be read as the created event is a lost answer.
+
+    The provider accepted the create -- the write is recorded on its side -- but
+    answered with a body this client cannot read as the event, so whether the
+    write was applied cannot be established from that answer. The run must park
+    for a human rather than report the clean ``FAILED`` a caller would
+    blind-retry into a second event.
+    """
+    token, task_id, approval_id = await _ready_task(client, "khaled@example.com")
+    await _approve(client, token, approval_id)
+
+    # The provider accepts the create, then answers 200 with a body that is not
+    # the created resource.
+    backend.create_event_unreadable = b"<html>not json</html>"
+
+    settled = await _trigger(client, token, task_id)
+    assert settled["task_state"] == "REQUIRES_ATTENTION", settled
+    assert "INDETERMINATE" in settled["message"], settled
+
+    assert await _audit_row(UUID(task_id)) == (
+        "calendar_meeting",
+        "calendar_meeting:v1",
+        "INDETERMINATE",
+    )
+
+    # The durable record carries the runtime's own conclusion about the world:
+    # the external outcome is unknown, not merely "failed".
+    creates = [
+        entry
+        for entry in await _internal_evidence(task_id)
+        if entry["tool"] == "calendar.create_event"
+    ]
+    assert creates, "the create attempt produced no evidence"
+    assert creates[-1].get("external_outcome") == "UNKNOWN"
+
+    # Exactly one write reached the provider, and the accepted creation is
+    # recorded rather than discarded: the ambiguity never triggered a retry.
+    posts = [call for call in backend.calendar_calls if call.method == "POST"]
+    assert len(posts) == 1
+    assert len(backend.created_events) == 1
+
+    # A replay must not re-drive the ambiguous write.
+    replay = await client.post(
+        f"{API_PREFIX}/runtime/tasks/{task_id}/trigger",
+        headers=_auth(token),
+    )
+    assert replay.status_code == 409, replay.text
+    assert (await _inspect(client, token, task_id))["task_state"] == "REQUIRES_ATTENTION"
+    assert len(backend.created_events) == 1
 
 
 def datetime_parse(raw: str) -> datetime:

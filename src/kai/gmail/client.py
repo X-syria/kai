@@ -78,6 +78,14 @@ class GoogleNotFoundError(_TypedStatusError):
     """HTTP 404: the requested message does not exist."""
 
 
+class GoogleUnreadableResultError(GoogleApiError):
+    """The request was dispatched and the provider replied with a success status,
+    yet the reply cannot be read as the created resource (a malformed body, or a
+    missing/unparseable id), so whether the write was applied cannot be
+    established from this answer.
+    """
+
+
 def _raise_for_status(resp: httpx.Response) -> None:
     """Map Google's failure modes onto typed errors (never echoes tokens)."""
     if resp.status_code == 401:
@@ -195,8 +203,14 @@ async def send_message(
         try:
             payload = resp.json()
         except ValueError as exc:
-            raise GoogleApiError("gmail send returned a malformed response") from exc
+            raise GoogleUnreadableResultError(
+                "gmail send returned a malformed response",
+                status_code=resp.status_code,
+            ) from exc
         message = parse_message_payload(payload)
         if message is None or not message.message_id:
-            raise GoogleApiError("gmail send returned no accepted message_id")
+            raise GoogleUnreadableResultError(
+                "gmail send returned no accepted message_id",
+                status_code=resp.status_code,
+            )
         return message

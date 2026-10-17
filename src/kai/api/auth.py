@@ -76,8 +76,13 @@ async def register(
     )
     session.add(user)
     await session.commit()
-    await session.refresh(user)
 
+    # No refresh after commit. The row is already durable and the session factory
+    # sets ``expire_on_commit=False``, so ``user.id``/``user.tenant_id`` are the
+    # committed values. Re-reading it opened a *second* transaction on a row this
+    # request had just written: anything that deletes the row in between (the test
+    # harness truncates between tests, an admin purge does it in production) turned
+    # a successful registration into a 500, "Could not refresh instance '<User>'".
     token = create_access_token(user_id=user.id, tenant_id=user.tenant_id)
     return TokenResponse(access_token=token, user_id=user.id)
 

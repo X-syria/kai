@@ -125,7 +125,11 @@ from kai.runtime.evidence import (
     undetermined_creations,
 )
 from kai.runtime.schemas import MeetingWindow
-from kai.runtime.send_evidence import QualifyingSend, qualifying_sends
+from kai.runtime.send_evidence import (
+    QualifyingSend,
+    qualifying_sends,
+    undetermined_sends,
+)
 from kai.tasks.schemas import FulfillmentProfile
 
 __all__ = [
@@ -136,11 +140,15 @@ __all__ = [
     "FulfillmentVerdict",
     "GMAIL_SEND_EVALUATOR_VERSION",
     "GmailSendCriteria",
+    "TaskPreparationCriteria",
     "SuccessCriteria",
     "calendar_meeting_criteria",
     "evaluate_calendar_meeting",
     "evaluate_gmail_send",
+    "evaluate_task_preparation",
     "gmail_send_criteria",
+    "task_preparation_criteria",
+    "TASK_PREPARATION_EVALUATOR_VERSION",
 ]
 
 #: Stable identity of the calendar meeting evaluator's *semantics*, written as
@@ -169,6 +177,12 @@ CALENDAR_MEETING_EVALUATOR_VERSION: Final = "calendar_meeting:v1"
 #: nothing has established. Two names, two meanings, two independently
 #: versioned histories.
 GMAIL_SEND_EVALUATOR_VERSION: Final = "gmail_send:v1"
+
+#: Stable identity of the task preparation evaluator's *semantics*: a declared
+#: constant naming one meaning, ``v1`` meaning "a qualifying local preparation
+#: exists whose witness is bound to the sealed task goal", bumped by hand and
+#: only when that meaning changes.
+TASK_PREPARATION_EVALUATOR_VERSION: Final = "task_preparation:v1"
 
 
 class FulfillmentVerdict(StrEnum):
@@ -343,17 +357,17 @@ class SuccessCriteria(BaseModel):
     evaluator, so a criteria object can never claim a profile whose payload it
     does not carry.
 
-    It is a *closed* vocabulary of two, mirroring ``FulfillmentProfile`` itself.
-    There is no registry, no resolution hook, and no expression tree: a third
-    domain would mean a third payload and widening this model deliberately, which
-    is a contract amendment and not something a task can bring with it.
+    It is a *closed* vocabulary of three, mirroring ``FulfillmentProfile`` itself.
+    There is no registry, no resolution hook, and no expression tree: a further
+    domain would mean a further payload and widening this model deliberately,
+    which is a contract amendment and not something a task can bring with it.
 
-    **Two members is not a framework.** The payloads share a shape — a frozen
+    **Three members is not a framework.** The payloads share a shape — a frozen
     model, one accessor, conditions read by one evaluator — and nothing else: no
     common base class, no protocol, no shared predicate, and no code path that
     treats them interchangeably. That is the honest state of the evidence after
     the second-domain experiment, and a base class asserting more than that has
-    not been earned by two domains.
+    not been earned by the domains.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -361,6 +375,7 @@ class SuccessCriteria(BaseModel):
     profile: FulfillmentProfile
     calendar_meeting: CalendarMeetingCriteria | None = None
     gmail_send: GmailSendCriteria | None = None
+    task_preparation: TaskPreparationCriteria | None = None
 
     @model_validator(mode="after")
     def _payload_matches_profile(self) -> Self:
@@ -373,12 +388,14 @@ class SuccessCriteria(BaseModel):
         with no payload, a profile carrying another domain's payload, and a
         profile that is not in the vocabulary at all.
         """
-        named: CalendarMeetingCriteria | GmailSendCriteria | None
-        foreign: CalendarMeetingCriteria | GmailSendCriteria | None
+        named: CalendarMeetingCriteria | GmailSendCriteria | TaskPreparationCriteria | None
+        foreign: CalendarMeetingCriteria | GmailSendCriteria | TaskPreparationCriteria | None
         if self.profile == "calendar_meeting":
-            named, foreign = self.calendar_meeting, self.gmail_send
+            named, foreign = self.calendar_meeting, self.gmail_send or self.task_preparation
         elif self.profile == "gmail_send":
-            named, foreign = self.gmail_send, self.calendar_meeting
+            named, foreign = self.gmail_send, self.calendar_meeting or self.task_preparation
+        elif self.profile == "task_preparation":
+            named, foreign = self.task_preparation, self.calendar_meeting or self.gmail_send
         else:
             raise ValueError(
                 f"success criteria name profile {self.profile!r}, which is not a "
@@ -402,17 +419,15 @@ class SuccessCriteria(BaseModel):
         return self.calendar_meeting
 
     def for_gmail_send(self) -> GmailSendCriteria:
-        """The gmail payload, reachable only when the profile says gmail.
-
-        The second of the two accessors, and there is deliberately no third way
-        to reach a payload. Each domain's conditions are named by that domain's
-        own accessor, so an evaluator's signature still says which meaning it
-        applies, and neither payload can be read by the other's evaluator even by
-        accident.
-        """
+        """The gmail payload, reachable only when the profile says gmail."""
         if self.profile != "gmail_send" or self.gmail_send is None:
             raise ValueError(f"no gmail criteria in profile {self.profile!r}")
         return self.gmail_send
+
+    def for_task_preparation(self) -> TaskPreparationCriteria:
+        if self.profile != "task_preparation" or self.task_preparation is None:
+            raise ValueError(f"no task_preparation criteria in profile {self.profile!r}")
+        return self.task_preparation
 
 
 def calendar_meeting_criteria(
@@ -487,6 +502,36 @@ def gmail_send_criteria(
     return SuccessCriteria(
         profile=profile,
         gmail_send=GmailSendCriteria(required_recipients=required),
+    )
+
+
+class TaskPreparationCriteria(BaseModel):
+    """Typed success criteria for the `task_preparation` domain."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    objective_digest: str = Field(min_length=1)
+    required_step_count: int = Field(ge=1)
+
+    def as_criteria(self) -> str:
+        return f"task prepared with objective digest {self.objective_digest[:8]}..."
+
+
+def task_preparation_criteria(
+    *,
+    profile: FulfillmentProfile,
+    objective: str,
+    required_step_count: int = 1,
+) -> SuccessCriteria:
+    import hashlib
+
+    digest = hashlib.sha256(objective.strip().encode("utf-8")).hexdigest()
+    return SuccessCriteria(
+        profile=profile,
+        task_preparation=TaskPreparationCriteria(
+            objective_digest=digest,
+            required_step_count=required_step_count,
+        ),
     )
 
 
@@ -708,35 +753,38 @@ def evaluate_gmail_send(inputs: FulfillmentInput) -> FulfillmentVerdict:
     **not** a duplicate: they are two witnesses, and existential satisfaction
     makes the question indifferent to how many there are.
 
-    **This evaluator never returns ``INDETERMINATE``, and the reason is a
-    property of the domain rather than an omission.** Every check is a decidable
-    comparison over durable scalars, so there is nothing undecidable here — the
-    same structural argument as the calendar evaluator.
+    **``INDETERMINATE`` means the provider's answer was lost, not that the send
+    failed.** Every criterion check is a decidable comparison over durable
+    scalars, so the criteria themselves are never what is undecidable; what can
+    be is whether a message left. This evaluator therefore separates two cases
+    that gmail makes look alike and that are not alike at all:
 
-    The interesting case is the one that *looks* like it needs the third value: a
-    send the provider accepted but whose read-after-send failed. The adapter then
-    records ``verified=False`` with no ``message_id`` in ``evidence``, so the
-    record is not a witness, and the verdict is ``NOT_FULFILLED`` — even though a
-    message may in fact have been delivered. That is correct under the question
-    actually being asked, which is "does durable verified evidence establish
-    that the intent was fulfilled", and it is the same answer the calendar domain
-    gives when a created event cannot be read back.
+    * The provider **answered** and read-after-send could not confirm it — the
+      adapter records ``verified=False`` with no ``message_id`` in ``evidence``.
+      That is an answer, so the record is not a witness and the verdict is
+      ``NOT_FULFILLED``.
+    * The provider **never answered** — a spent approval with no receipt, or a
+      call that timed out. Nothing is known, so the verdict is
+      ``INDETERMINATE``.
 
-    It is recorded here rather than resolved, because gmail makes the stakes
-    visible in a way calendar does not: a retry after an unverified send may
-    deliver the message twice, and that irreversibility is a real argument for a
-    future "cannot tell" that is distinct from "not fulfilled". Designing that
-    value is **deferred** — it needs a decision about retry policy and about
-    whether a human is asked, not a third enum member — and inventing it here
-    would be a state the runtime cannot yet route meaningfully. The enum keeps
-    three values; this domain produces two.
+    The second case is what gmail made visible: a retry after an unverified send
+    may deliver the message twice, and irreversibility is a real argument for a
+    "cannot tell" distinct from "not fulfilled". It is now answered from the
+    durable log by :func:`undetermined_sends` rather than deferred, because the
+    runtime already routes ``INDETERMINATE`` to ``REQUIRES_ATTENTION`` and that
+    route is what makes the answer safe: the message is neither re-sent nor
+    declared undelivered, and no blind retry follows from it.
     """
     qualifying = qualifying_sends(inputs.evidence)
+    undetermined = undetermined_sends(inputs.evidence)
 
-    # The empty set is an answer, not a gap: no verified message was ever sent, so
-    # "a message was sent to the Intent's recipient" is known to be false. That is
-    # ``NOT_FULFILLED``, never the empty ``all()`` reading as vacuous truth.
+    # The empty set is normally an answer, not a gap: no verified message was
+    # ever sent, so "a message was sent to the Intent's recipient" is known to be
+    # false. That is ``NOT_FULFILLED``, never the empty ``all()`` reading as
+    # vacuous truth. The exception is an empty set alongside a lost answer.
     if not qualifying:
+        if undetermined:
+            return FulfillmentVerdict.INDETERMINATE
         return FulfillmentVerdict.NOT_FULFILLED
 
     criteria = inputs.criteria.for_gmail_send()
@@ -747,5 +795,44 @@ def evaluate_gmail_send(inputs: FulfillmentInput) -> FulfillmentVerdict:
     # applied to the other.
     for sent in qualifying:
         if _send_satisfies_criteria(sent, criteria=criteria):
+            return FulfillmentVerdict.FULFILLED
+    # Proof outranks an unknown, for the same reason as in the calendar domain: a
+    # witness satisfying every criterion settles whether such a message exists,
+    # however many other attempts went unanswered.
+    if undetermined:
+        return FulfillmentVerdict.INDETERMINATE
+    return FulfillmentVerdict.NOT_FULFILLED
+
+
+
+def evaluate_task_preparation(inputs: FulfillmentInput) -> FulfillmentVerdict:
+    """Was a local preparation completed against the sealed task objective?
+
+    The third sealed question. It reuses the evidence-set shape: over the
+    relevant set the question is existential, over one witness the criteria are
+    conjunctive. The witness set comes from
+    :func:`kai.runtime.evidence.qualifying_preparations`, the one boundary that
+    states what a qualifying ``task.prepare`` attempt is, so this evaluator and
+    the runtime cannot disagree about it.
+
+    The one criterion that reaches the sealed user intent is the objective
+    digest, built from the persisted ``task.goal`` at sealing time. The step
+    count is a secondary, request-side condition: it proves the local tool
+    produced a non-trivial result, not that the intent named those steps. There
+    is no ``INDETERMINATE`` here: ``task.prepare`` is local and side-effect-free,
+    so no provider answer can be lost.
+    """
+    from kai.runtime.evidence import qualifying_preparations
+
+    qualifying = qualifying_preparations(inputs.evidence)
+    if not qualifying:
+        return FulfillmentVerdict.NOT_FULFILLED
+
+    criteria = inputs.criteria.for_task_preparation()
+    for prepared in qualifying:
+        if (
+            prepared.objective_digest == criteria.objective_digest
+            and prepared.step_count >= criteria.required_step_count
+        ):
             return FulfillmentVerdict.FULFILLED
     return FulfillmentVerdict.NOT_FULFILLED

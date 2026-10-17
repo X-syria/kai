@@ -78,6 +78,14 @@ class GoogleNotFoundError(_TypedStatusError):
     """HTTP 404: the requested event does not exist."""
 
 
+class GoogleUnreadableResultError(GoogleApiError):
+    """The request was dispatched and the provider replied with a success status,
+    yet the reply cannot be read as the created resource (a malformed body, or a
+    missing/unparseable id), so whether the write was applied cannot be
+    established from this answer.
+    """
+
+
 def _raise_for_status(resp: httpx.Response) -> None:
     """Map Google's failure modes onto typed errors (never echoes tokens)."""
     if resp.status_code == 401:
@@ -193,12 +201,16 @@ async def create_event(
         try:
             payload = resp.json()
         except ValueError as exc:
-            raise GoogleApiError(
-                "google calendar create returned a malformed response"
+            raise GoogleUnreadableResultError(
+                "google calendar create returned a malformed response",
+                status_code=resp.status_code,
             ) from exc
         event = parse_event_payload(payload)
         if event is None:
-            raise GoogleApiError("google calendar create returned an unparseable event")
+            raise GoogleUnreadableResultError(
+                "google calendar create returned an unparseable event",
+                status_code=resp.status_code,
+            )
         return event
 
 

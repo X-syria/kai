@@ -77,9 +77,12 @@ CLIENT_TRANSITION_TARGETS: frozenset[str] = frozenset(
 #: stays in the vocabulary but is not listed, so it remains sealable at the
 #: schema layer and is refused here, at the single write to
 #: ``Task.fulfillment_profile``.
-LIVE_SEALABLE_PROFILES: frozenset[FulfillmentProfile] = frozenset({
-    "calendar_meeting",
-})
+LIVE_SEALABLE_PROFILES: frozenset[FulfillmentProfile] = frozenset(
+    {
+        "calendar_meeting",
+        "task_preparation",
+    }
+)
 
 
 class InvalidActorError(ValueError):
@@ -108,10 +111,15 @@ async def create_task(
 ) -> Task:
     """Persist a freshly ``CREATED`` task for one tenant/user.
 
-    The sealing gate lives here, before the row is written: a contract may only
+    The licensing gate lives here, before the row is written: a contract may only
     be sealed with a profile from :data:`LIVE_SEALABLE_PROFILES`, so a profile
     the review did not licence for live execution is refused at the single write
-    to ``Task.fulfillment_profile``.
+    to ``Task.fulfillment_profile``. This is the *only* creation-time refusal:
+    the generic Task Manager accepts any ``allowed_tools`` scope token (tool name
+    or capability name), for policy, approval, identity, and gateway tests as
+    well as ordinary callers. Profile↔capability compatibility is enforced on the
+    governed path, where a task can actually execute (see
+    :func:`kai.runtime.translator.profile_scope_violation`), not here.
     """
     if contract.fulfillment_profile not in LIVE_SEALABLE_PROFILES:
         raise UnlicensedFulfillmentError(

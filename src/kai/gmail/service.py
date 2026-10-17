@@ -20,10 +20,7 @@ from kai.db.models import GoogleAccount
 from kai.gmail import client
 from kai.gmail.client import (
     GoogleApiError,
-    GoogleForbiddenError,
-    GoogleInvalidTokenError,
     GoogleNotFoundError,
-    GoogleRateLimitError,
 )
 from kai.gmail.models import GmailMessage, MessageRef
 from kai.google.service import usable_access_token
@@ -173,9 +170,12 @@ async def send_and_verify(
 ) -> SendOutcome:
     """Send one message, read it back, and verify it with Gmail evidence.
 
-    401/403/429 propagate so the API can surface them; any other read failure
-    (404, malformed payload, 5xx) means evidence cannot be established and the
-    outcome is explicitly not verified.
+    A failure to *send* propagates: nothing was delivered, so the caller must
+    see the provider's error. A failure to *read the message back* (401/403/429
+    as well as 404, malformed payloads, and 5xx) means the evidence cannot be
+    established, so the outcome is explicitly not verified rather than a success
+    or a tool failure: the message may have been delivered, and reporting a
+    failure would invite a duplicate send.
     """
     account = await _load_account(session, account_id=account_id, tenant_id=tenant_id)
     sender_email = account.email
@@ -188,8 +188,6 @@ async def send_and_verify(
         readback = await client.get_message(
             transport, access_token=token, message_id=sent.message_id
         )
-    except (GoogleInvalidTokenError, GoogleForbiddenError, GoogleRateLimitError):
-        raise
     except GoogleNotFoundError:
         return SendOutcome(
             message=None,

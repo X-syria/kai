@@ -323,14 +323,14 @@ FulfillmentVerdict -> Task State Machine
 **«صالح في الـschema» لا يعني «قابل للختم الحيّ».** المفردان في النوع هما مدى مفردة الـschema، لا مدى التشغيل الحيّ:
 
 ```text
-FulfillmentProfile = Literal["calendar_meeting", "gmail_send"]   # schema-valid (tasks/schemas.py)
+FulfillmentProfile = Literal["calendar_meeting", "gmail_send", "task_preparation"]   # schema-valid (tasks/schemas.py)
         ↓
-LIVE_SEALABLE_PROFILES = frozenset({"calendar_meeting"})         # الختم الحيّ (tasks/service.py)
+LIVE_SEALABLE_PROFILES = frozenset({"calendar_meeting", "task_preparation"})         # الختم الحيّ (tasks/service.py)
         ↓
 gmail_send -> schema-valid  ->  NOT live-sealable
 ```
 
-`create_task` يرفض أي `fulfillment_profile` خارج `LIVE_SEALABLE_PROFILES` بـ`UnlicensedFulfillmentError`، عند الكتابة الوحيدة إلى `Task.fulfillment_profile`. فـ`gmail_send` يمرّ عبر طبقة الـschema ويُرفض عند الختم الحيّ، وهما بوابتان منفصلتان (§10.2).
+`create_task` يرفض أي `fulfillment_profile` خارج `LIVE_SEALABLE_PROFILES` بـ`UnlicensedFulfillmentError`، عند الكتابة الوحيدة إلى `Task.fulfillment_profile`. فـ`gmail_send` يمرّ عبر طبقة الـschema ويُرفض عند الختم الحيّ، وهما بوابتان منفصلتان (§10.2). تمت إضافة `task_preparation` إلى الملف الحيّ (§10.10.5) بعد التحقق من استيفائه شرط المرساة (§10.10): المعيار `objective_digest` مشتق من `task.goal` المختوم، والمُقيِّم `evaluate_task_preparation` يقرّر عليه.
 
 **لماذا حقل مسمّى لا اشتقاق.** الاشتقاق (`goal` فيه «اجتماع» ⟹ مُقيِّم التقويم) يجعل اختيار المُقيِّم وظيفةً لـLLM غير مقيَّدة، فيعود السؤال الأصلي: من يقرر معيار الحكم؟ الاسم الصريح يجيب: الـContract.
 

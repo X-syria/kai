@@ -108,13 +108,16 @@ from kai.runtime.evidence import qualifying_creation, qualifying_creations
 from kai.runtime.fulfillment import (
     CALENDAR_MEETING_EVALUATOR_VERSION,
     GMAIL_SEND_EVALUATOR_VERSION,
+    TASK_PREPARATION_EVALUATOR_VERSION,
     FulfillmentInput,
     FulfillmentOutcome,
     FulfillmentVerdict,
     calendar_meeting_criteria,
     evaluate_calendar_meeting,
     evaluate_gmail_send,
+    evaluate_task_preparation,
     gmail_send_criteria,
+    task_preparation_criteria,
 )
 from kai.runtime.models import RuntimeExecution
 from kai.runtime.schemas import (
@@ -125,6 +128,7 @@ from kai.runtime.schemas import (
 )
 from kai.runtime.translator import (
     CAPABILITY_TO_TOOL,
+    PROFILE_ALLOWED_CAPABILITIES,
     build_slice_contract,
     candidate_days,
     capability_to_tool,
@@ -134,6 +138,7 @@ from kai.runtime.translator import (
     parse_free_intervals,
     pick_slot,
     plan_fingerprint,
+    profile_scope_violation,
     read_intent_args,
 )
 from kai.runtime.understanding import UnderstandingFailed, understand_scenario
@@ -186,6 +191,7 @@ _WAITING_ON_OTHERS: frozenset[str] = frozenset({WAITING_EXTERNAL})
 #: one is an edit to this function rather than a lookup.
 _CALENDAR_MEETING: Final = "calendar_meeting"
 _GMAIL_SEND: Final = "gmail_send"
+_TASK_PREPARATION: Final = "task_preparation"
 
 #: How long a trigger's execution claim stays valid before another trigger may
 #: take it over. A live trigger finishes in seconds; a claim this old belongs
@@ -218,6 +224,16 @@ class RuntimeResumeError(ValueError):
 
 class RuntimeFatal(ValueError):
     """A deterministic stop condition the runtime translates into a failure."""
+
+
+class RuntimeScopeError(RuntimeFatal):
+    """A contract's sealed profile does not licence its tool/capability scope.
+
+    Raised at the governed live-sealing boundary (:meth:`AgentRuntime.submit`):
+    the runtime refuses to seal an executable task whose profile and
+    ``allowed_tools`` disagree, rather than persisting a task the governed path
+    could never honour.
+    """
 
 
 class ClaimLostError(Exception):
@@ -294,7 +310,23 @@ class AgentRuntime:
     ) -> Task:
         """Create a ``CREATED`` task with the sealed slice contract and its
         execution envelope (timezone validated at the schema boundary)."""
-        contract = build_slice_contract(submission.goal)
+        from kai.runtime.translator import build_preparation_contract
+
+        if getattr(submission, "intent", "schedule_meeting") == "prepare_task":
+            contract = build_preparation_contract(submission.goal)
+        else:
+            contract = build_slice_contract(submission.goal)
+        # The governed live-sealing gate: a contract that its profile does not
+        # licence cannot become an executable task. Checked before the write, so
+        # no incompatible task and no execution envelope is ever persisted.
+        refused = profile_scope_violation(
+            contract.fulfillment_profile, contract.allowed_tools
+        )
+        if refused:
+            raise RuntimeScopeError(
+                f"fulfillment profile {contract.fulfillment_profile!r} does not "
+                f"permit tools/capabilities: {list(refused)!r}"
+            )
         task = await create_task(
             session, tenant_id=tenant_id, user_id=user_id, contract=contract
         )
@@ -462,11 +494,21 @@ class AgentRuntime:
         await self._fence_execution(
             session, task_id=task.id, tenant_id=task.tenant_id, claim=claim
         )
-        account = await self._resolve_account(session, task)
-        if account is None:
-            return await self._fail(
-                session, task, "no connected google account for this tenant"
-            )
+        # ``task_preparation`` is a local, provider-free profile: it names no
+        # calendar and no guest, so it reaches neither the account resolver nor
+        # the model. Everything below that is gated on ``is_prepare`` skips a
+        # boundary the profile genuinely does not need; every Google-bound
+        # profile still takes the same resolvers, checks, and fail-closed paths
+        # it always did.
+        is_prepare = task.fulfillment_profile == _TASK_PREPARATION
+        if is_prepare:
+            account = None
+        else:
+            account = await self._resolve_account(session, task)
+            if account is None:
+                return await self._fail(
+                    session, task, "no connected google account for this tenant"
+                )
 
         scenario = (
             UnderstandingOutput.model_validate(row.scenario)
@@ -480,7 +522,7 @@ class AgentRuntime:
         # already durable, so the crash window costs one decision and never a
         # re-execution, a re-plan, or a second model call.
         if task.state == VERIFYING:
-            if scenario is None:
+            if scenario is None and not is_prepare:
                 return await self._fail(
                     session, task, "cannot verify: no understanding on record"
                 )
@@ -488,12 +530,34 @@ class AgentRuntime:
                 session, task=task, row=row, scenario=scenario, claim=claim
             )
 
+        # Stage 1a - the local preparation carries no model understanding: its
+        # objective is the persisted goal itself, handed to the tool by the
+        # runtime. It still walks the machine's own UNDERSTANDING state so the
+        # plan below is created through the same gate every profile uses, but no
+        # model is consulted and no scenario is written.
+        if is_prepare and task.state == CREATED:
+            await self._fence_execution(
+                session, task_id=task.id, tenant_id=task.tenant_id, claim=claim
+            )
+            await transition_task(
+                session,
+                task_id=task.id,
+                tenant_id=task.tenant_id,
+                user_id=task.user_id,
+                target=UNDERSTANDING,
+            )
+            await session.refresh(task)
+
         # Stage 1 - understanding, exactly once per task. The scenario is
         # committed while the task is still in UNDERSTANDING, so a resume can
         # find one already on record; reading that one back is what keeps a
         # crash in this window from costing a second model call that might not
         # even agree with the first one about which day the meeting is on.
-        if task.state in {CREATED, UNDERSTANDING} and scenario is None:
+        if (
+            not is_prepare
+            and task.state in {CREATED, UNDERSTANDING}
+            and scenario is None
+        ):
             await self._fence_execution(
                 session, task_id=task.id, tenant_id=task.tenant_id, claim=claim
             )
@@ -521,23 +585,31 @@ class AgentRuntime:
                 session, task_id=task.id, tenant_id=task.tenant_id, claim=claim
             )
 
-        assert scenario is not None
-
-        # Stage 2 - identity, exactly once per task.
-        if not row.identities:
-            await self._fence_execution(
-                session, task_id=task.id, tenant_id=task.tenant_id, claim=claim
-            )
-            try:
-                identities = await self._resolve_guest_identities(
-                    session, task, scenario=scenario, account=account, transport=transport
+        # Stage 2 - identity, exactly once per task. A preparation resolves no
+        # guests: its sealed contract names no attendee, so there is nothing to
+        # resolve and no identity gate to pass. The guard that reads and writes
+        # the identity row is unchanged for every profile that does name guests.
+        if not is_prepare:
+            assert scenario is not None
+            assert account is not None
+            if not row.identities:
+                await self._fence_execution(
+                    session, task_id=task.id, tenant_id=task.tenant_id, claim=claim
                 )
-            except RuntimeFatal as exc:
-                return await self._fail(session, task, str(exc))
-            row.identities = identities
-            await self._fence_execution(
-                session, task_id=task.id, tenant_id=task.tenant_id, claim=claim
-            )
+                try:
+                    identities = await self._resolve_guest_identities(
+                        session,
+                        task,
+                        scenario=scenario,
+                        account=account,
+                        transport=transport,
+                    )
+                except RuntimeFatal as exc:
+                    return await self._fail(session, task, str(exc))
+                row.identities = identities
+                await self._fence_execution(
+                    session, task_id=task.id, tenant_id=task.tenant_id, claim=claim
+                )
 
         # Stage 3 - planning (UNDERSTANDING/PLANNING only; resume reuses the row).
         service = PlannerService(self.model)
@@ -715,13 +787,13 @@ class AgentRuntime:
         *,
         task: Task,
         row: RuntimeExecution,
-        scenario: UnderstandingOutput,
+        scenario: UnderstandingOutput | None,
         proposal: PlanProposal,
         plan_version: int,
         plan_hash: str,
         plan_status: str,
         transport: Any,
-        account: GoogleAccount,
+        account: GoogleAccount | None,
         claim: UUID,
     ) -> TriggerOutcome:
         evidence: list[dict[str, Any]] = list(row.evidence)
@@ -783,6 +855,7 @@ class AgentRuntime:
                     collected=collected,
                     created_event_id=created_event_id,
                     timezone=row.timezone,
+                    objective=task.goal,
                 )
                 for index, (tool_name, args, identity) in enumerate(intents):
                     steps_used += 1
@@ -810,7 +883,7 @@ class AgentRuntime:
                         task_id=task.id,
                         tenant_id=task.tenant_id,
                         user_id=task.user_id,
-                        account_id=account.id,
+                        account_id=account.id if account is not None else None,
                         transport=transport,
                         metadata={
                             "steps_used": steps_used,
@@ -1010,7 +1083,7 @@ class AgentRuntime:
         *,
         task: Task,
         row: RuntimeExecution,
-        scenario: UnderstandingOutput,
+        scenario: UnderstandingOutput | None,
         claim: UUID,
     ) -> TriggerOutcome:
         """Give a task in ``VERIFYING`` the verdict its evidence already implies.
@@ -1057,10 +1130,15 @@ class AgentRuntime:
                 user_id=task.user_id,
                 target=COMPLETED,
             )
+            message = (
+                "task prepared and recorded"
+                if outcome.profile == _TASK_PREPARATION
+                else "meeting scheduled and verified"
+            )
             return TriggerOutcome(
                 COMPLETED,
                 COMPLETED,
-                "meeting scheduled and verified",
+                message,
                 [],
                 row.steps_used,
             )
@@ -1099,12 +1177,43 @@ class AgentRuntime:
         (spec §2.1).
         """
         registry = getattr(self.gateway, "registry", None)
+        # The profile↔capability licence, checked first and fail-closed: a
+        # profile present in no execution entry has no licence at all (the
+        # registry maps only the live-sealable profiles), so the task is refused
+        # by name here — before any capability is derived and before the program
+        # is built or any step is dispatched. This is the runtime's own
+        # execution-side authority (``PROFILE_ALLOWED_CAPABILITIES``, the same
+        # registry :func:`kai.runtime.translator.profile_scope_violation` reads
+        # at :meth:`submit`); ``LIVE_SEALABLE_PROFILES`` remains the
+        # storage/creation gate in ``kai.tasks.service``. Reading a missing
+        # profile as "no restriction" (the old ``if licensed is not None``) let a
+        # row written by any other route reach dispatch only to be refused later
+        # by the fulfillment evaluator, so an unknown profile could run a
+        # representable step first.
+        licensed = PROFILE_ALLOWED_CAPABILITIES.get(task.fulfillment_profile)
+        if licensed is None:
+            raise RuntimeFatal(
+                f"fulfillment profile {task.fulfillment_profile!r} is not "
+                "licensed for execution"
+            )
         # An unsupported capability is refused here, before the program is built,
         # with the runtime's own wording — the same refusal the runtime used to
         # make mid-step, moved earlier so nothing can be reached first. The IR
         # validates the same constraint as a backstop, but a plan the slice
         # cannot execute is a runtime fact, not a validation detail.
         allowed = set(allowed_capabilities_from_task(task, CAPABILITY_TO_TOOL))
+        # Profile↔capability compatibility: a sealed profile licences a fixed
+        # capability set, and a contract whose tools derive a capability outside
+        # it is refused here — before the program is built and before any step is
+        # dispatched. This is the second seam behind :meth:`submit`, so a task
+        # that reached the row by any other route still cannot execute a
+        # capability its profile did not licence.
+        refused = tuple(sorted(allowed - licensed))
+        if refused:
+            raise RuntimeFatal(
+                f"fulfillment profile {task.fulfillment_profile!r} does not "
+                f"permit tools/capabilities: {list(refused)!r}"
+            )
         for step in proposal.steps:
             if step.action not in allowed:
                 raise RuntimeFatal(
@@ -1130,16 +1239,32 @@ class AgentRuntime:
         self,
         action: str,
         *,
-        scenario: UnderstandingOutput,
+        scenario: UnderstandingOutput | None,
         identities: list[dict[str, Any]],
         collected: list[tuple[datetime, datetime]],
         created_event_id: str | None,
         timezone: str,
+        objective: str | None = None,
     ) -> list[tuple[str, dict[str, Any], IdentityQuery | None]]:
         tool_name = capability_to_tool(action)
         if tool_name is None:
             raise RuntimeFatal(
                 f"capability not supported by the agent runtime slice: {action}"
+            )
+
+        if tool_name == "task.prepare":
+            # The one argument is the task's own persisted goal — the sealed user
+            # intent — never a planner- or model-supplied string. A planner step
+            # names the capability; the runtime is what fills in the objective,
+            # so the local tool cannot be told to "prepare" something the user
+            # never asked for.
+            if not objective or not objective.strip():
+                raise RuntimeFatal("cannot prepare: the task has no goal on record")
+            return [(tool_name, {"objective": objective}, None)]
+
+        if scenario is None:
+            raise RuntimeFatal(
+                f"capability {action!r} requires a sealed understanding on record"
             )
 
         if tool_name == "contacts.match":
@@ -1591,7 +1716,7 @@ def _external_outcome_unestablished(
 def _fulfillment_outcome(
     task: Task,
     *,
-    scenario: UnderstandingOutput,
+    scenario: UnderstandingOutput | None,
     identities: list[dict[str, Any]],
     evidence: list[dict[str, Any]],
 ) -> FulfillmentOutcome:
@@ -1638,6 +1763,10 @@ def _fulfillment_outcome(
         # The constant is the same value as ``profile`` — the branch is an
         # equality — and it carries the sealed profile's own type, so the
         # criteria and the outcome both name the profile that was checked.
+        if scenario is None:
+            raise RuntimeFatal(
+                "calendar fulfillment requires a sealed understanding on record"
+            )
         criteria = calendar_meeting_criteria(
             profile=_CALENDAR_MEETING,
             window=scenario.window,
@@ -1671,6 +1800,24 @@ def _fulfillment_outcome(
             profile=_GMAIL_SEND,
             version=GMAIL_SEND_EVALUATOR_VERSION,
             verdict=evaluate_gmail_send(
+                FulfillmentInput(criteria=criteria, evidence=tuple(evidence))
+            ),
+        )
+    if profile == _TASK_PREPARATION:
+        # The third sealed question. Its one intent-anchored criterion is the
+        # digest of the persisted task goal — a sealed statement of what the user
+        # asked for — while the step count is a request-side condition. Neither
+        # the scenario nor the resolved identities are read: a preparation names
+        # no guest and carries no window, and the whole question is answered from
+        # the durable evidence log and the sealed goal on the task row.
+        criteria = task_preparation_criteria(
+            profile=_TASK_PREPARATION,
+            objective=task.goal,
+        )
+        return FulfillmentOutcome(
+            profile=_TASK_PREPARATION,
+            version=TASK_PREPARATION_EVALUATOR_VERSION,
+            verdict=evaluate_task_preparation(
                 FulfillmentInput(criteria=criteria, evidence=tuple(evidence))
             ),
         )

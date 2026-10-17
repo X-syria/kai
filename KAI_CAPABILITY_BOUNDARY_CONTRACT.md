@@ -179,8 +179,8 @@ Only three of the 32 are anything other than current, and each is stated precise
 - **CAP-010 — current in the gateway, not drivable.** `gmail.send` is registered in the
   sealed catalog (`tools/catalog.py:97-107`) and the gateway will execute it faithfully.
   But three independent gates make it unreachable from production:
-  1. `LIVE_SEALABLE_PROFILES = {"calendar_meeting"}` (`tasks/service.py:78-80`) — a Task
-     cannot be sealed with `gmail_send`.
+1. `LIVE_SEALABLE_PROFILES = {"calendar_meeting", "task_preparation"}` (`tasks/service.py:78-80`) — a Task
+      cannot be sealed with `gmail_send`.
   2. `SLICE_ALLOWED_TOOLS` omits every gmail tool (`runtime/translator.py:29-34`), and
      `allowed_capabilities_from_task` derives capabilities as the **reverse of the
      slice table**, dropping unknown tools and **raising** on an empty result
@@ -1484,3 +1484,308 @@ gateway, evidence, approval, fulfillment or lifecycle path fails.
 The dirty working tree is itself the reason the prior round's matrix is stale: it was
 written against `1f63fb4`, three feature commits and 24 modified files behind this
 baseline.
+
+---
+
+## 17. Phase 1 Exit Gate — recorded human decisions (D1 / D2 / D3) — 2026-10-06
+
+Recorded as issued, verbatim from the human decision gate on the Phase 1 Exit
+(Engineering Proof). These rulings are governance decisions, not implementation
+decisions; they promote nothing and change no production code.
+
+```text
+D1 = A — Phase 1 Exit Criterion is ENGINEERING PROOF only.
+  Phase 1 Exit = completing and proving the Calendar vertical slice over the governed
+  core path, with the critical engineering semantics closed. Product Proof and
+  DEPLOYMENT/PRODUCTION readiness are later, independent gates.
+  External alert destination and PRODUCTION-READY are NOT part of the Phase 1 Exit
+  definition.
+
+D2 = b — PARK the Alerts unit in full.
+  The alerts unit (migration a1b2c3d4e5f7, src/kai/alerts/, alerting/observability,
+  config/env, task notification, deploy manifest, tests, and the related docs) stays
+  outside Phase 1 as one unit. The single migration-test failure at this gate is a
+  KNOWN ACCEPTED FINDING, not a semantic failure of the Calendar Core.
+  Mandatory constraint (no blind DB downgrade/rollback):
+    1. read-only verification of the migration chain and rollback safety precedes any
+       DB change;
+    2. verify a return from a1b2c3d4e5f7 to d4e5f6a7b8c9 loses no data;
+    3. no DB mutation until safety is proven;
+    4. the current DB state is NOT considered aligned with the committed tree; it is
+       environment drift, recorded explicitly, until resolved safely.
+
+D3 = ii — PARK / DEFER all small unrelated work to Phase 2 or later units.
+  src/kai/api/auth.py, tests/test_auth_registration_durability.py,
+  tests/test_gmail_intent_contract_design.py, tests/test_kai_ir.py, the recovery
+  state-edge, the sealed-recipient design tests, the calendar formatting change, and
+  the remaining docs/plans/archive evidence are NOT promoted now and are NOT Phase 1
+  blockers.
+```
+
+Environment drift record (2026-10-06):
+
+- DB verification attempted read-only; **PostgreSQL unreachable at record time**
+  (`connection refused`). No live `alembic current`, row count, or data-loss
+  confirmation possible yet.
+- Static chain check (this record): `a1b2c3d4e5f7` has `down_revision = d4e5f6a7b8c9`
+  (single, linear head). Upgrade is additive only — one new leaf table `alerts` and
+  five indexes; no existing table, column, index, or default is touched, and nothing
+  references `alerts`, so a downgrade can discard only alert rows (undelivered
+  notification intents), never Core data. Live confirmation still required before any
+  mutation per D2 constraint 3.
+- Declared state: **`PHASE 1 EXIT` is not announced here.** It may be announced only
+  after PostgreSQL is available, the drift is safely settled (per D2), the single
+  suite is run on the committed tree, and D1's conditions hold — and then only as:
+
+  ```text
+  PHASE 1 — ENGINEERING PROOF EXIT
+  ```
+
+Execution record (2026-10-06, later same day):
+
+- PostgreSQL brought back up (Docker engine + `db` service only; no `migrate`, no `app`).
+- Read-only verification: `alembic current` = `a1b2c3d4e5f7`; `alerts` table present with
+  **0 rows**; single-row `alembic_version`. Downgrade to `d4e5f6a7b8c9` therefore
+  discards **no data** (leaf table, additive-only upgrade, nothing references `alerts`).
+  No evidence that Alerts/migration touches Calendar/Core semantics or data integrity —
+  the mandatory stop rule did **not** trigger.
+- Settlement executed per D2: `alembic downgrade d4e5f6a7b8c9` — run once, verified
+  afterwards: `alembic current` = `d4e5f6a7b8c9`, `alerts` table gone. The Alerts unit
+  itself was **not** promoted, and no test was edited.
+- One full suite executed on the committed tree (`c20f790`, detached worktree): **1237
+  passed, 9 skipped, 2 failed**. The two failures are **not migration-related**, so
+  D2(b)'s migration-only Known Accepted Finding does **not** cover them:
+  1. `tests/test_task_state.py::test_happy_path_transitions` — committed runtime rejects
+     `WAITING_EXTERNAL -> EXECUTING` while the committed test still asserts that edge
+     exists (D3-parked recovery state-edge staleness; the fix exists only in the working
+     tree).
+  2. `tests/test_gmail_intent_contract_design.py::test_the_outcome_vocabulary_now_distinguishes_grounded_from_absent`
+     — committed runtime returns `email=None` for `CONFLICTING` while the committed test
+     asserts the address is populated (D3-parked identity-consequence design-test
+     staleness; the fix exists only in the working tree).
+- **Exit withheld.** `PHASE 1 — ENGINEERING PROOF EXIT` is not declared: D1's
+  suite-green condition is not met on the committed tree and no ruling covers these two
+  failures. Resolution requires a human ruling (expand the Known Accepted Finding to
+  the two D3-correlated failures, or another disposition); no new ruling was assumed.
+
+Consequences recorded here for future rounds:
+
+- `PRODUCT PROOF: CLEARED` must **never** be declared on the basis of this gate; Product
+  Proof remains its own, later gate.
+- No Alerts promotion, no Auth/IR/design-test promotion, and no test edits that hide a
+  failure. If the one remaining failure after the safe settlement is still the
+  migration-only failure, it stays a Known Accepted Finding — the accepted state must
+  match D2(b) literally.
+- If settlement work produces new evidence that Alerts or the DB migration touches Core
+  semantics or data integrity, **stop** — no promotion and no rollback executed on
+  assumption — and re-report with the new evidence.
+- Nothing here reopens D.1–D.4, the identity commit, the governance commits, the
+  canonical architecture, or the non-authoritative classification.
+
+---
+
+Re-measurement on a clean committed snapshot — DB-isolated (2026-10-09):
+
+This entry records the first measurement of the committed tree taken from a byte-exact
+snapshot of `c20f790` with both the database target and the import source isolated. It
+corrects the two-failure characterization in the "Execution record (2026-10-06, later
+same day)" block above, which was taken from a detached worktree whose environment /
+import root could not be shown to be free of working-tree contamination.
+
+- **Snapshot:** created with `git archive c20f790` into a directory outside the
+  repository — no `git worktree`, no dirty files, no OAuth worktree, no untracked files.
+  The Alerts migration `a1b2c3d4e5f7_add_alerts.py` is absent from the snapshot, so its
+  Alembic head is `d4e5f6a7b8c9`, exactly as committed (12 version modules; verified
+  `alembic/env.py` and `tests/test_schema_metadata_parity.py` do not import `kai.alerts`).
+- **Isolation:** interpreter `.venv\Scripts\python.exe`; `PYTHONPATH` = `<snapshot>\src`;
+  `DATABASE_URL` = `…/kai_test`, session-scoped only. Verified before the run that `kai`,
+  `kai.tasks.state`, `kai.runtime.fulfillment`, and `kai.identity.service` all resolve to
+  the snapshot's `src` — not the base tree and not the OAuth worktree.
+- **Database target:** verified `current_database() = kai_test`, `alembic_version` =
+  `d4e5f6a7b8c9` (single row), no `alerts` table, 0 operational rows. The development
+  database `kai` remained at `b3d5f7a9c1e2` before and after and was not touched;
+  `git status --short` and HEAD were byte-identical before and after.
+- **Command:** `python -m pytest -q`, run once from the snapshot root.
+- **Result:** **1238 passed, 9 skipped, 1 failed** (exit code 1), 491 warnings,
+  457.17 s.
+
+The single failure:
+
+```text
+tests/test_gmail_intent_contract_design.py::test_the_outcome_vocabulary_now_distinguishes_grounded_from_absent
+AssertionError: assert None == 'alice@example.com'
+```
+
+The committed runtime returns `email=None` for a `CONFLICTING` identity result; the
+committed design test still asserts the address is populated. This is a contradiction
+between a committed source and a committed test — it is not evidence that the committed
+behavior is wrong.
+
+Disposition — measurement kept distinct from acceptance:
+
+1. **Measured fact:** the committed tree is **not** fully green; one test fails
+   deterministically.
+2. That failure is `tests/test_gmail_intent_contract_design.py`, which **D3 = ii already
+   lists** as a small unrelated design test that is **NOT a Phase 1 blocker** and is
+   parked to Phase 2. Accepting it as deferred debt does **not** make the suite green; it
+   records that the only deterministic failure is already covered by an approved
+   exception, and therefore does not require a new human ruling.
+3. `tests/test_task_state.py::test_happy_path_transitions` did **not** fail on the clean
+   snapshot. The earlier two-failure result is attributable to the previous worktree's
+   environment / import-root contamination, not to the committed tree. Nothing is
+   pending on it.
+
+D1 consistency under the approved exceptions:
+
+- D1 = A defines Phase 1 Exit as Engineering Proof only, with D2 (Alerts) and D3
+  (small unrelated work) carved out as known / accepted non-blockers. This clean-snapshot
+  measurement shows the only deterministic failure on the committed tree is a D3 = ii
+  deferred design test, and D2 (Alerts) is wholly outside the snapshot. No **unapproved**
+  failure remains on the committed tree.
+- This does **not** declare the exit. The record now shows the D1 suite-green condition
+  holds **modulo the approved D2 and D3 exceptions**, i.e. this is an
+  **`EXIT CANDIDATE — EVIDENCE COMPLETE`**. Recording the line
+  `PHASE 1 — ENGINEERING PROOF EXIT` remains a human action, taken only on this recorded
+  evidence, and never as a basis for Product Proof or Production Ready.
+
+No code, test, migration, database, or persistent environment was changed to produce
+this measurement. Nothing here reopens D.1–D.4, the identity commit, the governance
+commits, D2, D3, the canonical architecture, or the non-authoritative classification.
+
+---
+
+## 18. Stage 2E — capability-vocabulary amendment (local `task_preparation`) — 2026-10-11
+
+Recorded as issued. Stage 2E implements **Design 2D-1**: a governed first task that
+needs no Google account and performs no external action. Reaching it requires a
+deliberate, exact-vocabulary amendment, named here once and then applied consistently
+to the implementation and to every exact-set assertion. This is an amendment to the
+vocabulary only; it changes no sealed invariance, no Gateway security check, and no
+Policy/Approval semantics.
+
+### 18.1 The exact vocabulary delta (all five, and nothing beyond them)
+
+1. **Submission intent** — `GoalSubmission.intent` gains `"prepare_task"`, i.e.
+   `Literal["schedule_meeting", "prepare_task"]`. `"schedule_meeting"` is unchanged and
+   remains the default.
+2. **Abstract planning capability** — `prepare_checklist` is added to the planner's
+   `ABSTRACT_CAPABILITIES`. This is a vocabulary fact only: the planner's capability set
+   is not a security boundary, and the runtime remains the authority that refuses a
+   capability the sealed contract does not name.
+3. **Catalog tool** — `task.prepare`: local, deterministic, side-effect-free, with no
+   network, no model, and no unrelated database write. Declared `risk_level = LOW`,
+   `requires_account = False`, READ_BACKED, capability group `task`.
+4. **Fulfillment profile** — `FulfillmentProfile` gains `"task_preparation"`, and
+   `LIVE_SEALABLE_PROFILES` gains it alongside `"calendar_meeting"`.
+5. **Policy content category** — `prepare_task` is added to the policy `ContentCategory`
+   ALLOW vocabulary, and `content_category_for("task.prepare")` maps to it.
+
+`gmail_send` is **not** added to `LIVE_SEALABLE_PROFILES`; the live-sealable set remains
+`{calendar_meeting, task_preparation}` and no Gmail contract is touched.
+
+### 18.2 Why `task_preparation` may be live-sealable
+
+A profile belongs in `LIVE_SEALABLE_PROFILES` only because a task can bring it in
+through the governed path by naming its intent, and the sealed criterion is anchored in
+the user's own intent. For `calendar_meeting` that anchor is the persisted identity and
+window; for `task_preparation` it is the sealed criterion
+
+```text
+objective_digest = sha256(normalise(task.goal))
+```
+
+which derives from the persisted `Task.goal` — the sealed user-intent source — and the
+evaluator compares the witness's objective digest against it. Every other condition in
+the profile is non-intent-anchored and secondary. This is the narrow, single ground on
+which the membership is granted; it is recorded as a *conditional* justification rather
+than a general licence for local profiles.
+
+The model never selects the contract or the profile. `AgentRuntime.submit` selects
+`build_preparation_contract` from the validated submission `intent` alone; planner text
+and user goal cannot widen capabilities or choose a profile. A plan step is translated
+to a tool through the one `CAPABILITY_TO_TOOL` table, and a step naming a capability the
+sealed contract does not allow is refused before the program can run.
+
+### 18.3 The sealed preparation contract
+
+`build_preparation_contract(goal)` seals: `allowed_tools == ["task.prepare"]`,
+`fulfillment_profile == "task_preparation"`, `risk_policy == "LOW"`,
+`verification_method == "automatic"`, `max_steps == 2`.
+
+`max_steps` is the contract's invocation ceiling, and the Policy Engine's step-budget
+rule refuses an invocation once `steps_used` reaches that ceiling, counting the
+invocation about to run. A single local invocation therefore requires a ceiling of **2**;
+with it, the first `task.prepare` run proceeds and any second one is denied, so the slice
+still admits exactly one local run and no more.
+
+### 18.4 Evidence and fulfillment
+
+`evidence.py` gains `qualifying_preparation` / `qualifying_preparations`, and
+`fulfillment.py` gains `TaskPreparationCriteria`, `task_preparation_criteria`,
+`SuccessCriteria.task_preparation`, `TASK_PREPARATION_EVALUATOR_VERSION =
+"task_preparation:v1"`, and `evaluate_task_preparation`. The evaluator is a
+whole-evidence, existence-of-a-qualifying-record check over the durable log: a
+`task.prepare` record must have succeeded, be verified, carry a non-blank objective
+whose digest equals the sealed criterion, and report a positive integer step count.
+Malformed, failed, unverified, irrelevant, or differently-objectived evidence does not
+satisfy it. Because the tool is local and side-effect-free, absent qualifying evidence
+settles **`NOT_FULFILLED`** and never `INDETERMINATE`.
+
+### 18.5 Exact-set expectations updated in step
+
+The amendment is applied consistently (no subset assertions, no skipped or regenerated
+tripwires):
+
+- `tests/test_fulfillment.py` — closed dispatch vocabulary and `SuccessCriteria.model_fields`.
+- `tests/test_tool_registry.py` — expected MVP tools and `task.prepare` declarations.
+- `tests/test_gmail_approver_visibility_design.py`,
+  `tests/test_gmail_authority_review_design.py`,
+  `tests/test_gmail_intent_contract_design.py`,
+  `tests/test_identity_approval_binding_design.py`,
+  `tests/test_identity_single_gate_lock.py`,
+  `tests/test_recipient_intent_provenance.py`,
+  `tests/test_sealed_recipient_intent_design.py` — `LIVE_SEALABLE_PROFILES` set.
+- `tests/test_intent_provenance.py` — the sealed contract now supplies the profile
+  *and* the objective from the persisted goal, for the `task_preparation` profile only.
+
+New regression surface: `tests/test_task_preparation.py` proves the governed lifecycle
+completes with no Google account and no transport, that fulfillment fails closed without
+qualifying evidence, and that a preparation task cannot acquire another capability.
+
+### 18.6 Not changed
+
+No calendar or Gmail contract, tool, vocabulary, or behavior is modified. No sealed IR
+invariant, no Gateway security check, and no Policy/Approval semantics are modified. No
+migration is added or run; no database is reset or mutated to pass a test.
+
+---
+
+### 19. task_preparation Live-Sealing Decision — 2026-10-15
+
+**Decision: APPROVED / DECIDED**
+
+**Scope.** Add `task_preparation` to `LIVE_SEALABLE_PROFILES` for live execution via the governed runtime path.
+
+**Semantic Justification (§10.10).** The `task_preparation` profile carries the criterion `objective_digest`, computed as `sha256(task.goal)` from the sealed `Task.goal` at contract sealing time. The evaluator `evaluate_task_preparation` decides the outcome by comparing `prepared.objective_digest` against `criteria.objective_digest`. This satisfies the §10.10 anchor requirement: "a domain whose every criterion value is derived from execution-time resolution is not fulfilling an intent; it is reporting its own self-consistency. Such a profile must not be sealed for live use until at least one criterion value has a sealed user-intent source that its evaluator decides on." The `objective_digest` is derived from the sealed user intent (`task.goal`) and the evaluator decides on it.
+
+**Profile Characteristics.**
+- Local, side-effect-free, provider-free execution
+- `risk_policy = LOW`, `max_steps = 2` (one `task.prepare` invocation)
+- `VerificationContract.READ_BACKED` (no external provider verification)
+- `requires_account = False` (no Google account required)
+- Tool: `task.prepare` (local, deterministic, side-effect-free)
+- `SLICE_ALLOWED_TOOLS` for this profile: `["task.prepare"]` only
+- `SLICE_CAPABILITIES`: `{"prepare_checklist"}` only
+- `SLICE_FULFILLMENT_PROFILE` for the slice is `"calendar_meeting"`; `task_preparation` uses its own contract via `build_preparation_contract()`
+
+**Governance Gate.** The live-sealing gate remains at `create_task()` (`tasks/service.py:119`), which checks `contract.fulfillment_profile in LIVE_SEALABLE_PROFILES`. The `task_preparation` profile is now included in `LIVE_SEALABLE_PROFILES = frozenset({"calendar_meeting", "task_preparation"})`.
+
+**Test Evidence.**
+- `tests/test_task_preparation.py`: 6 tests covering contract sealing, adapter determinism, completion without Google account, fulfillment without qualifying evidence, capability restriction, and Google profile account gate.
+- `tests/test_fulfillment.py`: Additional assertions for `task_preparation` criteria and evaluator.
+- `tests/test_tool_registry.py`: Verifies `task.prepare` tool registration.
+- `tests/test_intent_provenance.py`: Verifies sealed contract supplies profile and objective for `task_preparation`.
+
+**Scope Boundary.** `gmail_send` remains NOT live-sealable. Its criteria (`required_recipients`) are entirely derived from execution-time resolution with no sealed user-intent source. This decision does not change that status.
+
+**Documentation Updates.** Updated `docs/architecture/KAI_REFERENCE_ARCHITECTURE_AR.md` (§10.1, §10.10), `README.md`, and this register to consistently reflect `LIVE_SEALABLE_PROFILES = {"calendar_meeting", "task_preparation"}`.

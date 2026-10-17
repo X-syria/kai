@@ -133,6 +133,7 @@ class GoogleBackend:
         self.read_event_payload: dict | None = None
         self.create_event_status = 200
         self.created_events: dict[str, dict] = {}
+        self.create_event_unreadable: bytes | None = None
         self.next_event_id = 1
 
         self.search_status = 200
@@ -143,6 +144,7 @@ class GoogleBackend:
         self.send_return: dict | None = None
         self.send_raw: str | None = None
         self.readback_status = 200
+        self.send_unreadable: bytes | None = None
         self.sent_messages: dict[str, dict] = {}
 
         self.contacts_calls: list[httpx.Request] = []
@@ -188,6 +190,8 @@ class GoogleBackend:
                     ),
                 )
                 self.created_events[event_id] = created
+                if self.create_event_unreadable is not None:
+                    return httpx.Response(200, content=self.create_event_unreadable)
                 return httpx.Response(200, json=created)
             self.calendar_calls.append(request)
             if self.calendar_list_status >= 400:
@@ -228,6 +232,8 @@ class GoogleBackend:
                 body_text="This is the plain text body.",
             )
             self.sent_messages[sent["id"]] = sent
+            if self.send_unreadable is not None:
+                return httpx.Response(200, content=self.send_unreadable)
             return httpx.Response(200, json=sent)
 
         if url.path.startswith("/gmail/v1/users/me/messages/"):

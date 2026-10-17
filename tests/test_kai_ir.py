@@ -2111,6 +2111,125 @@ def test_the_branch_a_plan_declares_is_part_of_the_program_it_compiles_to() -> N
     assert _forked().fingerprint == forked.fingerprint
 
 
+def _same_topology(other: KaiProgram, reference: KaiProgram) -> bool:
+    """Whether two programs differ only in their branch predicate."""
+    return [
+        (node.node_id, node.kind.value, node.step_order) for node in other.nodes
+    ] == [
+        (node.node_id, node.kind.value, node.step_order) for node in reference.nodes
+    ] and [(edge.from_node, edge.to_node) for edge in other.edges] == [
+        (edge.from_node, edge.to_node) for edge in reference.edges
+    ]
+
+
+@pytest.mark.parametrize(
+    "predicate",
+    [
+        pytest.param(
+            _branch(
+                condition={
+                    "kind": "observation",
+                    "step_order": 1,
+                    "field": "outcome",
+                    "operator": "eq",
+                    "value": ToolOutcome.EXECUTION_FAILED.value,
+                }
+            ),
+            id="a-different-outcome-continues-the-plan",
+        ),
+        pytest.param(
+            _branch(
+                condition={
+                    "kind": "observation",
+                    "step_order": 1,
+                    "field": "outcome",
+                    "operator": "neq",
+                    "value": ToolOutcome.EXECUTION_SUCCEEDED.value,
+                }
+            ),
+            id="inverted-operator",
+        ),
+        pytest.param(
+            _branch(
+                condition={
+                    "kind": "observation",
+                    "step_order": 1,
+                    "field": "outcome",
+                    "operator": "eq",
+                    "value": ToolOutcome.REQUIRES_ATTENTION.value,
+                }
+            ),
+            id="a-laxer-outcome-continues-the-plan",
+        ),
+    ],
+)
+def test_the_branch_predicate_is_part_of_the_program_identity(predicate: dict) -> None:
+    """Same task, same steps, same fork — a different decision is a different program.
+
+    The graph tests pin that *topology* counts: branching differs from a chain.
+    This pins the half they leave open. A condition node and its two guarded edges
+    can be byte-identical in shape while the comparison inside them decides the
+    opposite thing, and the outcome that follows a step-1 failure is exactly the
+    difference between retrying the meeting and giving up on it.
+
+    So the predicate has to be inside the canonical form. If it were not, the two
+    programs below would share a fingerprint, and the seal in
+    :meth:`KaiProgram.validate_executable` — the only thing that detects a program
+    edited after sealing — would accept the substituted one.
+    """
+    approved = _forked()
+    swapped = _forked(proposal=_declared(steps=3, branches=[predicate]))
+
+    # Same task, same plan topology, same node ids and edges: only the comparison
+    # inside the condition differs.
+    assert swapped.program_id == approved.program_id
+    assert _same_topology(swapped, approved), "the test must isolate the predicate"
+    assert swapped.plan.steps == approved.plan.steps
+
+    # Same task, same plan, different decision: therefore a different program.
+    assert swapped.fingerprint != approved.fingerprint
+
+    # And the seal catches the substitution rather than silently accepting it.
+    with pytest.raises(IrValidationError):
+        approved.model_copy(
+            update={
+                "nodes": swapped.nodes,
+                "edges": swapped.edges,
+            }
+        ).validate_executable()
+
+
+def test_swapping_only_the_predicate_leaves_the_program_id_alone() -> None:
+    """``program_id`` is the task; the fingerprint is what the program intends.
+
+    Approval is granted against a task and a plan, so two programs that differ
+    only in a branch predicate are the same thing to an approver. They must
+    therefore share ``program_id`` while differing in ``fingerprint``, which is
+    what lets the runtime notice that the program it is about to execute is not
+    the one it validated.
+    """
+    approved = _forked()
+    swapped = _forked(
+        proposal=_declared(
+            steps=3,
+            branches=[
+                _branch(
+                    condition={
+                        "kind": "observation",
+                        "step_order": 1,
+                        "field": "outcome",
+                        "operator": "eq",
+                        "value": ToolOutcome.REQUIRES_ATTENTION.value,
+                    }
+                )
+            ],
+        )
+    )
+
+    assert swapped.program_id == approved.program_id
+    assert swapped.fingerprint != approved.fingerprint
+
+
 def test_the_order_branches_were_declared_in_is_not_part_of_the_program() -> None:
     """Two plans that declare the same forks are the same plan."""
     first_fork = _branch(else_step=4)

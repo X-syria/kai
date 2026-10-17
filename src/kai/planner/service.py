@@ -43,6 +43,7 @@ ABSTRACT_CAPABILITIES: frozenset[str] = frozenset(
         "send_message",
         "create_calendar_event",
         "verify_calendar_event",
+        "prepare_checklist",
     }
 )
 

@@ -19,6 +19,7 @@ from kai.tools.schemas import (
     GmailReadArgs,
     GmailSearchArgs,
     GmailSendArgs,
+    PrepareTaskArgs,
 )
 
 
@@ -27,9 +28,10 @@ def default_definitions(
     contacts: ToolExecutor,
     calendar: ToolExecutor,
     gmail: ToolExecutor,
+    preparation: ToolExecutor | None = None,
 ) -> list[ToolDefinition]:
     """The MVP catalog as a plain list, ready for any registry composition."""
-    return [
+    defs = [
         ToolDefinition(
             name="contacts.match",
             description=(
@@ -106,6 +108,23 @@ def default_definitions(
             verification_contract=VerificationContract.READ_AFTER_SEND,
         ),
     ]
+    if preparation is not None:
+        defs.append(
+            ToolDefinition(
+                name="task.prepare",
+                description=(
+                    "Prepare a local, side-effect-free task checklist and list "
+                    "missing information. Does not contact external services."
+                ),
+                input_schema=PrepareTaskArgs,
+                risk_level=RiskLevel.LOW,
+                capability="task",
+                executor=preparation,
+                verification_contract=VerificationContract.READ_BACKED,
+                requires_account=False,
+            )
+        )
+    return defs
 
 
 def default_registry() -> ToolRegistry:
@@ -113,12 +132,19 @@ def default_registry() -> ToolRegistry:
     from kai.tools.adapters.calendar import CalendarAdapter
     from kai.tools.adapters.contacts import ContactsAdapter
     from kai.tools.adapters.gmail import GmailAdapter
+    from kai.tools.adapters.preparation import PreparationAdapter
 
     contacts = ContactsAdapter()
     calendar = CalendarAdapter()
     gmail = GmailAdapter()
+    preparation = PreparationAdapter()
     return ToolRegistry.build(
-        default_definitions(contacts=contacts, calendar=calendar, gmail=gmail)
+        default_definitions(
+            contacts=contacts,
+            calendar=calendar,
+            gmail=gmail,
+            preparation=preparation,
+        )
     )
 
 

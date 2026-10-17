@@ -45,9 +45,10 @@ of discovering it. Nothing here licenses ``gmail_send``.
 from __future__ import annotations
 
 import json
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Final, Literal, get_args
+from zoneinfo import ZoneInfo
 
 import pytest
 from pydantic import ValidationError
@@ -307,7 +308,7 @@ async def test_a_memory_address_reaches_the_understanding_model() -> None:
 
     # The stage's one deterministic rule is about the calendar's own field, so
     # there is no grounding relation here to extend to a recipient.
-    past = date.today() - timedelta(days=1)
+    past = datetime.now(ZoneInfo(TZ)).date() - timedelta(days=1)
     with pytest.raises(ValueError, match="starts in the past"):
         await understand_scenario(
             _StubModel(_scenario(window={**_future_window(), "start_date": past.isoformat()})),
@@ -399,10 +400,11 @@ def test_gmail_send_is_still_unlicensed_and_the_gate_has_one_entrance() -> None:
     The chosen representation — a goal-grounded sealed address — is not
     implemented, so the domain's only criterion value is still a resolution
     projection and the profile stays out of the licence set. The set is a closed
-    literal checked at one place, so a second path to live sealing cannot appear
-    without an edit to the single function that grants it.
+    literal checked at one place — it now also holds the local, provider-free
+    ``task_preparation`` profile added in Stage 2E — so a second path to live
+    sealing cannot appear without an edit to the single function that grants it.
     """
-    assert frozenset({"calendar_meeting"}) == LIVE_SEALABLE_PROFILES
+    assert frozenset({"calendar_meeting", "task_preparation"}) == LIVE_SEALABLE_PROFILES
     assert "gmail_send" in get_args(FulfillmentProfile)
 
     # The set is a closed literal and the gate is a single membership test, so a

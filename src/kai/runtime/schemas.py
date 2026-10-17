@@ -42,6 +42,7 @@ class GoalSubmission(BaseModel):
 
     goal: str = Field(min_length=1, max_length=_MAX_GOAL)
     timezone: str = Field(min_length=1, max_length=_MAX_TZ)
+    intent: Literal["schedule_meeting", "prepare_task"] = "schedule_meeting"
 
     @field_validator("goal")
     @classmethod

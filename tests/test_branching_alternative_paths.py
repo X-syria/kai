@@ -896,7 +896,7 @@ def test_the_two_paths_are_two_control_flow_paths_over_one_provider_method() -> 
     parameters = set(inspect.signature(AgentRuntime._intents_for).parameters)
     assert parameters == {
         "self", "action", "scenario", "identities", "collected",
-        "created_event_id", "timezone",
+        "created_event_id", "timezone", "objective",
     }
     assert not parameters & {"step_order", "node_id", "branch", "path", "arm"}
 

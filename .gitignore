@@ -36,3 +36,23 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Local diagnostic artifacts (untracked, credential/payload shaped).
+# Root-anchored only; never matches application source, tests, migrations, or docs.
+/exec_*.json
+/auth401_*.json
+/exec_goal.txt
+/diag_*.py
+/db_*.py
+/auth401_proof.py
+/gcal_independent.py
+/gen_connect.py
+/verify3.py
+/inspect_proof.py
+/prep_identity.py
+/calendar_days_check.py
+/capture_evidence.py
+/duplicate_trigger.py
+/exec_resume.py
+/exec_submit.py
+/scan_revisions.py

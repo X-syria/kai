@@ -25,6 +25,11 @@ from kai.calendar.slots import parse_timezone
 
 _Timezone = Annotated[str, Field(min_length=1, max_length=64)]
 
+#: Upper bound on a preparation objective. Kept equal to the runtime's goal
+#: limit (``kai.runtime.schemas._MAX_GOAL``) so a goal that the submission
+#: boundary accepted can always be carried into the local tool unchanged.
+_MAX_OBJECTIVE = 2000
+
 
 class _StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -144,6 +149,20 @@ class GmailSendArgs(_StrictModel):
         return value
 
 
+class PrepareTaskArgs(_StrictModel):
+    """Arguments for the local, side-effect-free task preparation tool."""
+
+    objective: str = Field(min_length=1, max_length=_MAX_OBJECTIVE)
+
+    @field_validator("objective")
+    @classmethod
+    def _objective_not_blank(cls, value: str) -> str:
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("objective must not be blank")
+        return stripped
+
+
 #: Application-controlled map from tool name to its argument schema. The LLM
 #: can only reference these names; it cannot register or attach a new schema.
 ARGUMENT_SCHEMAS: dict[str, type[BaseModel]] = {
@@ -154,6 +173,7 @@ ARGUMENT_SCHEMAS: dict[str, type[BaseModel]] = {
     "gmail.search": GmailSearchArgs,
     "gmail.read": GmailReadArgs,
     "gmail.send": GmailSendArgs,
+    "task.prepare": PrepareTaskArgs,
 }
 
 
@@ -166,4 +186,5 @@ __all__ = [
     "GmailReadArgs",
     "GmailSearchArgs",
     "GmailSendArgs",
+    "PrepareTaskArgs",
 ]

@@ -31,7 +31,7 @@ from kai.gmail.service import (
 )
 from kai.tools.adapters.base import AdapterBase, provider_failure
 from kai.tools.context import ToolContext
-from kai.tools.errors import ToolExecutionError
+from kai.tools.errors import PROVIDER_UNREACHABLE, ToolExecutionError
 from kai.tools.execution import ToolExecutionOutcome, VerificationMismatch
 
 _PROVIDER_CODES: dict[type[Exception], str] = {
@@ -39,6 +39,7 @@ _PROVIDER_CODES: dict[type[Exception], str] = {
     gmail_client.GoogleForbiddenError: "PERMISSION_DENIED",
     gmail_client.GoogleRateLimitError: "RATE_LIMITED",
     gmail_client.GoogleNotFoundError: "NOT_FOUND",
+    gmail_client.GoogleUnreadableResultError: PROVIDER_UNREACHABLE,
     gmail_client.GoogleApiError: "PROVIDER_ERROR",
 }
 

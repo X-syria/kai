@@ -30,8 +30,10 @@ PROVIDER_SERVER_ERROR: Final = "PROVIDER_SERVER_ERROR"
 #: request was on the wire, and each is a case where the response cannot settle
 #: what the provider did:
 #:
-#: * :data:`PROVIDER_UNREACHABLE` — the request was dispatched and no response
-#:   ever completed. The provider may have applied it, or never received it.
+#: * :data:`PROVIDER_UNREACHABLE` — the request was dispatched and no usable
+#:   answer establishing the outcome came back: no response ever completed, or a
+#:   success response whose body cannot be read as the accepted result. The
+#:   provider may have applied it, or never received it.
 #: * :data:`PROVIDER_SERVER_ERROR` — the provider answered, but with a 5xx. A
 #:   server error is a statement about the response, not about whether the write
 #:   was committed before the error was raised.

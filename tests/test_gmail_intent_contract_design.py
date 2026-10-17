@@ -440,13 +440,15 @@ async def test_the_outcome_vocabulary_now_distinguishes_grounded_from_absent() -
             IdentityStatus.UNKNOWN,
         }
 
-        # The address is still readable from a result whose status is not positive,
-        # which is why the runtime guards on status at write time rather than on the
-        # email. A populated address is a payload, never an authority.
-        assert colliding.email == ALICE
+        # A contested identity now publishes no address at all, so it
+        # cannot become a required recipient. The runtime still guards on
+        # status at write time, but that guard is now defence in depth
+        # rather than the only thing between a conflict and an obligation.
+        assert colliding.email is None
+        assert colliding.phone is None
         assert _criteria(
             ("Alice", colliding.email, colliding.status.value)
-        ).for_gmail_send().required_recipients == frozenset({ALICE})
+        ).for_gmail_send().required_recipients == frozenset()
 
 
 # ---------------------------------------------------------------------------
@@ -666,10 +668,11 @@ def test_calendar_semantics_are_unchanged_and_the_gate_stays_single() -> None:
     assert gmail.profile == "gmail_send"
     assert gmail.verdict is FulfillmentVerdict.FULFILLED
 
-    # The licence is still one closed literal checked in one place, and gmail is still
-    # outside it. Nothing in this round moved that, and a second path to live sealing
-    # would need an edit to the single function that writes the row.
-    assert frozenset({"calendar_meeting"}) == LIVE_SEALABLE_PROFILES
+    # The licence is still one closed literal checked in one place. It gained the
+    # local, provider-free ``task_preparation`` profile in the Stage 2E slice, and
+    # gmail is still outside it. Nothing here moved that, and a second path to live
+    # sealing would need an edit to the single function that writes the row.
+    assert frozenset({"calendar_meeting", "task_preparation"}) == LIVE_SEALABLE_PROFILES
 
     from kai.tasks import service as task_service
 
@@ -710,4 +713,4 @@ def test_the_semantic_minimum_is_not_yet_determinable() -> None:
     # And the profile that would need them is still unlicensed, which is the gate's
     # own record of the three open questions.
     assert "gmail_send" not in LIVE_SEALABLE_PROFILES
-    assert frozenset({"calendar_meeting"}) == LIVE_SEALABLE_PROFILES
+    assert frozenset({"calendar_meeting", "task_preparation"}) == LIVE_SEALABLE_PROFILES

@@ -623,14 +623,21 @@ def test_the_content_authorizer_cannot_stand_in_for_human_visibility() -> None:
 def test_gmail_send_stays_unlicensed_and_the_decision_is_design_only() -> None:
     """The boundary this round is not allowed to move.
 
-    ``LIVE_SEALABLE_PROFILES`` still holds only ``calendar_meeting``; ``gmail_send``
+    ``LIVE_SEALABLE_PROFILES`` now holds ``calendar_meeting`` and the local,
+    provider-free ``task_preparation`` (added in Stage 2E); ``gmail_send`` still
     exists as a fulfilment profile and a tool definition and nowhere as a live path.
     The two defects found this round — the claim predicate and the unread body — are
     left in place, because settling either is a decision, and a round told to stop
     rather than choose stops.
     """
-    assert frozenset(LIVE_SEALABLE_PROFILES) == frozenset({"calendar_meeting"})
-    assert typing.get_args(FulfillmentProfile) == ("calendar_meeting", "gmail_send")
+    assert frozenset(LIVE_SEALABLE_PROFILES) == frozenset(
+        {"calendar_meeting", "task_preparation"}
+    )
+    assert typing.get_args(FulfillmentProfile) == (
+        "calendar_meeting",
+        "gmail_send",
+        "task_preparation",
+    )
     assert "gmail_send" not in LIVE_SEALABLE_PROFILES
 
     # No gmail branch was added to the runtime's intent builder.

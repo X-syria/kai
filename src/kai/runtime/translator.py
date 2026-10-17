@@ -13,7 +13,7 @@ fallback are used for every task created through the runtime.
 from __future__ import annotations
 
 import re
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from datetime import date, datetime, time, timedelta
 from typing import Any, Literal
 from uuid import UUID
@@ -72,6 +72,28 @@ CAPABILITY_TO_TOOL: dict[str, str] = {
     "read_calendar": "calendar.read_slots",
     "create_calendar_event": "calendar.create_event",
     "verify_calendar_event": "calendar.get_event",
+    "prepare_checklist": "task.prepare",
+}
+
+#: The tool and capability scope of each live-sealable fulfillment profile. This
+#: is the governed path's profile↔scope rule: a token in a sealed contract's
+#: ``allowed_tools`` is in scope only when it names a permitted tool or a
+#: permitted capability. There is deliberately no allow-all entry and no
+#: fallback — an unknown profile has no scope, so *everything* is refused.
+#:
+#: ``gmail`` appears in no entry. The slice's capability table
+#: (:data:`CAPABILITY_TO_TOOL`) has no gmail capability, so a gmail tool is
+#: dropped by :func:`kai.ir.build.allowed_capabilities_from_task` (and with it
+#: every gmail capability) and can never become an executable capability. The
+#: mapping here is the outer bound: it also refuses a profile whose sealed tools
+#: name a capability the profile did not licence.
+PROFILE_ALLOWED_TOOLS: dict[str, frozenset[str]] = {
+    "calendar_meeting": frozenset(SLICE_ALLOWED_TOOLS),
+    "task_preparation": frozenset({"task.prepare"}),
+}
+PROFILE_ALLOWED_CAPABILITIES: dict[str, frozenset[str]] = {
+    "calendar_meeting": SLICE_CAPABILITIES,
+    "task_preparation": frozenset({"prepare_checklist"}),
 }
 
 _DAY_END = time(17, 0)
@@ -92,6 +114,29 @@ def build_slice_contract(goal: str) -> TaskContractInput:
         max_steps=SLICE_MAX_STEPS,
         verification_method=SLICE_VERIFICATION_METHOD,
         fallback=SLICE_FALLBACK,
+    )
+
+
+def build_preparation_contract(goal: str) -> TaskContractInput:
+    """The sealed contract for the local prepare_task slice.
+
+    ``max_steps`` is the contract's invocation ceiling, and the Policy Engine
+    refuses an invocation once ``steps_used`` reaches it, counting the invocation
+    about to run. A single local step therefore needs a ceiling of 2: the slice
+    permits exactly one ``task.prepare`` run and no more.
+    """
+    return TaskContractInput(
+        goal=goal,
+        success_criteria=[
+            "a plan was prepared",
+            "information gaps identified",
+        ],
+        fulfillment_profile="task_preparation",
+        allowed_tools=["task.prepare"],
+        risk_policy="LOW",
+        max_steps=2,
+        verification_method="automatic",
+        fallback="provide the missing details",
     )
 
 
@@ -247,6 +292,29 @@ def capability_to_tool(action: str) -> str | None:
     return CAPABILITY_TO_TOOL.get(action)
 
 
+def profile_scope_violation(
+    profile: str, tokens: Iterable[str]
+) -> tuple[str, ...]:
+    """The ``tokens`` that fall outside ``profile``'s licensed tool/capability scope.
+
+    The single profile↔scope rule, shared by the governed path's sealing and
+    pre-dispatch seams. A token is in scope when it is a permitted tool name or a
+    permitted capability name — the same two namespaces
+    :func:`kai.policy.rules._task_allows` compares against at the gateway.
+
+    Fail-closed: an unknown profile has no scope, so every token is a violation
+    rather than an allow-all. Returns the sorted offenders; an empty tuple means
+    the tokens are compatible with the profile.
+    """
+    permitted_tools = PROFILE_ALLOWED_TOOLS.get(profile)
+    if permitted_tools is None:
+        return tuple(sorted(set(tokens)))
+    permitted = permitted_tools | PROFILE_ALLOWED_CAPABILITIES.get(
+        profile, frozenset()
+    )
+    return tuple(sorted(set(tokens) - permitted))
+
+
 def content_category_for(tool_name: str) -> str:
     """The trusted content category this slice attaches to each tool call.
 
@@ -255,6 +323,8 @@ def content_category_for(tool_name: str) -> str:
     """
     if tool_name == "calendar.create_event":
         return "confirm_meeting"
+    if tool_name == "task.prepare":
+        return "prepare_task"
     return "propose_time"
 
 
@@ -264,6 +334,8 @@ def scenario_from_row(payload: Any) -> UnderstandingOutput:
 
 __all__ = [
     "CAPABILITY_TO_TOOL",
+    "PROFILE_ALLOWED_CAPABILITIES",
+    "PROFILE_ALLOWED_TOOLS",
     "SLICE_ALLOWED_TOOLS",
     "SLICE_CAPABILITIES",
     "SLICE_FALLBACK",
@@ -271,6 +343,7 @@ __all__ = [
     "SLICE_RISK_POLICY",
     "SLICE_SUCCESS_CRITERIA",
     "SLICE_VERIFICATION_METHOD",
+    "build_preparation_contract",
     "build_slice_contract",
     "candidate_days",
     "capability_to_tool",
@@ -281,6 +354,7 @@ __all__ = [
     "parse_free_intervals",
     "pick_slot",
     "plan_fingerprint",
+    "profile_scope_violation",
     "read_intent_args",
     "request_id_for",
     "scenario_from_row",

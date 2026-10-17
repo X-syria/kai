@@ -377,7 +377,7 @@ def test_the_chain_is_unreachable_twice_over_and_both_bounds_are_independent() -
     assert "LIVE_SEALABLE_PROFILES" not in runtime.split("row.identities = identities")[0]
 
     # Bound two: the profile cannot be licensed, so the gmail reader has no input.
-    assert frozenset({"calendar_meeting"}) == LIVE_SEALABLE_PROFILES
+    assert frozenset({"calendar_meeting", "task_preparation"}) == LIVE_SEALABLE_PROFILES
     assert "gmail_send" not in LIVE_SEALABLE_PROFILES
     assert "UnlicensedFulfillmentError" in _repo_text("tasks", "service.py")
 

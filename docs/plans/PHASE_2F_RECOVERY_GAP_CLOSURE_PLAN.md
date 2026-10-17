@@ -470,3 +470,293 @@ Phase 2F scope and would touch semantics this phase must not change.
 | Gap B — `UNDETERMINATE` recovery | **CLOSED** (working-tree proof; not yet committed) |
 | Provider idempotency keys | **NOT PROVEN — not claimed** |
 | Automatic orphan rediscovery | **OUT OF SCOPE by decision (Option D)** |
+
+The Gap B line above was accurate when §9 was written. §10 supersedes it.
+
+---
+
+## 10. Post-Commit Provenance Reconciliation
+
+Appended after the Phase 2F commit. Sections 1–9 are the pre-commit record and are left as
+written. Nothing above is retroactively edited, because doing so would erase the distinction
+between what was known when and what the repository turned out to contain.
+
+### 10.1 The commit
+
+`ebed4871482ca1bba93502a52c1ca993d312118c` (`test(runtime): close phase 2F recovery proof gap`),
+parent `758ad9b`. Exactly two paths:
+
+| Path | Change |
+|---|---|
+| `tests/test_runtime.py` | +110 / −1, one hunk, one added test |
+| `docs/plans/PHASE_2F_RECOVERY_GAP_CLOSURE_PLAN.md` | new file (this document) |
+
+No `src/**`, no `alembic/**`, no `tests/tool_harness.py`, no migrations. The 41 other tracked
+files carrying the user's uncommitted work were left unstaged and are still unstaged.
+
+### 10.2 Correction: the orphan test is not reproducible from the repository alone
+
+§9 and the commit message record the orphan test as repository-backed proof. The *test* is
+committed. The *semantics it asserts* are not, and this changes what the commit actually
+establishes on its own.
+
+At `758ad9b` the three production symbols the orphan test depends on do not exist:
+
+| Symbol | `758ad9b` | Working tree |
+|---|---|---|
+| `external_outcome` in `src/kai/runtime/service.py` | **0 occurrences** | present |
+| `undetermined_creations` in `src/kai/runtime/evidence.py` | **0 occurrences** | present |
+| `APPROVAL_STALE` in `src/kai/tools/gateway.py` | **0 occurrences** | present |
+
+The committed crash test at `758ad9b` — unchanged by `ebed487` — asserts the older outcome:
+
+```
+assert resumed["task_state"] == "FAILED", resumed
+assert "STALE" in resumed["message"]
+```
+
+whereas the orphan test committed in `ebed487` asserts `REQUIRES_ATTENTION` and a durable
+`INDETERMINATE` audit triple. Those two expectations cannot both hold against one tree.
+
+So `ebed487` records the proof, but does not by itself reproduce it. Checked out on its own it
+would fail; it passes only in combination with the uncommitted production semantics. The honest
+formulation is:
+
+> The orphan-present proof is **committed as a test**, and **reproducible only against the
+> working tree**, because the production symbols it asserts are still uncommitted.
+
+### 10.3 What is committed at `758ad9b`
+
+Not everything about recovery is working-tree-only. `758ad9b` already contains:
+
+1. Single-use approval consumed **and committed before dispatch** —
+   `src/kai/approvals/service.py`, unmodified (`git status` clean).
+2. Refusal of a stale claim at the authorization boundary — `src/kai/tools/gateway.py:160`.
+   The refusal is committed; only its `APPROVAL_STALE` error code is not.
+3. `INDETERMINATE` as a settlement verdict reaching `REQUIRES_ATTENTION`, proven by committed
+   tests that inject the verdict directly:
+   `test_an_indeterminate_verdict_stops_for_a_human_not_a_failure`,
+   `test_an_indeterminate_run_records_its_own_verdict`.
+4. The crash window itself, asserted to its older outcome: no duplicate provider event, cursor
+   unchanged, blocked attempt recorded not-ok, replay refused `409`.
+
+### 10.4 What remains working-tree-only
+
+| Item | Kind |
+|---|---|
+| `APPROVAL_STALE` error code | production |
+| `external_outcome` marker + `undetermined_creations` selection | production |
+| Stale claim → `UNKNOWN` → `INDETERMINATE` → `REQUIRES_ATTENTION` for the crash window | production |
+| `test_crash_after_create_before_persist_never_duplicates` upgraded to `REQUIRES_ATTENTION` + durable `INDETERMINATE` | test |
+| `test_a_lost_answer_is_re_derived_identically_after_a_crash` | test |
+| Seven `INDETERMINATE` anti-overreach guards | test |
+| `test_the_published_evidence_names_the_sealed_plan_that_produced_it` | test |
+
+The `external_outcome` mechanism is the load-bearing one: without it there is no path from an
+ambiguous provider outcome to `INDETERMINATE`, so the stale-claim settlement differs between the
+committed tree and the working tree.
+
+### 10.5 Canonical recovery status
+
+| Area | Status |
+|---|---|
+| Crash-before-evidence **implementation** | **CLOSED** — pre-dispatch refusal committed at `758ad9b` |
+| Crash-before-evidence **proof with orphan present** | **CLOSED** — test committed at `ebed487`; reproducible only against the working tree (§10.2) |
+| `INDETERMINATE` recovery **implementation** | **CLOSED semantically**; the `UNKNOWN` → `INDETERMINATE` → `REQUIRES_ATTENTION` path for the crash window is working-tree-only |
+| `INDETERMINATE` recovery **semantic proof** | **CLOSED at working-tree level; repository-backed proof pending** |
+| Provider idempotency | **NOT PROVEN** — no idempotency key exists; not claimed |
+| Automatic orphan rediscovery | **OUT OF SCOPE** — deliberate, not a deferral |
+
+The guarantee actually demonstrated is narrow and should not be widened in the retelling:
+
+> An ambiguous external outcome causes **fail-stop into human attention** rather than blind
+> redispatch. It does not reconcile, self-heal, or prevent provider-side duplicates by any other
+> means. A human opening the provider is the intended resolution path.
+
+Parking in `REQUIRES_ATTENTION` rather than auto-retrying is the designed outcome, not a missing
+feature. Recovery cannot distinguish "the crashed attempt created the event" from "it did not",
+so a retry would be a coin flip and a rediscovery query would be a new capability.
+
+### 10.6 Not decided here
+
+Whether to commit the Gap B semantic tests, the production symbols in §10.4, and the untracked
+Phase 2C/2E reports is a separate decision. This document records the state; it does not resolve
+it.
+
+---
+
+## 11. P0 / P1 Milestone Record
+
+Appended after §10, under the same convention: nothing above is retroactively edited. Sections 1–10
+remain the record of what was known when, including the §10.5 statuses that this section supersedes
+on the two axes it now closes.
+
+### 11.1 Recorded status
+
+```text
+P0 — public execution boundary:        CLOSED / PROVEN
+P1 — Calendar ambiguity/recovery:      CLOSED / PROVEN
+Gmail evidence semantics:              PROVEN
+Gmail runtime recovery execution:     DEFERRED / OUT OF SLICE
+```
+
+Stated with the precision the Gmail line requires, because the two are not the same claim:
+
+```text
+Gmail evidence/fulfillment semantics: PROVEN
+Gmail governed execution + ambiguous-outcome recovery: UNEXERCISED / OUT OF CURRENT SLICE
+```
+
+The Gmail result is a **deliberate scope boundary, not a defect**. Gmail runtime recovery is
+recorded as **not exercised**. It is explicitly *not* claimed as proven, and it is explicitly *not*
+derived from the Calendar proof: the Calendar evidence says nothing about a send, and inferring a
+send result from it would be vacuous reasoning of exactly the kind this record refuses.
+
+`src/kai/**` for this milestone: **zero**. No production change was made or was required. No
+recovery abstraction, idempotency framework, or state-machine machinery was added. The Calendar
+slice remains Calendar-only: Gmail was **not** added to capabilities, allowed tools, planner/tool
+routing, fulfillment profile, runtime dispatch, or the public execution surface.
+
+HEAD at the time of this record: `18050e4` (`fix(recovery): make ambiguous outcome semantics
+repository-backed`).
+
+### 11.2 P0 — public execution boundary, CLOSED / PROVEN
+
+Method was boundary enumeration, not assertion. 19 public write routes exist; the only two with
+provider capability are `POST /api/v1/calendar/events` and `POST /api/v1/gmail/send`, both retired
+`410` with zero provider calls. `POST /api/v1/tasks` followed by `/trigger` is refused `409`
+("task was not submitted through the agent runtime") with zero provider calls. Each external write
+service has exactly one caller, the adapter (`test_each_external_write_has_exactly_one_caller_and_it_is_the_adapter`),
+and `ToolGateway.execute` has exactly one production caller, `src/kai/runtime/service.py:829`,
+after the claim fence.
+
+Positive control was a real governed run over the in-process public HTTP boundary: the first trigger
+parks at `WAITING_APPROVAL` with no provider write, the approval is taken, and the second trigger —
+a resume rather than a second pass — reaches `COMPLETED` with exactly one create POST. The provider
+is reached only after approval, and only through the Gateway. Boundary tests:
+`tests/test_calendar.py:307`, `tests/test_calendar.py:342`, `tests/test_gmail.py:326`,
+`tests/test_gmail.py:364`.
+
+### 11.3 P1 — Calendar ambiguity/recovery, CLOSED / PROVEN
+
+**The critical window is proven by an injected crash, not by a reconstructed database state.**
+`test_crash_after_create_before_persist_never_duplicates` and its orphan sibling set up the
+post-crash rows directly. The new test instead kills the process at the first durable write after
+the provider answered, then reads whatever the database was actually left holding.
+
+The injection seam is deliberately the crudest one available — process death at the first
+`AsyncSession.commit` after the provider's answer — because evidence durability rides on *whichever
+commit comes next*, not on a commit of its own. That was established by a failed first attempt:
+injecting before the `VERIFYING` transition still left the create evidence durable, because
+`AgentRuntime._fence_execution` (`src/kai/runtime/service.py:1296`) commits the claim renewal at
+`service.py:1311`, and `transition_task` commits at `src/kai/tasks/service.py:342`.
+
+What the test establishes:
+
+| Claim | Assertion |
+|---|---|
+| the side effect happened | `backend.next_event_id == 2` — exactly one create POST |
+| KAI durably knows nothing of it | execution envelope byte-identical to pre-crash |
+| absence of evidence is not failure | task state `EXECUTING` — neither `FAILED` nor `COMPLETED` |
+| recovery is honest | `REQUIRES_ATTENTION`, audit triple `INDETERMINATE` |
+| recovery does not duplicate | `next_event_id` still `== 2`; still exactly one event |
+| the refusal is durable | replay still `409`, still no dispatch |
+
+**`WAITING_EXTERNAL` is proven unreachable.** No `transition_task(..., target=WAITING_EXTERNAL)`,
+no direct `task.state` assignment, and `ToolOutcome.WAITING_EXTERNAL` is declared at
+`src/kai/tools/result.py:26` and referenced nowhere else in `src/` — no adapter produces it. It is
+also deliberately absent from `UNRESOLVED_EXTERNAL_CODES` (`src/kai/tools/errors.py:53`), which
+holds only `PROVIDER_UNREACHABLE` and `PROVIDER_SERVER_ERROR`, and `is_unresolved_external` is
+documented never to admit a refusal code. The `WAITING_EXTERNAL -> EXECUTING` edge is already
+absent at `src/kai/tasks/state.py:110` — a **working-tree** removal; HEAD still carries
+`{EXECUTING, FAILED, REQUIRES_ATTENTION}`. Because the state is unreachable, that removal changes no
+reachable behaviour.
+
+**Duplicate prevention is layered, and not in the state graph.** Adding `WAITING_EXTERNAL` to
+`_RESUMABLE_STATES` does **not** produce a valid governed path: the run is refused by
+`rule_task_state` (`src/kai/policy/rules.py:70`, which admits only `_EXECUTION_STATES`) and the task
+ends `FAILED` rather than re-dispatching. Two guards were removed *together* before a duplicate
+appeared, and the create POST genuinely re-dispatched. The single-use approval
+(`src/kai/approvals/service.py:266`) and the policy task-state rule are what prevent redispatch;
+the transition table is not, and claiming otherwise would document a protection that does not exist.
+
+### 11.4 Proof quality: not tautological
+
+Every invariant above was checked against mutants, and each mutant was rolled back to verified
+bytes.
+
+| Mutant | Outcome |
+|---|---|
+| `_external_outcome_unestablished` → `False` | killed — the unknown collapses to `FAILED` |
+| drop `consumed_at.is_(None)` from the approval CAS | **survived** |
+| treat `ApprovalDecision.STALE` as approved | killed — reports `FAILED` |
+| remove **both** approval guards | killed — genuine duplicate: `next_event_id == 3` |
+| `WAITING_EXTERNAL` added to `_RESUMABLE_STATES` | killed — refused by policy, task ends `FAILED` |
+| `CAPABILITY_TO_TOOL` routes a capability to `gmail.send` | killed — refused before dispatch |
+| a send branch added to `_build_steps` | killed — **a real Gmail mutation reached the provider** |
+
+The surviving mutant is informative rather than a gap: the CAS is a backstop, not the primary
+guard, because `check` refuses at `src/kai/tools/gateway.py:161` before `consume` is reached. The
+last mutant is the reason the Gmail boundary below is stated as *unexercised* and not as *proven*:
+the seal was broken far enough to dispatch a real send, and the test caught it at the provider.
+
+### 11.5 Gmail: what is proven and what is not
+
+`gmail.send` **is** a registered tool with a `READ_AFTER_SEND` contract, so the Gateway would
+classify a lost answer from it as an unresolved external outcome exactly as it does for
+`calendar.create_event`. `src/kai/runtime/send_evidence.py` implements the send-witness boundary:
+`message_id` is the identity (not `thread_id`, and with **no fallback** to `data`), qualification is
+a total pure function of the record's own content, and the evaluator returns `INDETERMINATE` for a
+lost answer rather than `NOT_FULFILLED`. Recipient identity does affect qualification —
+`_send_satisfies_criteria` compares `to` against the sealed resolution, while subject/body/`SENT` are
+deliberately not re-checked because `verified=True` already vouches for them. An empty required set
+is a failed criterion, not a vacuous success.
+
+None of it is reachable from the governed runtime. At least six independent seals: the capability
+vocabulary has no gmail entry; `SLICE_ALLOWED_TOOLS` excludes the tool so `rule_allowed_tools`
+denies it; `SLICE_CAPABILITIES` excludes the capability so the planner cannot plan it;
+`SLICE_FULFILLMENT_PROFILE` seals `calendar_meeting`; `src/kai/runtime/service.py:1107` validates
+every proposed action against the task's capabilities and refuses at `service.py:1111` before the
+program is built; and `_build_steps` has a per-action allowlist with no send branch.
+
+So the honest split is:
+
+| Gmail axis | Status |
+|---|---|
+| evidence / fulfillment semantics | **PROVEN** |
+| governed execution dispatch | **DEFERRED — out of current slice, by design** |
+| ambiguous-outcome recovery, end to end | **UNEXERCISED** |
+
+`gmail.send` requires PRQ-1, PRQ-2 **and** PRQ-3 before it may be driven (§16.2). Enabling Gmail to
+satisfy the P1 proof matrix would be adding a capability to close an artificial gap, and is not
+authorised. The next architectural task does not come from this workstream.
+
+### 11.6 Verification
+
+| Gate | Result |
+|---|---|
+| Full suite | **1303 passed, 9 skipped, 522 warnings** — zero failures, zero errors |
+| `ruff check .` | **All checks passed** |
+| `mypy` | **Success: no issues found in 133 source files** |
+| `alembic check` | **No new upgrade operations detected** |
+| Focused (runtime + gmail + governed write path + task state + policy + security) | **291 passed** |
+| Byte preservation of every mutated file | SHA-256 verified, 3 files |
+| Working tree after the round | **identical to the pre-round baseline** (67 entries) |
+
+Added, working-tree-only and **not committed**:
+
+| Test | Axis |
+|---|---|
+| `test_a_crash_after_the_provider_answered_never_lets_the_write_happen_twice` | P1 Calendar critical window |
+| `test_waiting_external_is_inert_even_for_a_reclaimable_stale_claim` | P1 `WAITING_EXTERNAL` |
+| `test_the_governed_runtime_cannot_reach_a_send_however_it_is_widened` | P1 Gmail boundary |
+
+Per §10.2, these are committed as neither test nor symbol: **they are reproducible only against the
+working tree**, because the production semantics they assert remain uncommitted. They do not by
+themselves establish what the repository contains on checkout.
+
+### 11.7 Not decided here
+
+Whether to commit these three tests, the `src/kai/tasks/state.py` edge removal, or the §10.4
+production symbols remains a separate decision. This record states the milestone; it does not
+resolve the commit question, and it resolves no Gmail scope question.

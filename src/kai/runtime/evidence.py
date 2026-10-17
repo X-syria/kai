@@ -114,9 +114,13 @@ from kai.tools.result import ToolOutcome
 
 __all__ = [
     "MEETING_CREATION_TOOL",
+    "TASK_PREPARATION_TOOL",
     "QualifyingCreation",
+    "QualifyingPreparation",
     "qualifying_creation",
     "qualifying_creations",
+    "qualifying_preparation",
+    "qualifying_preparations",
     "undetermined_creations",
 ]
 
@@ -125,6 +129,13 @@ __all__ = [
 #: as a decision about the domain rather than as a string comparison buried in a
 #: check, and so the evaluator and the runtime cannot name it differently.
 MEETING_CREATION_TOOL: Final = "calendar.create_event"
+
+#: The one tool whose successful, verified, local attempts are what
+#: ``task_preparation`` fulfillment is asked about. A ``task.prepare`` run is
+#: side-effect-free and provider-free, so its witness needs no provider identity:
+#: what qualifies it is that it succeeded, was verified, and carried a sealed
+#: objective and a non-empty step list.
+TASK_PREPARATION_TOOL: Final = "task.prepare"
 
 #: The key the provider's own identity of the created object is published under.
 #:
@@ -261,6 +272,68 @@ def undetermined_creations(evidence: Iterable[Any]) -> tuple[Mapping[str, Any], 
         if isinstance(record, Mapping)
         and record.get("tool") == MEETING_CREATION_TOOL
         and record.get(EXTERNAL_OUTCOME) == EXTERNAL_OUTCOME_UNKNOWN
+    )
+
+
+@dataclass(frozen=True)
+class QualifyingPreparation:
+    """One verified, local ``task.prepare`` attempt.
+
+    The objective is carried as its digest and never as the raw text: the
+    evaluator only ever compares it against the digest sealed from the persisted
+    goal, so keeping the text would be a second copy of user content with no
+    reader. ``step_count`` is the size of the produced checklist, read from the
+    record's own verification evidence.
+    """
+
+    objective_digest: str
+    step_count: int
+
+
+def qualifying_preparation(record: Any) -> QualifyingPreparation | None:
+    """This record read as a qualifying local preparation, or ``None``.
+
+    Total and pure, over the record's own content: the same record always yields
+    the same answer, and there is no session, clock, provider, or model. It
+    qualifies when the tool is ``task.prepare``, the outcome succeeded, ``ok`` and
+    ``verified`` are true, the recorded objective is a non-blank string, and the
+    verification evidence reports a positive integer ``step_count``.
+    """
+    import hashlib
+
+    if not isinstance(record, Mapping):
+        return None
+    if record.get("tool") != TASK_PREPARATION_TOOL:
+        return None
+    if record.get("outcome") != ToolOutcome.EXECUTION_SUCCEEDED.value:
+        return None
+    if not record.get("ok") or not record.get("verified"):
+        return None
+    arguments = record.get("args")
+    objective = arguments.get("objective") if isinstance(arguments, Mapping) else None
+    if not isinstance(objective, str) or not objective.strip():
+        return None
+    evidence = record.get("evidence")
+    step_count = evidence.get("step_count") if isinstance(evidence, Mapping) else None
+    if not isinstance(step_count, int) or isinstance(step_count, bool) or step_count < 1:
+        return None
+    digest = hashlib.sha256(objective.strip().encode("utf-8")).hexdigest()
+    return QualifyingPreparation(objective_digest=digest, step_count=step_count)
+
+
+def qualifying_preparations(
+    evidence: Iterable[Any],
+) -> tuple[QualifyingPreparation, ...]:
+    """The relevant preparation-witness set: every qualifying attempt in the log.
+
+    A filter, never a truncation, with the same existential reading as
+    :func:`qualifying_creations`: the whole set is returned and no caller picks a
+    representative.
+    """
+    return tuple(
+        witness
+        for witness in (qualifying_preparation(record) for record in evidence)
+        if witness is not None
     )
 
 

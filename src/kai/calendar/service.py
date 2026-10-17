@@ -18,10 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from kai.calendar import client
 from kai.calendar.client import (
     GoogleApiError,
-    GoogleForbiddenError,
-    GoogleInvalidTokenError,
     GoogleNotFoundError,
-    GoogleRateLimitError,
     fetch_event,
 )
 from kai.calendar.models import CalendarEvent
@@ -195,10 +192,13 @@ async def create_and_verify_event(
 ) -> CreateEventOutcome:
     """Create an event, read it back, and verify it deterministically.
 
-    401/403/429 from create or read propagate so the API can surface them as
-    those statuses; any other read failure (404, malformed payload, 5xx)
-    means the event could not be verified and returns an outcome that is
-    explicitly not verified.
+    A failure to *create* propagates: nothing was written, so the caller must
+    see the provider's error. A failure to *read the event back* does not. Once
+    the provider has accepted the create, a 401/403/429 on the read-back joins
+    the 404/malformed/5xx read failures in returning an outcome that is
+    explicitly not verified and that still carries the created event id. The
+    write may have landed, so reporting it as a tool failure would invite a
+    blind retry and a duplicate event.
     """
     account = await _load_account(session, account_id=account_id, tenant_id=tenant_id)
     token = await usable_access_token(session, transport, account=account)
@@ -207,16 +207,16 @@ async def create_and_verify_event(
         readback = await fetch_event(
             transport, access_token=token, event_id=created.event_id
         )
-    except (GoogleInvalidTokenError, GoogleForbiddenError, GoogleRateLimitError):
-        raise
     except GoogleNotFoundError:
         return CreateEventOutcome(
             event=None,
+            created_event_id=created.event_id,
             mismatches=(FieldMismatch("retrieval", "read-after-create", "event not found"),),
         )
     except GoogleApiError as exc:
         return CreateEventOutcome(
             event=None,
+            created_event_id=created.event_id,
             mismatches=(FieldMismatch("retrieval", "read-after-create", str(exc)),),
         )
     mismatches = verify_event(readback, req)

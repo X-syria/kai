@@ -49,6 +49,7 @@ from kai.runtime.fulfillment import (
     evaluate_gmail_send,
     gmail_send_criteria,
 )
+from kai.runtime.schemas import EXTERNAL_OUTCOME_UNKNOWN
 from kai.runtime.send_evidence import (
     MESSAGE_SEND_TOOL,
     QualifyingSend,
@@ -56,6 +57,13 @@ from kai.runtime.send_evidence import (
     qualifying_sends,
 )
 from kai.runtime.service import RuntimeFatal, _fulfillment_outcome
+from kai.tools.errors import (
+    APPROVAL_STALE,
+    PROVIDER_ERROR,
+    PROVIDER_NOT_CONTACTED,
+    PROVIDER_SERVER_ERROR,
+    PROVIDER_UNREACHABLE,
+)
 
 #: The resolved contact the Intent names. Sealed once, and never recomputed —
 #: the gmail criteria are built from this exactly as the calendar ones are.
@@ -93,6 +101,132 @@ def _sent(**overrides: Any) -> dict[str, Any]:
     }
     entry.update(overrides)
     return entry
+
+
+def _verdict(*evidence: Any) -> Any:
+    return evaluate_gmail_send(_inputs(*evidence))
+
+
+def _lost_answer(**overrides: Any) -> dict[str, Any]:
+    """A send whose external outcome KAI could not establish.
+
+    Carries no ``message_id`` in ``evidence``, so it cannot be mistaken for a
+    delivery by any reader. **The field that makes it unknown is
+    ``external_outcome``, not ``error_code``** \u2014 the runtime's own conclusion
+    about the provider's side, kept apart from why the gateway returned what it
+    returned. The default pairs a known refusal code with an unestablished world.
+    """
+    entry: dict[str, Any] = {
+        "tool": "gmail.send",
+        "outcome": "EXECUTION_FAILED",
+        "ok": False,
+        "verified": False,
+        "error_code": APPROVAL_STALE,
+        "external_outcome": EXTERNAL_OUTCOME_UNKNOWN,
+        "args": {
+            "to": "ahmed@example.com",
+            "subject": "Quarterly plan",
+            "body": "Attached is the plan.",
+        },
+        "evidence": {},
+    }
+    entry.update(overrides)
+    return entry
+
+
+# --- gmail's irreversible case: an unestablished outcome is not a failed send ----
+
+
+@pytest.mark.parametrize(
+    "error_code", [APPROVAL_STALE, PROVIDER_UNREACHABLE, PROVIDER_SERVER_ERROR]
+)
+def test_a_lost_provider_answer_is_indeterminate_not_not_fulfilled(
+    error_code: str,
+) -> None:
+    """The message may have been delivered, so failure would be a false claim.
+
+    This is the case gmail made visible. A retry after an unverified send may
+    deliver twice, and reporting "not sent" invites exactly that retry, so the
+    third verdict is what keeps the run from either lying or re-sending.
+    """
+    assert (
+        _verdict(_lost_answer(error_code=error_code))
+        is FulfillmentVerdict.INDETERMINATE
+    )
+
+
+def test_a_provider_refusal_is_not_fulfilled() -> None:
+    """An answer, negative, is a decision \u2014 and stays one.
+
+    The ``external_outcome=None`` is deliberate: the runtime writes that marker
+    only when it actually concluded the world was unestablished, so a known
+    refusal carries no marker at all.
+    """
+    assert (
+        _verdict(_lost_answer(error_code=PROVIDER_ERROR, external_outcome=None))
+        is FulfillmentVerdict.NOT_FULFILLED
+    )
+
+
+def test_a_send_that_never_reached_the_provider_is_not_fulfilled() -> None:
+    """A connection that was never established is a *known* non-attempt.
+
+    For a send this is the claim that matters most: nothing was delivered, and
+    the record knows it. Reporting it as undecidable would manufacture doubt about
+    an operation that provably never happened.
+    """
+    assert (
+        _verdict(_lost_answer(error_code=PROVIDER_NOT_CONTACTED, external_outcome=None))
+        is FulfillmentVerdict.NOT_FULFILLED
+    )
+
+
+def test_an_unverified_send_the_provider_answered_is_not_fulfilled() -> None:
+    """Read-after-send that could not confirm is an answer, not a lost one.
+
+    The provider responded; the verification boundary simply declined to vouch
+    for it. That is decidable, so it must not be reported as undecidable \u2014
+    otherwise every unverifiable send would park instead of failing.
+    """
+    unconfirmed = _sent(
+        outcome="EXECUTION_SUCCEEDED",
+        verified=False,
+        evidence={"mismatch_count": 1},
+        data=None,
+    )
+    assert _verdict(unconfirmed) is FulfillmentVerdict.NOT_FULFILLED
+
+
+def test_a_proven_send_outranks_a_lost_answer() -> None:
+    """A witnessed delivery settles the question whatever else went unanswered."""
+    assert (
+        _verdict(_sent(), _lost_answer()) is FulfillmentVerdict.FULFILLED
+    )
+    assert (
+        _verdict(_lost_answer(), _sent()) is FulfillmentVerdict.FULFILLED
+    )
+
+
+def test_a_wrong_recipient_does_not_outrank_a_lost_answer() -> None:
+    """A verified send to the wrong person is not this Intent's fulfillment."""
+    wrong = _sent(args={"to": "saif@example.com", "subject": "x", "body": "y"})
+    assert (
+        _verdict(wrong, _lost_answer()) is FulfillmentVerdict.INDETERMINATE
+    )
+
+
+def test_no_send_attempt_at_all_is_not_fulfilled() -> None:
+    """Silence alone is decidable; indeterminacy needs a lost answer."""
+    assert _verdict() is FulfillmentVerdict.NOT_FULFILLED
+
+
+def test_a_lost_answer_is_never_promoted_to_a_witness() -> None:
+    """The unknown record itself cannot become evidence of delivery."""
+    from kai.runtime.send_evidence import qualifying_sends, undetermined_sends
+
+    record = _lost_answer()
+    assert qualifying_sends([record]) == ()
+    assert len(undetermined_sends([record])) == 1
 
 
 def _criteria(identities: Any = IDENTITIES) -> SuccessCriteria:

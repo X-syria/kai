@@ -30,6 +30,7 @@ EXPECTED_MVP_TOOLS = {
     "gmail.search",
     "gmail.read",
     "gmail.send",
+    "task.prepare",
 }
 
 
@@ -67,6 +68,10 @@ class TestDefaultCatalog:
         assert gmail_send.risk_level is RiskLevel.MEDIUM
         assert gmail_send.verification_contract is VerificationContract.READ_AFTER_SEND
         assert registry.get("contacts.match").risk_level is RiskLevel.LOW
+        prepare = registry.get("task.prepare")
+        assert prepare.risk_level is RiskLevel.LOW
+        assert prepare.verification_contract is VerificationContract.READ_BACKED
+        assert prepare.requires_account is False
 
     def test_sealed_registry_refuses_registration(self) -> None:
         registry = default_registry()

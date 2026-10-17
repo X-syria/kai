@@ -168,6 +168,19 @@ def _sent(**overrides: Any) -> dict[str, Any]:
     return entry
 
 
+def _prepared(**overrides: Any) -> dict[str, Any]:
+    entry: dict[str, Any] = {
+        "tool": "task.prepare",
+        "outcome": "EXECUTION_SUCCEEDED",
+        "ok": True,
+        "verified": True,
+        "args": {"objective": "prepare a trip"},
+        "evidence": {"objective_provided": True, "step_count": 3, "missing_count": 3},
+    }
+    entry.update(overrides)
+    return entry
+
+
 def _task_row(**overrides: Any) -> Any:
     values: dict[str, Any] = {
         "goal": "schedule a meeting",
@@ -217,20 +230,29 @@ def test_each_criteria_names_the_sealed_rows_it_is_sealed_from() -> None:
 
 
 def test_the_sealed_contract_supplies_the_profile_and_nothing_else() -> None:
-    """``goal`` and the prose criteria are not inputs to any criteria.
+    """Prose criteria and scope are not inputs to any criteria; the goal only to
+    the one profile whose question is anchored to it.
 
-    The prose being inert is proved elsewhere. The goal is a further step and is
-    easy to miss: the window the criteria are sealed from is the model's reading
-    of the goal, committed in ``RuntimeExecution.scenario``, so two tasks whose
-    sealed contracts disagree entirely about the goal and its success criteria
-    are decided identically from the same understanding row. That is the correct
-    place for a deterministic evaluator to sit, and it is also the honest
-    description of where "what the user asked" lives: not in the contract, and
-    not read from the contract.
+    The prose being inert is proved elsewhere. For the calendar and gmail
+    questions the goal is likewise not an input: the window those criteria are
+    sealed from is the model's reading of the goal, committed in
+    ``RuntimeExecution.scenario``, so two tasks whose sealed contracts disagree
+    entirely about the goal and its success criteria are decided identically
+    from the same understanding row.
+
+    The ``task_preparation`` question is the deliberate exception: its sealed
+    criterion is the digest of the persisted ``task.goal`` — the user intent
+    fixed at submission — because a local preparation has no understanding row
+    and no resolved identities to project from. So the goal is read there and
+    only there, and a different goal is a different criterion by construction.
     """
     source = _code_of(_fulfillment_outcome)
-    for absent in ("task.goal", "success_criteria", "allowed_tools", "risk_policy"):
+    for absent in ("success_criteria", "allowed_tools", "risk_policy"):
         assert absent not in source, absent
+    # ``task.goal`` is read once, inside the task_preparation branch and nowhere
+    # else: the profile-gated read is visible here rather than buried in a call.
+    assert source.count("task.goal") == 1
+    assert source.index("if profile == _TASK_PREPARATION") < source.index("task.goal")
 
     baseline = _fulfillment_outcome(
         _task_row(),
@@ -250,14 +272,30 @@ def test_the_sealed_contract_supplies_the_profile_and_nothing_else() -> None:
         evidence=[_created()],
     )
     assert baseline == other
-    # And the profile itself is the one field that does select the branch.
+    # The profile itself is the one field that does select the branch.
     gmail = _fulfillment_outcome(
         _task_row(fulfillment_profile="gmail_send"),
-        scenario=None,  # type: ignore[arg-type]
+        scenario=None,
         identities=list(IDENTITIES),
         evidence=[_sent()],
     )
     assert gmail.profile == "gmail_send" and gmail != baseline
+    # And on the preparation branch, the goal *is* the intent source: two goals
+    # give two criteria, so the goal is not inert for that one question.
+    prepared = _fulfillment_outcome(
+        _task_row(fulfillment_profile="task_preparation", goal="prepare a trip"),
+        scenario=None,
+        identities=[],
+        evidence=[_prepared()],
+    )
+    prepared_other = _fulfillment_outcome(
+        _task_row(fulfillment_profile="task_preparation", goal="prepare a report"),
+        scenario=None,
+        identities=[],
+        evidence=[_prepared()],
+    )
+    assert prepared.profile == "task_preparation"
+    assert prepared != prepared_other
 
 
 def test_provider_echo_moves_the_verdict_and_never_the_criteria() -> None:

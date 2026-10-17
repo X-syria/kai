@@ -990,8 +990,9 @@ def test_this_round_changed_no_semantics() -> None:
     }
     assert all(isinstance(v, PolicyIdentityStatus) for v in _IDENTITY_TO_POLICY.values())
 
-    # Gmail stays unlicensed for live sealing.
-    assert frozenset({"calendar_meeting"}) == LIVE_SEALABLE_PROFILES
+    # Gmail stays unlicensed for live sealing; the local, provider-free
+    # task_preparation profile is the only other live-sealable question.
+    assert frozenset({"calendar_meeting", "task_preparation"}) == LIVE_SEALABLE_PROFILES
 
     # The identity round itself added no migration. The twelfth, thirteenth and
     # fourteenth files are ``d4e5f6a7b8c9_add_revoked_tokens`` (access-token

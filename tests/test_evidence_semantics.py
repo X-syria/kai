@@ -622,15 +622,26 @@ def test_the_model_cannot_be_widened_into_a_generic_evidence_language() -> None:
     shape the log already holds, and answers a question about one domain. It is
     the complement of ``qualifying_creations``, not a second kind of witness, and
     ``QualifyingCreation`` is still exactly two fields.
+
+    The ``task_preparation`` names are the Stage 2E addition, and they stay on the
+    same side of the line: they read exactly one more tool (``task.prepare``),
+    return the same durable record shape, and answer a question about one domain,
+    with ``QualifyingPreparation`` exactly two fields as well. No generic
+    ``Evidence``/``Witness``/registry vocabulary is introduced.
     """
     from kai.runtime import evidence as module
 
     assert module.MEETING_CREATION_TOOL == "calendar.create_event"
+    assert module.TASK_PREPARATION_TOOL == "task.prepare"
     assert set(module.__all__) == {
         "MEETING_CREATION_TOOL",
+        "TASK_PREPARATION_TOOL",
         "QualifyingCreation",
+        "QualifyingPreparation",
         "qualifying_creation",
         "qualifying_creations",
+        "qualifying_preparation",
+        "qualifying_preparations",
         "undetermined_creations",
     }
     assert not {
@@ -642,6 +653,7 @@ def test_the_model_cannot_be_widened_into_a_generic_evidence_language() -> None:
         "profile",
     } & set(module.__all__)
     assert len(QualifyingCreation.__dataclass_fields__) == 2
+    assert len(module.QualifyingPreparation.__dataclass_fields__) == 2
 
 
 def test_the_outcome_record_is_unchanged_by_this_boundary() -> None:
