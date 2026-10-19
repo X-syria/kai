@@ -8,10 +8,18 @@ on:
 
 env:
   PYTHON_VERSION: "3.14"
-  POSTGRES_USER: kai
-  POSTGRES_PASSWORD: kai
-  POSTGRES_DB: kai_test
-  POSTGRES_PORT: 5432
+  # CI-only test-database settings. The service below runs on the ephemeral
+  # GitHub-hosted runner, which is not reachable from the internet and is
+  # destroyed after the job, and these values are never used by the application
+  # outside this job. They are not production secrets; the local test stack uses
+  # file-backed secrets.
+  KAI_TEST_POSTGRES_ADMIN_USER: kai_test_admin
+  KAI_TEST_POSTGRES_ADMIN_PASSWORD: ci_only_admin_password
+  # The safety gate in tests/conftest.py accepts only the `kai_test` database
+  # name and the `kai_test` runtime role; these values must not drift.
+  KAI_TEST_POSTGRES_USER: kai_test
+  KAI_TEST_POSTGRES_PASSWORD: ci_only_runtime_password
+  KAI_TEST_POSTGRES_DB: kai_test
 
 jobs:
   tests:
@@ -19,22 +27,31 @@ jobs:
     runs-on: ubuntu-latest
 
     services:
+      # The official postgres image makes POSTGRES_USER a superuser, so this
+      # account is a BOOTSTRAP ADMIN only: it initializes a fresh cluster and
+      # provisions the runtime role. It is never named in DATABASE_URL; the
+      # suite connects as the restricted `kai_test` role created below.
       postgres:
         image: postgres:17-alpine
         env:
-          POSTGRES_USER: kai
-          POSTGRES_PASSWORD: kai
+          POSTGRES_USER: kai_test_admin
+          POSTGRES_PASSWORD: ci_only_admin_password
           POSTGRES_DB: kai_test
         ports:
-          - 5432:5432
+          - 55432:5432
         options: >-
-          --health-cmd "pg_isready -U kai -d kai_test"
+          --health-cmd "pg_isready -U kai_test_admin -d kai_test"
           --health-interval 5s
           --health-timeout 5s
           --health-retries 10
 
     env:
-      DATABASE_URL: postgresql+asyncpg://kai:kai@localhost:5432/kai_test
+      # The runtime role is created by the provisioning step below, so this URL
+      # is only used after that step succeeds. Every component must match the
+      # safety gate's expectations: the kai_test database, the kai_test role,
+      # and the loopback test port. Alembic reads the same value (alembic.ini
+      # leaves sqlalchemy.url empty and alembic/env.py falls back to Settings).
+      DATABASE_URL: postgresql+asyncpg://kai_test:ci_only_runtime_password@127.0.0.1:55432/kai_test
       ENVIRONMENT: test
       LOG_LEVEL: INFO
 
@@ -60,8 +77,72 @@ jobs:
       - name: Mypy type check (src only)
         run: mypy
 
+      # The compose stack under docker/ is intentionally not used here: it is
+      # not part of the tracked tree yet, so a CI checkout would not contain it.
+      # This step reproduces the init script's role semantics inline instead:
+      # a LOGIN role that is NOSUPERUSER/NOCREATEDB/NOCREATEROLE, owns only its
+      # own test database and the public schema, and is the only account named
+      # in the test DATABASE_URL.
+      - name: Provision the restricted test database role
+        env:
+          POSTGRES_CONTAINER_ID: ${{ job.services.postgres.id }}
+        run: |
+          set -euo pipefail
+          : "${POSTGRES_CONTAINER_ID:?service container id is unavailable}"
+          docker exec -i \
+            -e PGPASSWORD="$KAI_TEST_POSTGRES_ADMIN_PASSWORD" \
+            "$POSTGRES_CONTAINER_ID" \
+            psql \
+              --host 127.0.0.1 \
+              --username "$KAI_TEST_POSTGRES_ADMIN_USER" \
+              --dbname "$KAI_TEST_POSTGRES_DB" \
+              --set ON_ERROR_STOP=1 \
+              --set runtime_password="$KAI_TEST_POSTGRES_PASSWORD" <<'SQL'
+          CREATE ROLE kai_test
+            WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION
+            PASSWORD :'runtime_password';
+          ALTER DATABASE kai_test OWNER TO kai_test;
+          ALTER SCHEMA public OWNER TO kai_test;
+          GRANT ALL ON SCHEMA public TO kai_test;
+          SQL
+
+      - name: Verify the restricted test database role
+        env:
+          POSTGRES_CONTAINER_ID: ${{ job.services.postgres.id }}
+        run: |
+          set -euo pipefail
+          : "${POSTGRES_CONTAINER_ID:?service container id is unavailable}"
+          actual="$(
+            docker exec -i \
+              -e PGPASSWORD="$KAI_TEST_POSTGRES_PASSWORD" \
+              "$POSTGRES_CONTAINER_ID" \
+              psql \
+                --host 127.0.0.1 \
+                --username "$KAI_TEST_POSTGRES_USER" \
+                --dbname "$KAI_TEST_POSTGRES_DB" \
+                --no-align --tuples-only --set ON_ERROR_STOP=1 \
+                --command "SELECT current_user, current_database(), \
+                                 (SELECT rolsuper FROM pg_roles WHERE rolname = current_user), \
+                                 (SELECT rolcreatedb FROM pg_roles WHERE rolname = current_user), \
+                                 (SELECT rolcreaterole FROM pg_roles WHERE rolname = current_user), \
+                                 (SELECT rolreplication FROM pg_roles WHERE rolname = current_user), \
+                                 pg_get_userbyid((SELECT datdba FROM pg_database WHERE datname = current_database())), \
+                                 pg_get_userbyid((SELECT nspowner FROM pg_namespace WHERE nspname = 'public'))"
+          )"
+          expected="kai_test|kai_test|f|f|f|f|kai_test|kai_test"
+          echo "test database identity and privileges: $actual"
+          if [ "$actual" != "$expected" ]; then
+            echo "expected: $expected" >&2
+            exit 1
+          fi
+
       - name: Apply database migrations
         run: alembic upgrade head
 
       - name: Run tests
+        env:
+          # Set only here, after provisioning and verification proved the target
+          # is the dedicated kai_test database reached as the restricted
+          # kai_test role. The gate still re-checks every condition itself.
+          KAI_TEST_ALLOW_DB_TRUNCATE: "1"
         run: pytest -q

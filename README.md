@@ -168,13 +168,15 @@ anyone because two runs overlapped. No HTTP endpoint purges anything.
 
 ## Quality gates
 
-The official commands. CI runs exactly these, and each one fails the build on
-error.
+The official commands. Each one fails the build on error. CI runs all three,
+after provisioning the test database and its restricted role and applying
+migrations first; see
+[`.github/workflows/quality-gate.yml`](.github/workflows/quality-gate.yml).
 
 ```powershell
 ruff check .   # repository-wide, no exclusions
 mypy            # type-checks src/ (130 files)
-pytest -q       # full suite against a real PostgreSQL
+pytest -q       # full suite against a real PostgreSQL (see Tests below)
 ```
 
 `mypy` reads its own configuration: `mypy_path = "src"` with
@@ -184,17 +186,83 @@ to consume its types.
 
 ## Tests
 
+The suite truncates every mutable table before and after each test (the
+`_clean_state` fixture in [`tests/conftest.py`](tests/conftest.py)), so it must
+run against a dedicated test database, never the development one.
+
+### What the safety gate requires
+
+With the guarded `tests/conftest.py`, truncation is authorized only when **all**
+of the following hold. The gate runs before any session is opened, so any
+mismatch fails closed with a configuration error at fixture setup, before a
+`TRUNCATE` executes:
+
+- `KAI_TEST_ALLOW_DB_TRUNCATE` is truthy (`1`, `true`, `yes`, `on`); absent or
+  false refuses.
+- `DATABASE_URL` names an allowlisted test database: the name must match
+  `^kai_test(?:_[A-Za-z0-9]+)*$`. The built-in default `kai` is refused, and so
+  is any name that merely contains "test".
+- The declared `DATABASE_URL` is the same connection target as the engine's
+  effective URL (`engine.url`): driver, user, password, host, port, database and
+  query must all match.
+- The engine's effective connection user is exactly `kai_test`.
+
+Because of that gate, an unconfigured or misconfigured run does **not** erase the
+development database; it stops before any truncation instead.
+
+The gate compares the connection *user name* only; it does not query PostgreSQL.
+It therefore does not, by itself, prove the role is restricted
+(`NOSUPERUSER`/`NOCREATEDB`/`NOCREATEROLE`). Verifying the live role's identity
+and privileges is the job of the CI verification step in
+[`.github/workflows/quality-gate.yml`](.github/workflows/quality-gate.yml) — or of
+whatever provisions a local test database. Matching the database and role names
+is not, on its own, proof that the cluster is an isolated test instance.
+
+### Test-database requirements
+
+| Setting | Value |
+|---|---|
+| Backend | PostgreSQL over `asyncpg` (`postgresql+asyncpg://`) |
+| Test database | `kai_test` |
+| Test connection role | a restricted login named `kai_test` |
+| Address used by the CI setup | `127.0.0.1:55432` |
+| Truncation opt-in | `KAI_TEST_ALLOW_DB_TRUNCATE=1` |
+
+Starting PostgreSQL and creating the restricted `kai_test` role are **not**
+automatic on a developer machine. CI does both explicitly in
+[`.github/workflows/quality-gate.yml`](.github/workflows/quality-gate.yml): it
+starts the service, provisions `kai_test` as a restricted login that owns the
+`kai_test` database and the `public` schema, verifies the live role's identity
+and privileges, and only then applies migrations and runs the suite. CI has not
+been run for this change, so its success is not yet established. The local helper
+files for one such stack (`docker-compose.test.yml`, `docs/TEST_DATABASE.md`,
+`docker/test-db-init/`) are not tracked and have not been verified to run, so
+this document does not rely on them.
+
+### Running the suite
+
+Once a dedicated test database and the `kai_test` role exist, point the suite at
+them, apply the schema, opt in, and run (PowerShell, as elsewhere in this
+document):
+
 ```powershell
-docker compose up -d db
-# point tests at a scratch database so the dev database is not truncated:
-$env:DATABASE_URL = "postgresql+asyncpg://kai:kai@127.0.0.1:5432/kai_test"
+# 1. Aim the suite at the dedicated test database and the restricted kai_test
+#    role. Replace <password> with that role's password — never the dev "kai"
+#    role. Use the host/port where your test database actually listens.
+$env:DATABASE_URL = "postgresql+asyncpg://kai_test:<password>@127.0.0.1:55432/kai_test"
+
+# 2. Alembic uses the same DATABASE_URL and has no gate of its own, so confirm
+#    the target is the test database before applying the schema.
+alembic upgrade head
+
+# 3. Opt in to truncation for this test environment only, then run.
+$env:KAI_TEST_ALLOW_DB_TRUNCATE = "1"
 pytest -q
 ```
 
-`tests/conftest.py` truncates every table before and after each test. With the
-default `DATABASE_URL` that is the **development** database, so tests will erase
-real local data. CI creates and uses a dedicated `kai_test` database; do the same
-locally, or point at a throwaway database.
+The test `DATABASE_URL` and `KAI_TEST_ALLOW_DB_TRUNCATE` are for the test
+environment only. Development credentials (`kai`, port `5432`) are refused by the
+gate, so they cannot be used to run the suite by mistake.
 
 ## Configuration
 
