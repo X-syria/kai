@@ -23,7 +23,6 @@ from __future__ import annotations
 
 import asyncio
 import subprocess
-import sys
 import uuid
 from datetime import UTC, datetime, timedelta
 
@@ -31,6 +30,7 @@ import httpx
 import pytest
 from sqlalchemy import func, select
 
+from alembic_runner import run_alembic
 from kai.auth.jwt import TokenClaims, decode_access_token
 from kai.db.engine import async_session_factory
 from kai.db.models import User
@@ -59,6 +59,7 @@ from kai.memory.service import (
     set_category_enabled,
     update_memory,
 )
+from migration_harness import MigrationGroupState, migration_schema
 from tool_harness import (
     make_policy_input,
     make_task,
@@ -1240,24 +1241,17 @@ REVISION_PREV = "c3d7e8a91b2f"
 REVISION_MEMORY = "d1a2b3c4e5f6"
 
 
-def _alembic(*args: str) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        [sys.executable, "-m", "alembic", *args],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+def _alembic(target_url: str, *args: str) -> subprocess.CompletedProcess[str]:
+    return run_alembic(*args, target_url=target_url)
 
 
-def _table_names_fresh() -> list[str]:
+def _table_names_fresh(target_url: str) -> list[str]:
     """Inspect on its own disposable engine + event loop (never the shared pool)."""
     from sqlalchemy import inspect as sa_inspect
     from sqlalchemy.ext.asyncio import create_async_engine
 
-    from kai.config import get_settings
-
     async def _names() -> list[str]:
-        eng = create_async_engine(get_settings().database_url)
+        eng = create_async_engine(target_url)
         try:
             async with eng.connect() as conn:
                 tables = await conn.run_sync(
@@ -1270,21 +1264,22 @@ def _table_names_fresh() -> list[str]:
     return asyncio.run(_names())
 
 
-def test_memory_migration_is_rollbackable_and_forward() -> None:
-    try:
-        down = _alembic("downgrade", REVISION_PREV)
+@pytest.mark.db_migration
+def test_memory_migration_is_rollbackable_and_forward(
+    migration_target: str, migration_group_state: MigrationGroupState
+) -> None:
+    with migration_schema(migration_group_state, migration_target):
+        down = _alembic(migration_target, "downgrade", REVISION_PREV)
         assert down.returncode == 0, down.stderr
-        assert REVISION_PREV in _alembic("current").stdout
+        assert REVISION_PREV in _alembic(migration_target, "current").stdout
 
-        names = _table_names_fresh()
+        names = _table_names_fresh(migration_target)
         assert "memory_entries" not in names
         assert "memory_preferences" not in names
 
-        up = _alembic("upgrade", REVISION_MEMORY)
+        up = _alembic(migration_target, "upgrade", REVISION_MEMORY)
         assert up.returncode == 0, up.stderr
-        names = _table_names_fresh()
+        names = _table_names_fresh(migration_target)
         assert "memory_entries" in names
         assert "memory_preferences" in names
-        assert REVISION_MEMORY in _alembic("current").stdout
-    finally:
-        _alembic("upgrade", "head")
+        assert REVISION_MEMORY in _alembic(migration_target, "current").stdout

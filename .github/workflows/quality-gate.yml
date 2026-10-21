@@ -20,6 +20,10 @@ env:
   KAI_TEST_POSTGRES_USER: kai_test
   KAI_TEST_POSTGRES_PASSWORD: ci_only_runtime_password
   KAI_TEST_POSTGRES_DB: kai_test
+  # Docker routing is explicit. The orchestrator requires this project-owned
+  # context, verifies the daemon id after selecting it, and never inherits
+  # DOCKER_HOST/DOCKER_CONTEXT/DOCKER_CONFIG.
+  KAI_TEST_DOCKER_CONTEXT: default
 
 jobs:
   tests:
@@ -49,8 +53,8 @@ jobs:
       # The runtime role is created by the provisioning step below, so this URL
       # is only used after that step succeeds. Every component must match the
       # safety gate's expectations: the kai_test database, the kai_test role,
-      # and the loopback test port. Alembic reads the same value (alembic.ini
-      # leaves sqlalchemy.url empty and alembic/env.py falls back to Settings).
+      # and the loopback test port. Alembic requires this explicit value; it
+      # never falls back to Settings.
       DATABASE_URL: postgresql+asyncpg://kai_test:ci_only_runtime_password@127.0.0.1:55432/kai_test
       ENVIRONMENT: test
       LOG_LEVEL: INFO
@@ -77,6 +81,52 @@ jobs:
       - name: Mypy type check (src only)
         run: mypy
 
+      # The service container id from the workflow is the only Docker anchor.
+      # The system identifier is read from the data directory with
+      # pg_controldata, not from DATABASE_URL, and is bound to that container id
+      # in a short-lived identity file. The orchestrator re-inspects the same
+      # container and compares this value before it creates any database.
+      - name: Capture trusted PostgreSQL identity
+        env:
+          POSTGRES_CONTAINER_ID: ${{ job.services.postgres.id }}
+        run: |
+          set -euo pipefail
+          : "${POSTGRES_CONTAINER_ID:?service container id is unavailable}"
+          if ! identifier="$(
+            docker --context "$KAI_TEST_DOCKER_CONTEXT" exec "$POSTGRES_CONTAINER_ID" \
+              pg_controldata 2>/dev/null \
+              | sed -n 's/^Database system identifier:[[:space:]]*//p'
+          )"; then
+            identifier="$(
+              docker --context "$KAI_TEST_DOCKER_CONTEXT" exec "$POSTGRES_CONTAINER_ID" \
+                pg_controldata -D /var/lib/postgresql/data \
+                | sed -n 's/^Database system identifier:[[:space:]]*//p'
+            )"
+          fi
+          test -n "$identifier"
+          IDENTITY_FILE="$RUNNER_TEMP/kai_pg_identity.json"
+          POSTGRES_CONTAINER_ID="$POSTGRES_CONTAINER_ID" \
+          KAI_SYSTEM_IDENTIFIER="$identifier" \
+          IDENTITY_FILE="$IDENTITY_FILE" \
+          python - <<'PY'
+          import json
+          import os
+          from datetime import UTC, datetime
+
+          with open(os.environ["IDENTITY_FILE"], "w", encoding="utf-8") as handle:
+              json.dump(
+                  {
+                      "container_id": os.environ["POSTGRES_CONTAINER_ID"],
+                      "system_identifier": os.environ["KAI_SYSTEM_IDENTIFIER"],
+                      "created_at": datetime.now(UTC).isoformat(),
+                  },
+                  handle,
+              )
+          PY
+          echo "KAI_TEST_PG_CONTAINER_ID=$POSTGRES_CONTAINER_ID" >> "$GITHUB_ENV"
+          echo "KAI_TEST_PG_IDENTITY_FILE=$IDENTITY_FILE" >> "$GITHUB_ENV"
+          echo "KAI_TEST_PG_ANCHOR_KIND=ci" >> "$GITHUB_ENV"
+
       # The compose stack under docker/ is intentionally not used here: it is
       # not part of the tracked tree yet, so a CI checkout would not contain it.
       # This step reproduces the init script's role semantics inline instead:
@@ -88,19 +138,25 @@ jobs:
           POSTGRES_CONTAINER_ID: ${{ job.services.postgres.id }}
         run: |
           set -euo pipefail
+          trap 'rm -f "$RUNNER_TEMP/pgadmin.env"' EXIT
           : "${POSTGRES_CONTAINER_ID:?service container id is unavailable}"
-          docker exec -i \
-            -e PGPASSWORD="$KAI_TEST_POSTGRES_ADMIN_PASSWORD" \
+          # The password reaches psql through an ephemeral env file, never
+          # argv. This is a CI-only throwaway credential; the same value is
+          # used by DATABASE_URL.
+          printf 'PGPASSWORD=%s\n' "$KAI_TEST_POSTGRES_ADMIN_PASSWORD" \
+            > "$RUNNER_TEMP/pgadmin.env"
+          chmod 600 "$RUNNER_TEMP/pgadmin.env"
+          docker --context "$KAI_TEST_DOCKER_CONTEXT" exec -i \
+            --env-file "$RUNNER_TEMP/pgadmin.env" \
             "$POSTGRES_CONTAINER_ID" \
             psql \
               --host 127.0.0.1 \
               --username "$KAI_TEST_POSTGRES_ADMIN_USER" \
               --dbname "$KAI_TEST_POSTGRES_DB" \
-              --set ON_ERROR_STOP=1 \
-              --set runtime_password="$KAI_TEST_POSTGRES_PASSWORD" <<'SQL'
+              --set ON_ERROR_STOP=1 <<SQL
           CREATE ROLE kai_test
             WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION
-            PASSWORD :'runtime_password';
+            PASSWORD '$KAI_TEST_POSTGRES_PASSWORD';
           ALTER DATABASE kai_test OWNER TO kai_test;
           ALTER SCHEMA public OWNER TO kai_test;
           GRANT ALL ON SCHEMA public TO kai_test;
@@ -111,23 +167,28 @@ jobs:
           POSTGRES_CONTAINER_ID: ${{ job.services.postgres.id }}
         run: |
           set -euo pipefail
+          trap 'rm -f "$RUNNER_TEMP/pgruntime.env"' EXIT
           : "${POSTGRES_CONTAINER_ID:?service container id is unavailable}"
+          printf 'PGPASSWORD=%s\n' "$KAI_TEST_POSTGRES_PASSWORD" \
+            > "$RUNNER_TEMP/pgruntime.env"
+          chmod 600 "$RUNNER_TEMP/pgruntime.env"
           actual="$(
-            docker exec -i \
-              -e PGPASSWORD="$KAI_TEST_POSTGRES_PASSWORD" \
+            docker --context "$KAI_TEST_DOCKER_CONTEXT" exec -i \
+              --env-file "$RUNNER_TEMP/pgruntime.env" \
               "$POSTGRES_CONTAINER_ID" \
               psql \
                 --host 127.0.0.1 \
                 --username "$KAI_TEST_POSTGRES_USER" \
                 --dbname "$KAI_TEST_POSTGRES_DB" \
-                --no-align --tuples-only --set ON_ERROR_STOP=1 \
-                --command "SELECT current_user, current_database(), \
-                                 (SELECT rolsuper FROM pg_roles WHERE rolname = current_user), \
-                                 (SELECT rolcreatedb FROM pg_roles WHERE rolname = current_user), \
-                                 (SELECT rolcreaterole FROM pg_roles WHERE rolname = current_user), \
-                                 (SELECT rolreplication FROM pg_roles WHERE rolname = current_user), \
-                                 pg_get_userbyid((SELECT datdba FROM pg_database WHERE datname = current_database())), \
-                                 pg_get_userbyid((SELECT nspowner FROM pg_namespace WHERE nspname = 'public'))"
+                --no-align --tuples-only --set ON_ERROR_STOP=1 <<'SQL'
+          SELECT current_user, current_database(),
+                 (SELECT rolsuper FROM pg_roles WHERE rolname = current_user),
+                 (SELECT rolcreatedb FROM pg_roles WHERE rolname = current_user),
+                 (SELECT rolcreaterole FROM pg_roles WHERE rolname = current_user),
+                 (SELECT rolreplication FROM pg_roles WHERE rolname = current_user),
+                 pg_get_userbyid((SELECT datdba FROM pg_database WHERE datname = current_database())),
+                 pg_get_userbyid((SELECT nspowner FROM pg_namespace WHERE nspname = 'public'));
+          SQL
           )"
           expected="kai_test|kai_test|f|f|f|f|kai_test|kai_test"
           echo "test database identity and privileges: $actual"
@@ -139,10 +200,16 @@ jobs:
       - name: Apply database migrations
         run: alembic upgrade head
 
-      - name: Run tests
+      # The orchestrator provisions one unique database, runs only db_migration
+      # tests against it, verifies the normal kai_test baseline was untouched,
+      # and removes only that database. It never runs the normal suite.
+      - name: Run isolated migration tests
+        run: python scripts/run_migration_tests.py
+
+      - name: Run normal tests
         env:
           # Set only here, after provisioning and verification proved the target
           # is the dedicated kai_test database reached as the restricted
           # kai_test role. The gate still re-checks every condition itself.
           KAI_TEST_ALLOW_DB_TRUNCATE: "1"
-        run: pytest -q
+        run: pytest -q -m "not db_migration"

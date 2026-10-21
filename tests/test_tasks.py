@@ -11,7 +11,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import subprocess
-import sys
 from datetime import UTC, datetime
 from uuid import UUID
 
@@ -21,6 +20,7 @@ from pytest import LogCaptureFixture
 from sqlalchemy import inspect as sa_inspect
 from sqlalchemy import select
 
+from alembic_runner import run_alembic
 from kai.auth.jwt import TokenClaims, decode_access_token
 from kai.db.engine import async_session_factory
 from kai.db.models import User
@@ -58,6 +58,7 @@ from kai.tasks.state import (
     VERIFYING,
     WAITING_APPROVAL,
 )
+from migration_harness import MigrationGroupState, migration_schema
 
 API_PREFIX = "/api/v1"
 
@@ -942,16 +943,11 @@ REVISION_PREV = "5f3e1d2c4b6a"
 REVISION_HEAD = "e6f7a8b9c0d1"
 
 
-def _alembic(*args: str) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        [sys.executable, "-m", "alembic", *args],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+def _alembic(target_url: str, *args: str) -> subprocess.CompletedProcess[str]:
+    return run_alembic(*args, target_url=target_url)
 
 
-def _table_names_fresh() -> list[str]:
+def _table_names_fresh(target_url: str) -> list[str]:
     """Inspect on its own disposable engine + event loop.
 
     The migration test runs synchronously and must not touch the shared
@@ -960,10 +956,8 @@ def _table_names_fresh() -> list[str]:
 
     from sqlalchemy.ext.asyncio import create_async_engine
 
-    from kai.config import get_settings
-
     async def _names() -> list[str]:
-        eng = create_async_engine(get_settings().database_url)
+        eng = create_async_engine(target_url)
         try:
             async with eng.connect() as conn:
                 tables = await conn.run_sync(
@@ -976,24 +970,24 @@ def _table_names_fresh() -> list[str]:
     return asyncio.run(_names())
 
 
-def test_migration_is_rollbackable_and_forward() -> None:
-    try:
-        down = _alembic("downgrade", REVISION_PREV)
+@pytest.mark.db_migration
+def test_migration_is_rollbackable_and_forward(
+    migration_target: str, migration_group_state: MigrationGroupState
+) -> None:
+    with migration_schema(migration_group_state, migration_target):
+        down = _alembic(migration_target, "downgrade", REVISION_PREV)
         assert down.returncode == 0, down.stderr
-        current = _alembic("current").stdout
+        current = _alembic(migration_target, "current").stdout
         assert REVISION_PREV in current
 
-        assert "tasks" not in _table_names_fresh()
-        assert "task_plans" not in _table_names_fresh()
+        assert "tasks" not in _table_names_fresh(migration_target)
+        assert "task_plans" not in _table_names_fresh(migration_target)
 
-        up = _alembic("upgrade", "head")
+        up = _alembic(migration_target, "upgrade", "head")
         assert up.returncode == 0, up.stderr
-        assert "tasks" in _table_names_fresh()
-        assert "task_plans" in _table_names_fresh()
-        assert REVISION_HEAD in _alembic("current").stdout
-    finally:
-        # Never leave the schema behind head, even on assertion failure.
-        _alembic("upgrade", "head")
+        assert "tasks" in _table_names_fresh(migration_target)
+        assert "task_plans" in _table_names_fresh(migration_target)
+        assert REVISION_HEAD in _alembic(migration_target, "current").stdout
 
 
 async def _persist(**overrides: object) -> Task:

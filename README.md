@@ -86,12 +86,21 @@ python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -e ".[dev]"
 
-# 4. Migrations
+# 4. Migrations — DATABASE_URL is required; there is no default target.
+#    Replace <password> with the development password from .env. Never paste a
+#    test or production URL into this shell by accident.
+$env:DATABASE_URL = "postgresql+asyncpg://kai:<password>@127.0.0.1:5432/kai"
 alembic upgrade head
 
 # 5. Run
 uvicorn kai.main:app --reload
 ```
+
+`alembic/env.py` refuses to run when `DATABASE_URL` is absent instead of falling
+back to the built-in development default (`kai` on `127.0.0.1:5432`). The refusal
+names the missing variable only; it never prints the URL or a password. This also
+applies to offline `--sql` runs, which still need an explicit target for the
+dialect.
 
 ## Health endpoint
 
@@ -174,9 +183,10 @@ migrations first; see
 [`.github/workflows/quality-gate.yml`](.github/workflows/quality-gate.yml).
 
 ```powershell
-ruff check .   # repository-wide, no exclusions
-mypy            # type-checks src/ (130 files)
-pytest -q       # full suite against a real PostgreSQL (see Tests below)
+ruff check .                         # repository-wide, no exclusions
+mypy                                  # type-checks src/ (130 files)
+pytest -q -m "not db_migration"       # normal suite against kai_test
+python scripts/run_migration_tests.py # isolated migration group (see Tests)
 ```
 
 `mypy` reads its own configuration: `mypy_path = "src"` with
@@ -201,7 +211,9 @@ mismatch fails closed with a configuration error at fixture setup, before a
   false refuses.
 - `DATABASE_URL` names an allowlisted test database: the name must match
   `^kai_test(?:_[A-Za-z0-9]+)*$`. The built-in default `kai` is refused, and so
-  is any name that merely contains "test".
+  is any name that merely contains "test". A per-run
+  `kai_test_migrations_<16 hex>` database is also refused by the normal
+  truncation gate; only the migration orchestrator may use it.
 - The declared `DATABASE_URL` is the same connection target as the engine's
   effective URL (`engine.url`): driver, user, password, host, port, database and
   query must all match.
@@ -239,11 +251,61 @@ files for one such stack (`docker-compose.test.yml`, `docs/TEST_DATABASE.md`,
 `docker/test-db-init/`) are not tracked and have not been verified to run, so
 this document does not rely on them.
 
-### Running the suite
+### Isolated migration test group
 
-Once a dedicated test database and the `kai_test` role exist, point the suite at
-them, apply the schema, opt in, and run (PowerShell, as elsewhere in this
-document):
+Alembic tests mutate the schema. They must not run against the shared `kai_test`
+database, and they must not run in the same pytest process as the normal
+truncating suite. The supported entry point is:
+
+```powershell
+python scripts/run_migration_tests.py
+```
+
+The orchestrator performs this sequence:
+
+1. Reads the explicit normal `DATABASE_URL` and the administrator credentials.
+2. Resolves the expected `system_identifier` from a trusted Docker anchor (the
+   Compose service locally, or the CI service container id) using
+   `pg_controldata`; it does not trust the URL or the database name.
+3. Checks the administrator's identity, `CREATEDB`, ownership ability, and
+   identity-read permission, then opens the same connection, compares the live
+   `system_identifier`, and creates **one** database named
+   `kai_test_migrations_<16 lowercase hex characters>`.
+4. Sets and verifies `kai_test` ownership and the `public` schema, records a
+   run-id provenance comment, and constructs
+   `KAI_TEST_MIGRATIONS_DATABASE_URL` by replacing only the database name.
+5. Runs `alembic upgrade head` and `pytest -q -m db_migration` against that
+   database only. The same URL is passed to `DATABASE_URL` and the inspection
+   helpers; there is no `get_settings().database_url` fallback.
+6. Verifies the revision and expected tables, re-reads the normal `kai_test`
+   revision/table baseline, and fails if it changed.
+7. Removes only the database it created, only after proving exact name, owner,
+   run-id comment, and zero active connections. It never uses `DROP ... FORCE`
+   or a name-pattern sweeper. A failed run leaves the database in place and
+   prints its name for investigation.
+
+The migration tests are marked `db_migration` and open no normal-suite
+`TRUNCATE`: `tests/conftest.py` rejects mixed `db_migration`/normal selection and
+parallel `xdist` runs. Run the normal suite separately with
+`pytest -q -m "not db_migration"`.
+
+The migration child environments use an explicit allowlist. Administrator
+credentials, `PGPASSWORD`, `PGPASSFILE`, `KAI_TEST_ALLOW_DB_TRUNCATE`, and any
+unlisted future variable are not passed to Alembic or pytest. The runner has a
+120-second default timeout and sanitizes URLs/passwords from errors.
+
+The required Docker identity file is currently produced by the CI workflow and
+is not tracked. The P2 files (`scripts/run_migration_tests.py`,
+`src/kai/db/migration_orchestrator.py`, `src/kai/db/migration_subprocess.py`,
+`tests/migration_harness.py`, `tests/alembic_runner.py`, and the migration test
+files) must be added to the tracked tree before CI can use this flow. Live
+Docker/PostgreSQL/Alembic behavior has not been verified for this change.
+
+### Running the normal suite
+
+Once a dedicated test database and the `kai_test` role exist, point the normal
+suite at them, apply the schema, opt in, and run (PowerShell, as elsewhere in
+this document):
 
 ```powershell
 # 1. Aim the suite at the dedicated test database and the restricted kai_test
@@ -251,13 +313,15 @@ document):
 #    role. Use the host/port where your test database actually listens.
 $env:DATABASE_URL = "postgresql+asyncpg://kai_test:<password>@127.0.0.1:55432/kai_test"
 
-# 2. Alembic uses the same DATABASE_URL and has no gate of its own, so confirm
-#    the target is the test database before applying the schema.
+# 2. Alembic requires DATABASE_URL explicitly and refuses to run without it.
+#    Unlike the suite's truncation gate, it does not restrict the database name
+#    to a test pattern, so confirm the target is the test database yourself.
 alembic upgrade head
 
-# 3. Opt in to truncation for this test environment only, then run.
+# 3. Opt in to truncation for this test environment only, then run the
+#    normal suite. Migration tests use the orchestrator above instead.
 $env:KAI_TEST_ALLOW_DB_TRUNCATE = "1"
-pytest -q
+pytest -q -m "not db_migration"
 ```
 
 The test `DATABASE_URL` and `KAI_TEST_ALLOW_DB_TRUNCATE` are for the test

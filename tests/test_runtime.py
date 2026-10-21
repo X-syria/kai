@@ -11,7 +11,6 @@ from __future__ import annotations
 import asyncio
 import json
 import subprocess
-import sys
 import time
 from collections.abc import AsyncIterator, Callable, Iterator
 from contextlib import contextmanager
@@ -26,6 +25,7 @@ from pydantic import ValidationError
 from sqlalchemy import event, select
 from sqlalchemy import inspect as sa_inspect
 
+from alembic_runner import run_alembic
 from kai.db.engine import async_session_factory
 from kai.db.models import User
 from kai.google.deps import get_google_http_client
@@ -74,6 +74,7 @@ from kai.tools.errors import (
     PROVIDER_UNREACHABLE,
 )
 from kai.tools.result import RiskLevel, ToolOutcome, ToolResult
+from migration_harness import MigrationGroupState, migration_schema
 from tool_harness import GoogleBackend, contact_payload, insert_account, make_gateway
 
 API_PREFIX: Final = "/api/v1"
@@ -3384,23 +3385,16 @@ REVISION_PREV = "d1a2b3c4e5f6"
 REVISION_HEAD = "e6f7a8b9c0d1"
 
 
-def _alembic(*args: str) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        [sys.executable, "-m", "alembic", *args],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+def _alembic(target_url: str, *args: str) -> subprocess.CompletedProcess[str]:
+    return run_alembic(*args, target_url=target_url)
 
 
-def _table_names_fresh() -> list[str]:
+def _table_names_fresh(target_url: str) -> list[str]:
     from sqlalchemy import inspect as sa_inspect
     from sqlalchemy.ext.asyncio import create_async_engine
 
-    from kai.config import get_settings
-
     async def _names() -> list[str]:
-        eng = create_async_engine(get_settings().database_url)
+        eng = create_async_engine(target_url)
         try:
             async with eng.connect() as conn:
                 tables = await conn.run_sync(
@@ -3413,32 +3407,31 @@ def _table_names_fresh() -> list[str]:
     return asyncio.run(_names())
 
 
-def test_migration_is_rollbackable_and_forward() -> None:
-    try:
-        down = _alembic("downgrade", REVISION_PREV)
+@pytest.mark.db_migration
+def test_migration_is_rollbackable_and_forward(
+    migration_target: str, migration_group_state: MigrationGroupState
+) -> None:
+    with migration_schema(migration_group_state, migration_target):
+        down = _alembic(migration_target, "downgrade", REVISION_PREV)
         assert down.returncode == 0, down.stderr
-        assert "runtime_executions" not in _table_names_fresh()
+        assert "runtime_executions" not in _table_names_fresh(migration_target)
 
-        up = _alembic("upgrade", "head")
+        up = _alembic(migration_target, "upgrade", "head")
         assert up.returncode == 0, up.stderr
-        assert "runtime_executions" in _table_names_fresh()
-        assert REVISION_HEAD in _alembic("current").stdout
-    finally:
-        _alembic("upgrade", "head")
+        assert "runtime_executions" in _table_names_fresh(migration_target)
+        assert REVISION_HEAD in _alembic(migration_target, "current").stdout
 
 
 REVISION_BEFORE_AUDIT = "a4c7e2b9d1f3"
 AUDIT_COLUMNS = ("fulfillment_profile", "evaluator_version", "fulfillment_verdict")
 
 
-def _runtime_execution_columns() -> set[str]:
+def _runtime_execution_columns(target_url: str) -> set[str]:
     from sqlalchemy import inspect as sa_inspect
     from sqlalchemy.ext.asyncio import create_async_engine
 
-    from kai.config import get_settings
-
     async def _cols() -> set[str]:
-        eng = create_async_engine(get_settings().database_url)
+        eng = create_async_engine(target_url)
         try:
             async with eng.connect() as conn:
                 return set(
@@ -3455,38 +3448,46 @@ def _runtime_execution_columns() -> set[str]:
     return asyncio.run(_cols())
 
 
-def test_the_audit_triple_is_added_and_removed_as_one_migration() -> None:
+@pytest.mark.db_migration
+def test_the_audit_triple_is_added_and_removed_as_one_migration(
+    migration_target: str, migration_group_state: MigrationGroupState
+) -> None:
     """One revision adds all three, and rolling it back takes all three away.
 
     They are one fact, so they arrive together: a row with a verdict but no
     evaluator version would be a record of an answer with no provenance, which
     is the exact shape this change exists to prevent.
     """
-    try:
-        assert _alembic("downgrade", REVISION_BEFORE_AUDIT).returncode == 0
-        assert not set(AUDIT_COLUMNS) & _runtime_execution_columns()
+    with migration_schema(migration_group_state, migration_target):
+        assert (
+            _alembic(migration_target, "downgrade", REVISION_BEFORE_AUDIT).returncode
+            == 0
+        )
+        assert not set(AUDIT_COLUMNS) & _runtime_execution_columns(migration_target)
 
-        assert _alembic("upgrade", "head").returncode == 0
-        assert set(AUDIT_COLUMNS) <= _runtime_execution_columns()
-    finally:
-        _alembic("upgrade", "head")
-    assert set(AUDIT_COLUMNS) <= _runtime_execution_columns()
+        assert _alembic(migration_target, "upgrade", "head").returncode == 0
+        assert set(AUDIT_COLUMNS) <= _runtime_execution_columns(migration_target)
+
+    assert set(AUDIT_COLUMNS) <= _runtime_execution_columns(migration_target)
 
 
-def test_the_audit_columns_are_nullable_so_history_is_left_unclaimed() -> None:
+@pytest.mark.db_migration
+def test_the_audit_columns_are_nullable_so_history_is_left_unclaimed(
+    migration_target: str,
+    migration_group_state: MigrationGroupState,
+) -> None:
     """No NOT NULL, and no default: an old row stays honestly unknown.
 
     A backfilled version would claim a provenance nobody recorded — and for the
     rows that predate this revision it would be wrong, since the semantics that
     ran then were the earlier first-witness ones. NULL is the truthful value.
     """
+    migration_group_state.ensure_clean()
     from sqlalchemy import inspect as sa_inspect
     from sqlalchemy.ext.asyncio import create_async_engine
 
-    from kai.config import get_settings
-
     async def _nullable() -> dict[str, bool]:
-        eng = create_async_engine(get_settings().database_url)
+        eng = create_async_engine(migration_target)
         try:
             async with eng.connect() as conn:
                 return await conn.run_sync(
