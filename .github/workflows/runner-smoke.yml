@@ -1,0 +1,22 @@
+name: Runner Smoke Test
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["ci/task-ci-07-db-guard"]
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Runner diagnostics
+        run: |
+          set -euxo pipefail
+          echo "runner=${RUNNER_NAME}"
+          echo "os=${RUNNER_OS}"
+          python3 --version
+          docker version
