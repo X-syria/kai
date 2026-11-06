@@ -5,6 +5,10 @@ on:
     branches: ["**"]
   pull_request:
     branches: ["**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 env:
   PYTHON_VERSION: "3.14"
@@ -29,6 +33,7 @@ jobs:
   tests:
     name: Python 3.14 - Lint, Type, DB Migrations, Tests
     runs-on: ubuntu-latest
+    timeout-minutes: 45
 
     services:
       # The official postgres image makes POSTGRES_USER a superuser, so this
@@ -36,7 +41,7 @@ jobs:
       # provisions the runtime role. It is never named in DATABASE_URL; the
       # suite connects as the restricted `kai_test` role created below.
       postgres:
-        image: postgres:17-alpine
+        image: postgres:17
         env:
           POSTGRES_USER: kai_test_admin
           POSTGRES_PASSWORD: ci_only_admin_password
@@ -45,6 +50,7 @@ jobs:
           - 55432:5432
         options: >-
           --health-cmd "pg_isready -U kai_test_admin -d kai_test"
+          --health-start-period 10s
           --health-interval 5s
           --health-timeout 5s
           --health-retries 10
