@@ -262,6 +262,7 @@ def redact_evidence(records: list) -> list[RuntimeEvidenceEntry]:
                 ir_fingerprint=(
                     ir_fingerprint if isinstance(ir_fingerprint, str) else None
                 ),
+                external_outcome=record.get(EXTERNAL_OUTCOME),
             )
         )
     return published

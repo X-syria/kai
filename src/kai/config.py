@@ -180,6 +180,15 @@ class Settings(BaseSettings):
     # affect this service. Nothing here is an application-critical dependency.
     metrics_enabled: bool = False
     metrics_path: str = "/api/v1/metrics"
+    # The approval demo page (``/demo``) is an evaluation surface, not part of
+    # the API: it is a browser UI that drives the same authenticated runtime
+    # endpoints a client could call directly. Exposing it is therefore a
+    # deliberate decision, so it is off by default and only an environment that
+    # is explicitly authorized for a demo turns it on. It is deliberately
+    # independent of ``environment``: a demo may run on a production-shaped
+    # stack, and a developer shell must not gain the page merely by being
+    # non-production. No secrets are involved.
+    demo_ui_enabled: bool = False
     # Traces are correlation, not a distributed-tracing stack: spans ride the
     # structured-log channel that already ships. There is deliberately no
     # OTEL_EXPORTER_ENDPOINT and no collector to point it at; see

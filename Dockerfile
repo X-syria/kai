@@ -35,4 +35,10 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
 # Alembic migrations take locks on the same schema the running replicas use, so
 # running them per-replica on boot turns a rolling deploy into a race. Migrations
 # are applied once, by a dedicated one-shot job (see docker-compose.yml).
-CMD ["uvicorn", "kai.main:app", "--host", "0.0.0.0", "--port", "8000"]
+#
+# Access logs are disabled: /api/v1/auth/google/callback carries ``code`` and
+# ``state`` in its query string, and uvicorn's default access log would persist
+# both. --no-access-log silences access logging for this whole process, not just
+# the OAuth routes; reverse proxies and hosting platforms still need their own
+# query-string redaction.
+CMD ["uvicorn", "kai.main:app", "--host", "0.0.0.0", "--port", "8000", "--no-access-log"]

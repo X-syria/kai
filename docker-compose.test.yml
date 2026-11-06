@@ -1,0 +1,95 @@
+# TEST-ONLY PostgreSQL stack. This file is intentionally INDEPENDENT from
+# docker-compose.yml: it defines its own service, its own named volume, and its
+# own host port. It must NEVER point at the development or production data
+# (`db` / `kai_pgdata` / port 5432), and it must never be merged into the
+# development stack.
+#
+# It exists so the test suite can run against a dedicated PostgreSQL instance
+# that the safety gate in tests/conftest.py will authorize to TRUNCATE, without
+# any risk of wiping the development volume.
+#
+# TWO-ROLE MODEL. The official postgres image makes POSTGRES_USER a superuser,
+# so POSTGRES_USER is a BOOTSTRAP ADMIN only:
+#
+#   * `kai_test_admin` (POSTGRES_USER) initializes a FRESH cluster. It is NOT
+#     used by KAI's connection strings, migrations, or tests.
+#   * `kai_test` (the runtime role) is created by the init script in
+#     ./docker/test-db-init. It is a NON-superuser LOGIN role that owns the
+#     `kai_test` database and the `public` schema, and it is the ONLY account
+#     named in the test DATABASE_URL.
+#
+# NO SECRETS ARE IN THIS FILE. Both passwords are supplied as Compose
+# file-backed secrets, read from LOCAL files that must live OUTSIDE the tracked
+# repository. The environment variables below hold PATHS to those files, never
+# the secret values, and are fail-closed via Compose's required `${VAR:?msg}`
+# syntax: when a path variable is unset, validation and startup abort with a
+# clear message instead of silently falling back to a default password.
+#
+# Nothing is started by merely loading or validating this file; the init script
+# and the healthcheck below run only once the container is actually up.
+#
+# See docs/TEST_DATABASE.md for the full workflow, required variables, how to
+# create the local password files, and the safety-gate compatibility notes.
+
+name: kai-test-db
+
+services:
+  # Dedicated test database. Named `db-test` on purpose: NOT the development
+  # `db` service, and never sharing its container or volume.
+  db-test:
+    image: postgres:17-alpine
+    environment:
+      # Bootstrap superuser. Used by the image to initialize a FRESH cluster and
+      # by the init script to provision the runtime role. NOT used by KAI.
+      POSTGRES_USER: ${KAI_TEST_POSTGRES_ADMIN_USER:-kai_test_admin}
+      # In-container path to the admin bootstrap secret (Docker secret). Read
+      # by the image entrypoint; never a literal password.
+      POSTGRES_PASSWORD_FILE: /run/secrets/kai_test_admin_password
+      # The image creates this database (initially owned by the admin user); the
+      # init script transfers ownership to the runtime role.
+      # The safety gate only authorizes databases matching
+      # ^kai_test(?:_[A-Za-z0-9]+)*$, so the default is `kai_test`.
+      POSTGRES_DB: ${KAI_TEST_POSTGRES_DB:-kai_test}
+      # Consumed by docker/test-db-init/10-create-test-runtime-role.sh.
+      KAI_TEST_RUNTIME_USER: ${KAI_TEST_POSTGRES_USER:-kai_test}
+      KAI_TEST_POSTGRES_PASSWORD_FILE: /run/secrets/kai_test_password
+    ports:
+      # Loopback only, on a non-default host port (55432 != 5432) so it cannot
+      # collide with the development stack published on 5432.
+      - "127.0.0.1:${KAI_TEST_POSTGRES_PORT:-55432}:5432"
+    volumes:
+      # Dedicated named volume. NEVER `kai_pgdata` (the development volume).
+      # Named volumes only: no bind mounts, no sharing with development data.
+      - kai_test_pgdata:/var/lib/postgresql/data
+      # Provisioning of the runtime role. Runs ONCE, only on a FRESH data
+      # directory; an existing `kai_test_pgdata` volume skips it entirely. See
+      # docs/TEST_DATABASE.md.
+      - ./docker/test-db-init:/docker-entrypoint-initdb.d:ro
+    secrets:
+      - kai_test_admin_password
+      - kai_test_password
+    healthcheck:
+      # Runs only once the container is up; parsing/validating this file does
+      # not execute it. `pg_isready` reports only whether the server responds
+      # and accepts connections under these arguments: exit 0 does NOT prove the
+      # runtime role exists, can authenticate, or that the init script completed
+      # -- only that PostgreSQL is answering. It is deliberately a liveness
+      # probe, never a readiness check or an isolation proof. The runtime role
+      # is created by the init script and is not needed to decide liveness, so
+      # the probe targets the bootstrap admin endpoint, which always exists.
+      test: ["CMD-SHELL", "pg_isready -U ${KAI_TEST_POSTGRES_ADMIN_USER:-kai_test_admin} -d ${KAI_TEST_POSTGRES_DB:-kai_test}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  # Test-only volume, namespaced separately from the development `kai_pgdata`.
+  kai_test_pgdata:
+
+secrets:
+  # File-backed secrets. Each `${VAR:?message}` is REQUIRED and must hold a PATH
+  # to a local file containing the secret. Keep those files OUTSIDE the repo.
+  kai_test_admin_password:
+    file: "${KAI_TEST_POSTGRES_ADMIN_PASSWORD_FILE:?set KAI_TEST_POSTGRES_ADMIN_PASSWORD_FILE to a local file containing the bootstrap admin password}"
+  kai_test_password:
+    file: "${KAI_TEST_POSTGRES_PASSWORD_FILE:?set KAI_TEST_POSTGRES_PASSWORD_FILE to a local file containing the kai_test runtime password}"

@@ -50,7 +50,10 @@ from typing import Any, Final
 import pytest
 from pydantic import ValidationError
 
-from kai.identity import IdentityQuery, IdentityResolver, IdentityStatus
+from kai.identity import IdentityQuery, IdentityResolver, IdentityResult, IdentityStatus
+from kai.memory.models import MemoryType
+from kai.memory.service import create_memory
+from kai.runtime import service as runtime_service
 from kai.runtime.fulfillment import (
     FulfillmentInput,
     FulfillmentVerdict,
@@ -61,15 +64,18 @@ from kai.runtime.fulfillment import (
 )
 from kai.runtime.models import RuntimeExecution
 from kai.runtime.schemas import RuntimeIdentity, UnderstandingOutput
-from kai.runtime.service import AgentRuntime, _fulfillment_outcome
+from kai.runtime.service import AgentRuntime, RuntimeFatal, _fulfillment_outcome
+from kai.runtime.translator import memory_email_hint
 from kai.runtime.understanding import UNDERSTANDING_SYSTEM_PROMPT
 from kai.tasks.service import LIVE_SEALABLE_PROFILES
 from kai.tools.schemas import GmailSendArgs
 from tool_harness import (
     GoogleBackend,
+    close_context,
     contact_payload,
     insert_account,
     make_context,
+    make_gateway,
     make_task,
     make_tenant_user,
     session_scope,
@@ -134,6 +140,62 @@ def _verdict(criteria: Any, *records: dict[str, Any]) -> FulfillmentVerdict:
 
 def _source(node: Any) -> str:
     return textwrap.dedent(inspect.getsource(node))
+
+
+def _scenario(*guests: str) -> UnderstandingOutput:
+    return UnderstandingOutput.model_validate(
+        {
+            "intent": "schedule_meeting",
+            "guests": list(guests),
+            "window": {
+                "start_date": "2026-06-24",
+                "end_date": "2026-06-25",
+                "earliest_time": "09:00",
+                "title": "KAI",
+            },
+        }
+    )
+
+
+class _UnusedModel:
+    """A planner the identity-resolution tests must never reach."""
+
+    model_id = "unused"
+
+    async def generate_plan(self, *, messages: list[dict]) -> dict:
+        raise AssertionError("identity resolution must not call the planner")
+
+
+def _runtime() -> AgentRuntime:
+    gateway, _ = make_gateway()
+    return AgentRuntime(gateway=gateway, model=_UnusedModel())
+
+
+class _GuardedResolver:
+    """A positive resolver whose second guest carries the parametrized address.
+
+    Substituted for ``kai.runtime.service.IdentityResolver`` so the positive
+    verdict/no-address state is constructible: the real resolver only publishes
+    an address on a positive verdict, so a live run cannot produce it by accident.
+    """
+
+    def __init__(self, missing_address: str | None) -> None:
+        self.missing_address = missing_address
+        self.queries: list[IdentityQuery] = []
+
+    async def resolve(self, *, query: IdentityQuery, context: Any) -> IdentityResult:
+        self.queries.append(query)
+        if query.name == "Alice":
+            return IdentityResult(
+                status=IdentityStatus.CONTACT_MATCH,
+                confidence=0.5,
+                email=ALICE,
+            )
+        return IdentityResult(
+            status=IdentityStatus.CONTACT_MATCH,
+            confidence=0.5,
+            email=self.missing_address,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -275,6 +337,123 @@ async def test_the_address_is_the_memory_hint_and_the_contact_is_only_a_gate() -
         assert failed.email is None
 
 
+async def test_a_resolved_guest_stores_only_the_resolver_address() -> None:
+    """The sealed row carries the resolver's address, never the raw memory hint.
+
+    Both are present and they differ in normalization: memory holds
+    ``Alice@Example.COM`` while the resolver returns ``alice@example.com``. Only
+    the latter may reach ``row.identities``; the hint is an input to the query,
+    not a value the writer may fall back to.
+    """
+    async with session_scope() as session:
+        backend = GoogleBackend()
+        tenant, user = await make_tenant_user("owner@corp.example")
+        account = await insert_account(
+            tenant_id=tenant.id, user_id=user.id, email="owner@corp.example", sub="sub-1"
+        )
+        backend.contacts_connections = [
+            contact_payload(resource_name="people/1", display_name="Alice", emails=(ALICE,))
+        ]
+        await create_memory(
+            session,
+            tenant_id=tenant.id,
+            user_id=user.id,
+            memory_type=MemoryType.PERSON,
+            content="Alice is a colleague; email Alice@Example.COM",
+        )
+        task = await make_task(tenant_id=tenant.id, user_id=user.id)
+        hint = await memory_email_hint(
+            session, tenant_id=tenant.id, user_id=user.id, name="Alice"
+        )
+        assert hint == "Alice@Example.COM"
+        query = IdentityQuery(email=hint)
+        context = make_context(
+            session=session,
+            task=task,
+            backend=backend,
+            account_id=account.id,
+            identity=query,
+        )
+        try:
+            resolved = await IdentityResolver().resolve(query=query, context=context)
+            assert resolved.status is IdentityStatus.CONTACT_MATCH
+            assert resolved.email == ALICE
+
+            rows = await _runtime()._resolve_guest_identities(
+                session,
+                task,
+                scenario=_scenario("Alice"),
+                account=account,
+                transport=context.transport,
+            )
+        finally:
+            await close_context(context)
+
+    assert rows == [
+        {
+            "name": "Alice",
+            "email": resolved.email,
+            "status": resolved.status.value,
+            "confidence": resolved.confidence,
+        }
+    ]
+    assert rows[0]["email"] == ALICE
+    assert rows[0]["email"] != hint
+
+
+@pytest.mark.parametrize("missing_address", [None, "", "   "])
+async def test_a_positive_verdict_without_an_address_refuses_the_whole_batch(
+    monkeypatch: pytest.MonkeyPatch, missing_address: str | None
+) -> None:
+    """A positive status is not enough; the memory hint must not fill the gap.
+
+    Alice resolves first with an address, so a partial list would exist inside
+    the helper when Bob's positive verdict arrives without one. The refusal names
+    Bob and the helper returns nothing: the caller sees an exception, not the
+    already-built row.
+    """
+    async with session_scope() as session:
+        backend = GoogleBackend()
+        tenant, user = await make_tenant_user("owner@corp.example")
+        account = await insert_account(
+            tenant_id=tenant.id, user_id=user.id, email="owner@corp.example", sub="sub-1"
+        )
+        # Only Bob has a hint, so his query carries one and Alice's does not.
+        await create_memory(
+            session,
+            tenant_id=tenant.id,
+            user_id=user.id,
+            memory_type=MemoryType.PERSON,
+            content="Bob is a colleague; email bob@example.com",
+        )
+        task = await make_task(tenant_id=tenant.id, user_id=user.id)
+        resolver = _GuardedResolver(missing_address)
+        monkeypatch.setattr(runtime_service, "IdentityResolver", lambda: resolver)
+        context = make_context(
+            session=session, task=task, backend=backend, account_id=account.id
+        )
+        returned: list[dict[str, Any]] | None = None
+        try:
+            with pytest.raises(RuntimeFatal, match="Bob"):
+                returned = await _runtime()._resolve_guest_identities(
+                    session,
+                    task,
+                    scenario=_scenario("Alice", "Bob"),
+                    account=account,
+                    transport=context.transport,
+                )
+        finally:
+            await close_context(context)
+
+    assert returned is None
+    # Alice was resolved and would have produced a row; Bob's verdict then
+    # stopped the batch instead of leaving that row to be returned.
+    assert [query.name or query.email for query in resolver.queries] == [
+        "Alice",
+        "bob@example.com",
+    ]
+
+
 def test_the_live_path_can_only_ever_reach_contact_match() -> None:
     """``PROVIDER_VERIFIED`` and ``CHANNEL_VERIFIED`` are unreachable for guests.
 
@@ -288,7 +467,6 @@ def test_the_live_path_can_only_ever_reach_contact_match() -> None:
     assert "IdentityQuery(email=email) if email else IdentityQuery(name=guest)" in source
     for absent in ("provider=", "channel=", "phone=", "provider_account_id="):
         assert absent not in source
-    assert '"email": resolved.email or email or ""' in source
     assert "PROVIDER_VERIFIED" not in source
     assert "CHANNEL_VERIFIED" not in source
 

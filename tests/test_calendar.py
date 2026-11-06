@@ -165,6 +165,15 @@ def stub() -> CalendarStub:
 
 
 @pytest_asyncio.fixture
+async def client() -> AsyncIterator[httpx.AsyncClient]:
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport, base_url="https://testserver"
+    ) as test_client:
+        yield test_client
+
+
+@pytest_asyncio.fixture
 async def google_transport(stub: CalendarStub) -> AsyncIterator[httpx.AsyncClient]:
     async with httpx.AsyncClient(transport=httpx.MockTransport(stub.handler)) as transport:
         app.dependency_overrides[get_google_http_client] = lambda: transport
@@ -199,12 +208,18 @@ def _state_from(authorization_url: str) -> str:
 
 
 async def _bind(client: httpx.AsyncClient, token: str) -> None:
+    """Link the stub's Google identity through the pending-confirmation flow."""
     url = await _connect(client, token)
-    resp = await client.get(
+    started = await client.get(
         f"{API_PREFIX}/auth/google/callback",
         params={"state": _state_from(url), "code": "auth-code-123"},
     )
-    assert resp.status_code == 200
+    assert started.status_code == 303, started.text
+    confirmed = await client.post(
+        f"{API_PREFIX}/auth/google/pending/confirm",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert confirmed.status_code == 200
 
 
 async def _account_id(client: httpx.AsyncClient, token: str) -> str:

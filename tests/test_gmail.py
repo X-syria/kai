@@ -236,9 +236,12 @@ async def _register(client: httpx.AsyncClient, email: str = "alice@example.com")
     return resp.json()["access_token"]
 
 
-async def _connect(client: httpx.AsyncClient, token: str) -> str:
+async def _connect(
+    client: httpx.AsyncClient, token: str, *, include_gmail: bool = False
+) -> str:
     resp = await client.get(
         f"{API_PREFIX}/auth/google/connect",
+        params={"include_gmail": "true"} if include_gmail else {},
         headers={"Authorization": f"Bearer {token}"},
     )
     assert resp.status_code == 200
@@ -250,12 +253,18 @@ def _state_from(authorization_url: str) -> str:
 
 
 async def _bind(client: httpx.AsyncClient, token: str) -> None:
+    """Link the stub's Google identity through the pending-confirmation flow."""
     url = await _connect(client, token)
-    resp = await client.get(
+    started = await client.get(
         f"{API_PREFIX}/auth/google/callback",
         params={"state": _state_from(url), "code": "auth-code-123"},
     )
-    assert resp.status_code == 200
+    assert started.status_code == 303
+    confirmed = await client.post(
+        f"{API_PREFIX}/auth/google/pending/confirm",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert confirmed.status_code == 200
 
 
 async def _account_id(client: httpx.AsyncClient, token: str) -> str:
@@ -390,7 +399,7 @@ async def test_public_gmail_write_is_refused_before_any_authorization(
 
 # --- least-privilege scopes ------------------------------------------------
 
-async def test_connect_requests_read_and_send_scopes_separately(
+async def test_connect_omits_gmail_scopes_by_default(
     client: httpx.AsyncClient,
     google_settings: None,
     google_transport: httpx.AsyncClient,
@@ -398,8 +407,21 @@ async def test_connect_requests_read_and_send_scopes_separately(
     token = await _register(client)
     url = await _connect(client, token)
     scopes = parse_qs(urlparse(url).query)["scope"][0].split()
-    assert GMAIL_READ_SCOPE in scopes
-    assert GMAIL_SEND_SCOPE in scopes
+    assert GMAIL_READ_SCOPE not in scopes
+    assert GMAIL_SEND_SCOPE not in scopes
+
+
+async def test_connect_requests_read_and_send_scopes_separately(
+    client: httpx.AsyncClient,
+    google_settings: None,
+    google_transport: httpx.AsyncClient,
+) -> None:
+    token = await _register(client)
+    default_url = await _connect(client, token)
+    default_scopes = parse_qs(urlparse(default_url).query)["scope"][0].split()
+    url = await _connect(client, token, include_gmail=True)
+    scopes = parse_qs(urlparse(url).query)["scope"][0].split()
+    assert scopes == [*default_scopes, GMAIL_READ_SCOPE, GMAIL_SEND_SCOPE]
     forbidden = (
         "https://www.googleapis.com/auth/gmail",  # full read/write mailbox
         "https://www.googleapis.com/auth/gmail.modify",

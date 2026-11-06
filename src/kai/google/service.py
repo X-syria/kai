@@ -23,7 +23,9 @@ endpoints are not safely replayable.
 from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
+import asyncpg
 import httpx
+import psycopg
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -32,6 +34,27 @@ from kai.db.models import GoogleAccount
 from kai.google import client
 from kai.google.client import GoogleOAuthError
 from kai.google.crypto import decrypt_credentials, encrypt_credentials
+
+
+def _constraint_name_for(exc: IntegrityError) -> str | None:
+    """Return a constraint name reported by a supported PostgreSQL driver.
+
+    Psycopg exposes the server diagnostic on ``orig.diag``. SQLAlchemy's
+    asyncpg dialect wraps the native exception and preserves it as
+    ``orig.__cause__``; asyncpg reports ``constraint_name`` on that exception.
+    If neither driver supplies the name, the error cannot be safely classified.
+    """
+    original = getattr(exc, "orig", None)
+    while original is not None:
+        if isinstance(original, psycopg.Error):
+            diag = original.diag
+            name = None if diag is None else diag.constraint_name
+            return name if isinstance(name, str) and name else None
+        if isinstance(original, asyncpg.exceptions.IntegrityConstraintViolationError):
+            name = original.constraint_name
+            return name if isinstance(name, str) and name else None
+        original = getattr(original, "__cause__", None)
+    return None
 
 #: A stored access token expiring within this window is exchanged for a new one
 #: before it is handed to a provider. Without a skew a token judged "still
@@ -42,6 +65,25 @@ REFRESH_SKEW = timedelta(seconds=60)
 
 class GoogleAccountConflictError(RuntimeError):
     """Raised when a Google identity cannot be bound to the requested user."""
+
+
+class GoogleReconnectRequiredError(GoogleOAuthError):
+    """The stored grant can never be renewed; the user must reconnect.
+
+    Distinct from a transient provider failure on purpose: this is the one
+    refresh outcome that a retry cannot fix, so the HTTP contract maps it to
+    ``409 google_reconnect_required`` instead of a 5xx. The message never
+    contains provider text.
+    """
+
+
+class GoogleCredentialsError(GoogleOAuthError):
+    """Stored credentials could not be read or produced no usable grant."""
+
+
+#: Stable, non-provider detail used by every API surface that surfaces a dead
+#: grant. Clients key on this value, so it is a constant, not a message.
+GOOGLE_RECONNECT_DETAIL = "google_reconnect_required"
 
 
 def merge_credentials(
@@ -73,7 +115,9 @@ def _store_credentials(
 def _stored_access_token(credentials: dict) -> str:
     token = credentials.get("access_token")
     if not isinstance(token, str) or not token:
-        raise GoogleOAuthError("google account has no stored access token")
+        raise GoogleReconnectRequiredError(
+            "google account has no stored access token"
+        )
     return token
 
 
@@ -131,13 +175,22 @@ async def _exchange_refresh_token(
     refresh_token = credentials.get("refresh_token")
     if not refresh_token:
         await session.rollback()
-        raise GoogleOAuthError("google account has no stored refresh token")
+        # Nothing stored can be exchanged; no retry can create a refresh token.
+        raise GoogleReconnectRequiredError("google account has no stored refresh token")
     try:
         token = await client.refresh_access_token(
             transport, refresh_token=str(refresh_token)
         )
-    except GoogleOAuthError:
+    except GoogleOAuthError as exc:
         await session.rollback()
+        if client.is_permanent_refresh_rejection(exc):
+            # The grant is gone (revoked / expired). A retry would fail
+            # identically, and no stored credential was touched.
+            raise GoogleReconnectRequiredError(
+                "google refresh token was rejected"
+            ) from exc
+        # Transient: provider outage, 5xx, misconfiguration, transport failure.
+        # The stored refresh token stays exactly as it was.
         raise
     merged = merge_credentials(
         credentials,
@@ -183,6 +236,143 @@ async def usable_access_token(
     return _stored_access_token(merged)
 
 
+async def _lock_account_by_sub(
+    session: AsyncSession, *, tenant_id: UUID, google_sub: str
+) -> GoogleAccount | None:
+    """Lock and re-read the account row for ``(tenant_id, google_sub)``.
+
+    ``populate_existing`` for the same reason as :func:`_lock_account`: a
+    caller may already hold a stale copy in this session's identity map, and a
+    lock that does not refresh the attributes would still let the merge write
+    against credentials that no longer exist.
+    """
+    result = await session.execute(
+        select(GoogleAccount)
+        .where(
+            GoogleAccount.tenant_id == tenant_id,
+            GoogleAccount.google_sub == google_sub,
+        )
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    return result.scalar_one_or_none()
+
+
+def _apply_new_credentials(
+    account: GoogleAccount,
+    *,
+    access_token: str,
+    refresh_token: str | None,
+    expires_in: int,
+    now: datetime,
+) -> None:
+    """Merge one token response into ``account`` using the one merge rule."""
+    _store_credentials(
+        account,
+        merge_credentials(
+            decrypt_credentials(account.credentials_encrypted),
+            access_token=access_token,
+            refresh_token=refresh_token,
+        ),
+        expires_in=expires_in,
+        now=now,
+    )
+
+
+async def bind_or_reconnect_google_account_in_transaction(
+    session: AsyncSession,
+    *,
+    tenant_id: UUID,
+    user_id: UUID,
+    google_sub: str,
+    email: str,
+    scopes: str,
+    access_token: str,
+    refresh_token: str | None,
+    expires_in: int,
+    now: datetime | None = None,
+) -> GoogleAccount:
+    """Bind or reconnect a Google identity inside the caller's transaction.
+
+    This function never calls ``commit`` or ``rollback``: the caller owns the
+    unit of work, which is what lets the pending-transaction flow write the
+    account and mark the transaction consumed atomically. The public
+    :func:`bind_or_reconnect_google_account` is a thin committing wrapper for
+    callers that do not need that.
+
+    The existing row is locked ``FOR UPDATE`` before it is merged, so a
+    reconnect cannot interleave with a concurrent token refresh and overwrite
+    the newer credentials. An insert that loses the race against the
+    ``(tenant_id, google_sub)`` unique constraint is caught through a
+    savepoint, the winner is re-read under the same lock, and the merge is
+    applied to it - never to the row that lost.
+    """
+    current = now or datetime.now(UTC)
+    existing = await _lock_account_by_sub(
+        session, tenant_id=tenant_id, google_sub=google_sub
+    )
+    if existing is not None:
+        if existing.user_id != user_id:
+            raise GoogleAccountConflictError(
+                "google account is already bound to another user in this tenant"
+            )
+        existing.email = email
+        existing.scopes = scopes
+        _apply_new_credentials(
+            existing,
+            access_token=access_token,
+            refresh_token=refresh_token,
+            expires_in=expires_in,
+            now=current,
+        )
+        await session.flush()
+        return existing
+
+    account = GoogleAccount(
+        tenant_id=tenant_id,
+        user_id=user_id,
+        google_sub=google_sub,
+        email=email,
+        scopes=scopes,
+    )
+    _store_credentials(
+        account,
+        merge_credentials(None, access_token=access_token, refresh_token=refresh_token),
+        expires_in=expires_in,
+        now=current,
+    )
+    try:
+        # The savepoint is scoped to the insert only: a unique-constraint loser
+        # rolls back this statement, not the caller's whole unit of work. The
+        # object is added inside it so a rollback also discards the pending
+        # insert instead of replaying it at the next flush.
+        async with session.begin_nested():
+            session.add(account)
+            await session.flush()
+    except IntegrityError as exc:
+        if _constraint_name_for(exc) != "uq_google_accounts_tenant_google_sub":
+            raise
+        winner = await _lock_account_by_sub(
+            session, tenant_id=tenant_id, google_sub=google_sub
+        )
+        if winner is None or winner.user_id != user_id:
+            raise GoogleAccountConflictError(
+                "google account could not be bound"
+            ) from exc
+        winner.email = email
+        winner.scopes = scopes
+        _apply_new_credentials(
+            winner,
+            access_token=access_token,
+            refresh_token=refresh_token,
+            expires_in=expires_in,
+            now=current,
+        )
+        await session.flush()
+        account = winner
+    return account
+
+
 async def bind_or_reconnect_google_account(
     session: AsyncSession,
     *,
@@ -205,66 +395,25 @@ async def bind_or_reconnect_google_account(
 
     A reconnect replaces the access token but keeps the stored refresh token
     unless Google issued a new one; see :func:`merge_credentials`.
+
+    This wrapper exists for callers that own no wider transaction. The
+    account-linking flow must use
+    :func:`bind_or_reconnect_google_account_in_transaction` so the account
+    write and the pending-row transition commit together.
     """
-    current = now or datetime.now(UTC)
-    result = await session.execute(
-        select(GoogleAccount).where(
-            GoogleAccount.tenant_id == tenant_id,
-            GoogleAccount.google_sub == google_sub,
-        )
+    account = await bind_or_reconnect_google_account_in_transaction(
+        session,
+        tenant_id=tenant_id,
+        user_id=user_id,
+        google_sub=google_sub,
+        email=email,
+        scopes=scopes,
+        access_token=access_token,
+        refresh_token=refresh_token,
+        expires_in=expires_in,
+        now=now,
     )
-    existing = result.scalar_one_or_none()
-    if existing is not None:
-        if existing.user_id != user_id:
-            raise GoogleAccountConflictError(
-                "google account is already bound to another user in this tenant"
-            )
-        existing.email = email
-        existing.scopes = scopes
-        _store_credentials(
-            existing,
-            merge_credentials(
-                decrypt_credentials(existing.credentials_encrypted),
-                access_token=access_token,
-                refresh_token=refresh_token,
-            ),
-            expires_in=expires_in,
-            now=current,
-        )
-        account = existing
-    else:
-        account = GoogleAccount(
-            tenant_id=tenant_id,
-            user_id=user_id,
-            google_sub=google_sub,
-            email=email,
-            scopes=scopes,
-        )
-        _store_credentials(
-            account,
-            merge_credentials(
-                None, access_token=access_token, refresh_token=refresh_token
-            ),
-            expires_in=expires_in,
-            now=current,
-        )
-        session.add(account)
-    try:
-        await session.commit()
-    except IntegrityError as exc:
-        # Lost a concurrent bind race against the unique constraint.
-        await session.rollback()
-        winner = (
-            await session.execute(
-                select(GoogleAccount).where(
-                    GoogleAccount.tenant_id == tenant_id,
-                    GoogleAccount.google_sub == google_sub,
-                )
-            )
-        ).scalar_one_or_none()
-        if winner is None or winner.user_id != user_id:
-            raise GoogleAccountConflictError("google account could not be bound") from exc
-        account = winner
+    await session.commit()
     await session.refresh(account)
     return account
 

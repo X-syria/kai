@@ -147,13 +147,19 @@ def _state_from(authorization_url: str) -> str:
 
 
 async def _bind(client: httpx.AsyncClient, token: str) -> httpx.Response:
+    """Link the stub's Google identity through the pending-confirmation flow."""
     url = await _connect(client, token)
-    resp = await client.get(
+    started = await client.get(
         f"{API_PREFIX}/auth/google/callback",
         params={"state": _state_from(url), "code": "auth-code-123"},
     )
-    assert resp.status_code == 200
-    return resp
+    assert started.status_code == 303
+    confirmed = await client.post(
+        f"{API_PREFIX}/auth/google/pending/confirm",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert confirmed.status_code == 200
+    return confirmed
 
 
 async def _contacts(
@@ -199,8 +205,6 @@ async def test_connect_requests_readonly_contacts_scope_only(
         "email",
         CONTACTS_READONLY_SCOPE,
         "https://www.googleapis.com/auth/calendar.events",
-        "https://www.googleapis.com/auth/gmail.readonly",
-        "https://www.googleapis.com/auth/gmail.send",
     ]
     forbidden = (
         "https://www.googleapis.com/auth/contacts",  # read/write variant

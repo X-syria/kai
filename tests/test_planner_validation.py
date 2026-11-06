@@ -9,6 +9,8 @@ contract-fidelity checks. Nothing here talks to the network.
 
 from __future__ import annotations
 
+import re
+
 import pytest
 from pydantic import ValidationError
 
@@ -129,6 +131,109 @@ def test_step_without_purpose_rejected() -> None:
     del step["purpose"]
     with pytest.raises(ValidationError):
         PlanProposal.model_validate(_plan(steps=[step]))
+
+
+def test_inputs_may_be_an_array_of_strings() -> None:
+    """The declared representation: ``inputs`` is a JSON array of strings."""
+    step = _plan()["steps"][0] | {"inputs": ["calendar_id", "window"]}
+    proposal = PlanProposal.model_validate(_plan(steps=[step]))
+    assert proposal.steps[0].inputs == ["calendar_id", "window"]
+
+
+def test_inputs_may_be_empty() -> None:
+    """An empty array is valid: the step declares no inputs."""
+    step = _plan()["steps"][0] | {"inputs": []}
+    proposal = PlanProposal.model_validate(_plan(steps=[step]))
+    assert proposal.steps[0].inputs == []
+
+
+def test_inputs_scalar_string_rejected() -> None:
+    """A scalar string is not the declared list type (the Phase 2D.4 mismatch)."""
+    step = _plan()["steps"][0] | {"inputs": "calendar_id"}
+    with pytest.raises(ValidationError) as exc_info:
+        PlanProposal.model_validate(_plan(steps=[step]))
+    errors = exc_info.value.errors()
+    assert any(
+        error["loc"] == ("steps", 0, "inputs") and error["type"] == "list_type"
+        for error in errors
+    ), errors
+
+
+def test_inputs_non_array_object_rejected() -> None:
+    """Any non-array value is rejected, never coerced into a one-item list."""
+    step = _plan()["steps"][0] | {"inputs": {"calendar_id": True}}
+    with pytest.raises(ValidationError) as exc_info:
+        PlanProposal.model_validate(_plan(steps=[step]))
+    errors = exc_info.value.errors()
+    assert any(
+        error["loc"] == ("steps", 0, "inputs") and error["type"] == "list_type"
+        for error in errors
+    ), errors
+
+
+def test_prompt_documents_inputs_contract() -> None:
+    """The prompt states the ``inputs`` type the schema actually enforces.
+
+    A regression guard for prompt documentation, not proof that a model will
+    comply; the executable guarantee stays the schema validation above.
+    """
+    from kai.planner.model import PLANNER_SYSTEM_PROMPT
+
+    assert "a JSON array of strings" in PLANNER_SYSTEM_PROMPT
+    assert "empty array []" in PLANNER_SYSTEM_PROMPT
+
+
+def _prompt_capability_vocabulary() -> set[str]:
+    """The capability ids the prompt enumerates, parsed from its own text."""
+    from kai.planner.model import PLANNER_SYSTEM_PROMPT
+
+    match = re.search(
+        r"capability ids \(and nothing else\):\s*\[([^\]]+)\]",
+        PLANNER_SYSTEM_PROMPT,
+    )
+    assert match is not None, "prompt does not enumerate a capability vocabulary"
+    return {token.strip() for token in match.group(1).split(",") if token.strip()}
+
+
+def test_prompt_enumerates_the_canonical_capability_vocabulary() -> None:
+    """The prompt lists exactly the capabilities the domain validator allows.
+
+    Detects drift in both directions: a capability added to
+    ``ABSTRACT_CAPABILITIES`` without updating the prompt, or a stale id kept
+    in the prompt after the canonical set changes.
+    """
+    from kai.planner.service import ABSTRACT_CAPABILITIES
+
+    assert _prompt_capability_vocabulary() == set(ABSTRACT_CAPABILITIES)
+
+
+def test_prompt_forbids_invented_capabilities() -> None:
+    """The prompt tells the model not to invent capability names."""
+    from kai.planner.model import PLANNER_SYSTEM_PROMPT
+
+    assert "Never invent synonyms" in PLANNER_SYSTEM_PROMPT
+
+
+def test_prompt_requires_exact_criteria_copy() -> None:
+    """The prompt requires the task's criteria be copied, not rewritten.
+
+    Prompt-text only: it does not assert a model will always comply; the
+    executable guarantee stays ``domain_errors``.
+    """
+    from kai.planner.model import PLANNER_SYSTEM_PROMPT
+
+    assert "success_criteria MUST be copied exactly" in PLANNER_SYSTEM_PROMPT
+    for phrase in ("paraphrase", "same order", "unresolved_questions"):
+        assert phrase in PLANNER_SYSTEM_PROMPT
+
+
+def test_task_datablocks_supply_the_authoritative_criteria() -> None:
+    """The task's own criteria reach the model verbatim (never re-derived)."""
+    from kai.planner.service import _task_datablocks
+
+    rendered = _task_datablocks(_task())
+    for criterion in CRITERIA:
+        assert criterion in rendered
 
 
 # --- contract fidelity -----------------------------------------------------

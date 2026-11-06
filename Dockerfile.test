@@ -1,0 +1,21 @@
+FROM python:3.14-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+
+WORKDIR /app
+
+# Keep the production image lean: Chromium is installed only in this test image.
+COPY pyproject.toml README.md ./
+COPY src ./src
+COPY tests ./tests
+COPY alembic.ini ./
+COPY alembic ./alembic
+
+RUN pip install --no-cache-dir --upgrade pip \
+    && pip install --no-cache-dir -e ".[dev]" \
+    && python -m playwright install --with-deps chromium \
+    && rm -rf /var/lib/apt/lists/*
+
+CMD ["pytest", "-q", "-m", "db_guard_unit or no_db_unit"]

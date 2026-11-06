@@ -886,6 +886,211 @@ def _create_attempts(snapshot: dict) -> list[dict]:
     ]
 
 
+async def test_runtime_local_demo(
+    client: httpx.AsyncClient,
+    backend: GoogleBackend,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Print the governed success and ambiguous-recovery paths for a local demo."""
+    print("[KAI DEMO] GOOGLE: deterministic mock only; no live Google calls")
+    print(f"[KAI DEMO] INPUT goal={GOAL!r} timezone={TIMEZONE}")
+
+    token = await _register(client, "demo-success@example.com")
+    tenant_id, user_id = await _user_scope("demo-success@example.com")
+    await insert_account(
+        tenant_id=tenant_id,
+        user_id=user_id,
+        email="demo-success@example.com",
+        scopes=(
+            "openid email "
+            "https://www.googleapis.com/auth/calendar.events "
+            "https://www.googleapis.com/auth/contacts.readonly"
+        ),
+    )
+    await _seed_attendee_memory(tenant_id, user_id)
+
+    task_id, submitted = await _submit(client, token)
+    assert submitted["task_state"] == CREATED
+    print(f"[KAI DEMO] TASK created id={task_id} state={submitted['task_state']}")
+
+    waiting = await _trigger(client, token, task_id)
+    assert waiting["task_state"] == WAITING_APPROVAL
+    assert len(waiting["approval_ids"]) == 1
+    approval_id = waiting["approval_ids"][0]
+
+    plan_response = await client.get(
+        f"{API_PREFIX}/tasks/{task_id}/plan", headers=_auth(token)
+    )
+    assert plan_response.status_code == 200, plan_response.text
+    plan = plan_response.json()["plan"]
+    plan_steps = [step["action"] for step in plan["steps"]]
+    assert plan_steps
+    print(f"[KAI DEMO] PLAN accepted actions={plan_steps}")
+
+    approval_response = await client.get(
+        f"{API_PREFIX}/approvals/{approval_id}", headers=_auth(token)
+    )
+    assert approval_response.status_code == 200, approval_response.text
+    approval = approval_response.json()
+    assert approval["status"] == "PENDING"
+    assert approval["tool_name"] == "calendar.create_event"
+    print(
+        "[KAI DEMO] APPROVAL "
+        f"state={waiting['task_state']} id={approval_id} "
+        f"summary={approval['request_summary']!r}"
+    )
+
+    posts_before_approval = [
+        call for call in backend.calendar_calls if call.method == "POST"
+    ]
+    assert posts_before_approval == []
+    print(
+        "[KAI DEMO] EXECUTION calendar create POSTs before approval="
+        f"{len(posts_before_approval)}"
+    )
+
+    decision = await client.post(
+        f"{API_PREFIX}/approvals/{approval_id}/approve",
+        json={"reason": "approved for the local demo"},
+        headers=_auth(token),
+    )
+    assert decision.status_code == 200, decision.text
+    assert decision.json()["status"] == "APPROVED"
+    completed = await _trigger(client, token, task_id)
+    assert completed["task_state"] == COMPLETED
+    snapshot = await _inspect(client, token, task_id)
+    assert snapshot["task_state"] == COMPLETED
+    assert snapshot["next_action"] == "DONE"
+    print(
+        "[KAI DEMO] EXECUTION human approval recorded; "
+        f"runtime outcome={completed['outcome']}"
+    )
+    print(
+        "[KAI DEMO] EVIDENCE "
+        + repr(
+            [
+                {
+                    "tool": item["tool"],
+                    "outcome": item["outcome"],
+                    "ok": item["ok"],
+                    "verified": item["verified"],
+                }
+                for item in snapshot["evidence"]
+            ]
+        )
+    )
+    success_posts = [
+        call for call in backend.calendar_calls if call.method == "POST"
+    ]
+    assert len(success_posts) == 1
+    assert len(backend.created_events) == 1
+    print(
+        "[KAI DEMO] FINAL "
+        f"state={snapshot['task_state']} next_action={snapshot['next_action']} "
+        f"Google mock create POSTs={len(success_posts)}"
+    )
+
+    backend.calendar_calls.clear()
+    backend.created_events.clear()
+    backend.next_event_id = 1
+    print("[KAI DEMO] AMBIGUOUS OUTCOME starting separate mock scenario")
+    ambiguous_token, ambiguous_task_id, ambiguous_approval_id = await _ready_task(
+        client, "demo-ambiguous@example.com"
+    )
+    await _approve(client, ambiguous_token, ambiguous_approval_id)
+    before_crash = await _inspect(client, ambiguous_token, ambiguous_task_id)
+    before_row = await _row(ambiguous_task_id)
+    assert backend.created_events == {}
+    assert backend.next_event_id == 1
+
+    import sqlalchemy.ext.asyncio as sa_asyncio
+
+    real_commit = sa_asyncio.AsyncSession.commit
+    worker_died = False
+
+    async def _commit_after_google_accepts_write(
+        session: object, *args: object, **kwargs: object
+    ) -> None:
+        nonlocal worker_died
+        if not worker_died and backend.created_events:
+            worker_died = True
+            raise _ProcessDied("worker lost after the mock provider answered")
+        await real_commit(session, *args, **kwargs)
+
+    monkeypatch.setattr(
+        sa_asyncio.AsyncSession, "commit", _commit_after_google_accepts_write
+    )
+    with pytest.raises(BaseException) as crashed:
+        await _trigger(client, ambiguous_token, ambiguous_task_id)
+    assert _crashed(crashed.value), crashed.value
+    assert len(backend.created_events) == 1
+    assert backend.next_event_id == 2
+    print(
+        "[KAI DEMO] AMBIGUOUS OUTCOME Google mock accepted the write; "
+        "worker stopped before the receipt was persisted"
+    )
+
+    after_crash = await _inspect(client, ambiguous_token, ambiguous_task_id)
+    assert _create_attempts(after_crash) == _create_attempts(before_crash)
+    assert await _row(ambiguous_task_id) == before_row
+    monkeypatch.undo()
+
+    recovered = await _trigger(client, ambiguous_token, ambiguous_task_id)
+    assert recovered["task_state"] == REQUIRES_ATTENTION
+    assert "INDETERMINATE" in recovered["message"]
+    recovered_snapshot = await _inspect(
+        client, ambiguous_token, ambiguous_task_id
+    )
+    assert recovered_snapshot["task_state"] == REQUIRES_ATTENTION
+    create_evidence = _create_attempts(recovered_snapshot)
+    assert create_evidence
+    assert create_evidence[-1]["external_outcome"] == "UNKNOWN"
+    assert set(create_evidence[-1]) == {
+        "step_order",
+        "tool",
+        "outcome",
+        "ok",
+        "verified",
+        "error_code",
+        "request_id",
+        "ir_fingerprint",
+        "external_outcome",
+    }
+    assert ATTENDEE_EMAIL not in json.dumps(create_evidence)
+    print(
+        "[KAI DEMO] AMBIGUOUS OUTCOME "
+        f"evidence_external_outcome={create_evidence[-1]['external_outcome']} "
+        f"runtime_outcome={recovered['outcome']}"
+    )
+    print(
+        "[KAI DEMO] EVIDENCE ambiguous create="
+        f"{create_evidence[-1]!r}"
+    )
+    print(
+        "[KAI DEMO] FINAL "
+        f"state={recovered_snapshot['task_state']} "
+        f"message={recovered['message']!r}"
+    )
+
+    replay = await client.post(
+        f"{API_PREFIX}/runtime/tasks/{ambiguous_task_id}/trigger",
+        headers=_auth(ambiguous_token),
+    )
+    assert replay.status_code == 409, replay.text
+    ambiguous_posts = [
+        call for call in backend.calendar_calls if call.method == "POST"
+    ]
+    assert len(ambiguous_posts) == 1
+    assert backend.next_event_id == 2
+    assert len(backend.created_events) == 1
+    print(
+        "[KAI DEMO] AMBIGUOUS OUTCOME "
+        f"replay_http={replay.status_code} "
+        f"total_mock_create_POSTs={len(ambiguous_posts)} "
+        "no second write dispatched"
+    )
+
+
 @contextmanager
 def _recorded_task_transitions() -> Iterator[list[str]]:
     """Record every real ``Task.state`` write, whoever performs it."""
@@ -3381,8 +3586,15 @@ async def test_trigger_rejects_unknown_task(client: httpx.AsyncClient) -> None:
 # ----------------------------------------------------------------------------------
 
 REVISION_PREV = "d1a2b3c4e5f6"
-# The repository head, which moves as later rounds add migrations.
-REVISION_HEAD = "e6f7a8b9c0d1"
+# The head of the *deliverable* migration chain. It is pinned explicitly rather
+# than read via ``migration_harness.current_head()``: that helper calls
+# ``ScriptDirectory.get_current_head()``, which raises as soon as the script
+# directory has more than one head. A working tree that still carries the
+# untracked, unapproved ``b2f7c1d9e4a6`` (deferred Google linking) has exactly
+# that shape, because ``a7c9e1f3b5d2`` now chains off the tracked
+# ``e6f7a8b9c0d1`` instead of off it. The assertion below only cares that
+# downgrade -> upgrade is clean and that this head is applied.
+REVISION_HEAD = "a7c9e1f3b5d2"
 
 
 def _alembic(target_url: str, *args: str) -> subprocess.CompletedProcess[str]:

@@ -6,13 +6,15 @@
 - ``GET /tasks/{task_id}/plan`` returns the latest accepted proposal (or one
   exact version via ``?version=`` for audit, including superseded rows).
 
-Errors map to: 404 unknown task / 409 wrong state or rejected plan / 502 model
-unavailable. Replanning versioned, never silently replaced.
+Errors map to: 404 unknown task / 409 wrong state, rejected plan, or unresolved
+runtime identities / 502 model unavailable. Replanning versioned, never silently
+replaced.
 """
 
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from kai.auth.deps import get_current_user
@@ -29,7 +31,8 @@ from kai.planner.service import (
     PlanNotFoundError,
     PlanRejectedError,
 )
-from kai.tasks.service import TaskNotFoundError
+from kai.runtime.models import RuntimeExecution
+from kai.tasks.service import TaskNotFoundError, get_task
 
 router = APIRouter(prefix="/tasks", tags=["planner"])
 
@@ -47,6 +50,58 @@ def _to_response(plan: TaskPlan) -> PlanResponse:
     )
 
 
+async def _runtime_identities_missing(
+    session: AsyncSession, *, task_id: UUID, tenant_id: UUID
+) -> bool:
+    """True only when this tenant's runtime execution exists with no identities.
+
+    The lookup mirrors ``AgentRuntime._load_execution`` exactly: the same two
+    predicates (``task_id`` and ``tenant_id``) and ``scalar_one_or_none``. A task
+    submitted through the Agent Runtime owns one ``RuntimeExecution`` row; a task
+    created directly through the task API owns none, so standalone planning is
+    unaffected.
+
+    The three persisted states this guard has to distinguish:
+
+    * W1 -- ``scenario IS NULL`` and empty identities. Nothing has been resolved
+      yet; the Runtime must remain able to run understanding and identity.
+    * W2 -- a scenario is persisted but identities are still empty. The Runtime
+      must remain able to resume at its identity stage.
+    * W3 -- identities are already persisted and the task is not yet PLANNING.
+      This must **not** be rejected: the identity set is durable, so the
+      existing planning flow (with its own state and validation gates) runs.
+
+    The check is presence-only. It never writes the execution row, transitions
+    the task, or resolves/filters/promotes identities.
+
+    Callers must establish that the requesting user may access the task first:
+    this function answers only whether that authorized task's identity set is
+    durable, and its answer must never be observable for a task the caller
+    cannot access.
+    """
+    result = await session.execute(
+        select(RuntimeExecution).where(
+            RuntimeExecution.task_id == task_id,
+            RuntimeExecution.tenant_id == tenant_id,
+        )
+    )
+    row = result.scalar_one_or_none()
+    return row is not None and not row.identities
+
+
+def _refuse_unresolved_identities(task_id: UUID) -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail={
+            "error": (
+                "planning cannot proceed until the runtime's identity-resolution "
+                "stage has produced and persisted the task's identity set"
+            ),
+            "current_task_id": str(task_id),
+        },
+    )
+
+
 @router.post("/{task_id}/plan", response_model=PlanResponse, status_code=201)
 async def plan_create(
     task_id: UUID,
@@ -57,6 +112,30 @@ async def plan_create(
     """Generate + validate + persist a plan proposal for one task."""
     service = PlannerService(model)
     try:
+        # Authorize first, inspect identity state second, plan third. The
+        # canonical lookup scopes by (tenant, user, task) and raises the same
+        # TaskNotFoundError for an unknown task and for one this caller may not
+        # access, so the identity guard below can never turn an authorization
+        # failure into a 409 that discloses the target's lifecycle state. This
+        # is a separate scoped read from the one ``create_plan`` performs:
+        # reusing the platform's access-control predicate is worth one indexed
+        # lookup, and duplicating its predicates here would be worse.
+        await get_task(
+            session,
+            task_id=task_id,
+            tenant_id=current.tenant_id,
+            user_id=current.id,
+        )
+
+        # Refuse before any plan is created, so no model call is made and no
+        # TaskPlan row is written for an authorized runtime task whose
+        # identities are not yet durable. See ``_runtime_identities_missing``
+        # for W1/W2/W3.
+        if await _runtime_identities_missing(
+            session, task_id=task_id, tenant_id=current.tenant_id
+        ):
+            raise _refuse_unresolved_identities(task_id)
+
         plan = await service.create_plan(
             session,
             task_id=task_id,

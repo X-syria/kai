@@ -38,7 +38,9 @@ from kai.gmail.service import (
 from kai.gmail.service import (
     search_messages as service_search_messages,
 )
+from kai.google.client import GoogleOAuthError
 from kai.google.deps import get_google_http_client
+from kai.google.service import GOOGLE_RECONNECT_DETAIL, GoogleReconnectRequiredError
 
 router = APIRouter(prefix="/gmail", tags=["gmail"])
 
@@ -114,6 +116,16 @@ async def gmail_search(
             query=q,
             max_results=max_results,
         )
+    except GoogleReconnectRequiredError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=GOOGLE_RECONNECT_DETAIL,
+        ) from exc
+    except GoogleOAuthError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="google provider temporarily unavailable",
+        ) from exc
     except GoogleInvalidTokenError as exc:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED, detail=str(exc)
@@ -150,6 +162,16 @@ async def gmail_read(
             tenant_id=current.tenant_id,
             message_id=message_id,
         )
+    except GoogleReconnectRequiredError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=GOOGLE_RECONNECT_DETAIL,
+        ) from exc
+    except GoogleOAuthError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="google provider temporarily unavailable",
+        ) from exc
     except GoogleInvalidTokenError as exc:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED, detail=str(exc)

@@ -71,6 +71,7 @@ from kai.ir.build import (
     allowed_capabilities_from_task,
     permission_for,
     risk_from_policy,
+    steps_from_plan,
 )
 from kai.planner.schemas import PlanBranch, PlanCondition, PlanProposal
 from kai.policy.engine import PolicyEngine
@@ -2565,3 +2566,29 @@ def test_recording_an_execution_never_changes_the_programs_identity() -> None:
     assert "observations" not in ran.canonical_form()
     assert "errors" not in ran.canonical_form()
     assert "result" not in ran.canonical_form()
+
+
+def test_steps_from_plan_copies_inputs_verbatim() -> None:
+    """``inputs`` is carried into the IR unchanged — never reinterpreted.
+
+    It stays an inert declarative annotation on ``StepNode`` (not tool
+    arguments): the copy is verbatim and order-preserving, and an empty list
+    stays empty.
+    """
+    proposal = _proposal()  # PLAN_JSON steps declare inputs ["sara"], ["slot"]
+    nodes = steps_from_plan(proposal)
+    assert [node.inputs for node in nodes] == [["sara"], ["slot"]]
+    assert nodes[0].inputs == list(proposal.steps[0].inputs)
+
+    empty = _proposal(
+        steps=[
+            {
+                "step_id": "s1",
+                "order": 1,
+                "action": "read_calendar",
+                "purpose": "find availability",
+                "inputs": [],
+            }
+        ]
+    )
+    assert steps_from_plan(empty)[0].inputs == []

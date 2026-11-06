@@ -8,6 +8,7 @@ from kai.api.metrics import build_metrics_router
 from kai.api.router import api_router
 from kai.config import get_settings
 from kai.db.engine import engine
+from kai.demo import router as demo_router
 from kai.logging import configure_logging, get_logger
 from kai.middleware import RequestContextMiddleware
 from kai.observability import metrics
@@ -78,6 +79,7 @@ def create_app() -> FastAPI:
         # The ignore is that library variance gap, not a loose call here.
         app.add_middleware(middleware_cls, **middleware_kwargs)  # type: ignore[arg-type]
     app.include_router(api_router)
+    _mount_demo_ui(app)
     _mount_metrics(app)
     # Installed last of all, so it is the outermost layer, and built after every
     # router is mounted so the route table it labels against is complete.
@@ -107,6 +109,24 @@ def _route_table(app: FastAPI) -> RouteTable:
     if get_settings().metrics_enabled:
         templates.add(get_settings().metrics_path)
     return build_route_table(templates)
+
+
+def _mount_demo_ui(app: FastAPI) -> None:
+    """Serve the approval demo page only when the operator opted in.
+
+    The page is unauthenticated HTML that drives the ordinary authenticated API
+    from a browser. Mounting it by default would put an evaluation surface in
+    every deployment, so the router is registered only when
+    ``DEMO_UI_ENABLED`` is true. When it is off the path does not exist at all
+    (404), which is stronger than returning an error from a mounted route: it
+    keeps ``/demo`` out of the route table entirely.
+    """
+    settings = get_settings()
+    if not settings.demo_ui_enabled:
+        _log.info("demo_ui_disabled", reason="DEMO_UI_ENABLED is false")
+        return
+    app.include_router(demo_router)
+    _log.info("demo_ui_enabled", path="/demo")
 
 
 def _mount_metrics(app: FastAPI) -> None:

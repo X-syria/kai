@@ -1,0 +1,16 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugins": ["@upstash/context7-opencode"],
+  "mcp": {
+    "servers": {
+      "github-readonly": {
+        "type": "remote",
+        "url": "https://api.githubcopilot.com/mcp/readonly",
+        "headers": {
+          "X-MCP-Toolsets": "repos,issues,pull_requests",
+          "X-MCP-Readonly": "true"
+        }
+      }
+    }
+  }
+}

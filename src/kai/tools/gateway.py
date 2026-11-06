@@ -29,7 +29,9 @@ Pipeline (in order, from :mod:`kai.tools` design):
 12. ``consume single use`` — the APPROVED approval's one executor slot is
     claimed by an atomic compare-and-set (exact intent hash, APPROVED status,
     not expired, not already consumed all in one statement), so concurrent
-    duplicate attempts can never both execute.
+    duplicate attempts can never both execute. Immediately before that claim,
+    one INTENT attempt row is added to the caller's session (O1-B; see
+    ``_record_intent_attempt`` for what it does and does not prove).
 13. ``execute`` — the registered executor (adapter) talks to the provider.
 14. ``verify`` — the tool's declared ``VerificationContract`` is re-asserted by
     the verification boundary; unverified executions are never reported as
@@ -48,6 +50,7 @@ from typing import Any, Final
 import structlog
 
 from kai.approvals.errors import ApprovalError
+from kai.db.models import IntentAttempt
 from kai.identity.models import IdentityStatus as ResolvedIdentityStatus
 from kai.logging import get_logger
 from kai.policy.models import IdentityStatus, PolicyDecisionKind, PolicyInput
@@ -198,6 +201,16 @@ class ToolGateway:
                 policy.decision is PolicyDecisionKind.REQUIRE_APPROVAL
                 and approved_approval_id is not None
             ):
+                # O1-B: record the INTENT attempt before the single use is
+                # claimed. See ``_record_intent_attempt`` for the exact limit of
+                # that record (it is not proof of durability, of consumption, or
+                # of any external effect).
+                self._record_intent_attempt(
+                    context=context,
+                    tool=tool,
+                    arguments=arguments,
+                    approval_id=approved_approval_id,
+                )
                 await self.approval_manager.consume(
                     approval_id=approved_approval_id,
                     intent=intent,
@@ -272,6 +285,72 @@ class ToolGateway:
 
         self._audit(intent, tool, result)
         return result
+
+    def _record_intent_attempt(
+        self,
+        *,
+        context: ToolContext,
+        tool: ToolDefinition,
+        arguments: Mapping[str, Any],
+        approval_id: uuid.UUID,
+    ) -> None:
+        """Add one INTENT attempt row to the caller's session, before consume.
+
+        This is the whole of O1-B, and it is deliberately smaller than it looks:
+
+        * ``session.add`` on ``context.session`` -- the caller's session, the
+          same one ``consume`` and the executor use. There is no second session,
+          no ``commit``, no ``flush``, no savepoint. Adding an independent
+          commit here would be a different change (durability *before* the
+          single use is claimed) and is explicitly not what this does.
+        * Consequently the row is **not** durable when ``consume`` starts. It
+          becomes durable at the next commit of that session, which today is the
+          commit inside :meth:`kai.approvals.service.ApprovalService.consume`.
+        * If that commit path is the compare-and-set **failure** path, the row
+          still commits while **that attempt** did not consume the approval
+          (``approvals/service.py``) -- and a concurrent attempt may have
+          consumed it since. So a durable row here does not mean "the approval
+          was used": the two are not atomic, and "both or nothing" must not be
+          claimed. Conversely, an error or crash before that commit loses the
+          row entirely -- it is not a write-ahead log.
+        * After a CAS failure the approval must not be assumed intact; a
+          concurrent attempt may have consumed it. Re-read if its state matters.
+        * The row says an attempt was *about to* claim an exact intent. It says
+          nothing about whether an external effect occurred, whether one is
+          permitted, or whether a retry is safe. Reading it as any of those is
+          wrong.
+
+        ``intent_hash`` is recomputed with the same canonical function the
+        approval storage and ``consume`` use, so the record is bound to the same
+        digest the approval was decided on rather than to a copy.
+
+        Only the in-memory ``add`` happens here. If it raised, the existing
+        generic handler maps it to ``INTERNAL_ERROR`` and the approval is never
+        consumed -- no new branch is introduced for it.
+        """
+        # Imported here, not at module scope: ``kai.approvals.service`` imports
+        # ``kai.tools.boundaries``, so a module-level import would close the
+        # cycle ``approvals.service -> tools.boundaries -> tools.gateway ->
+        # approvals.service`` whenever the approvals package is the entry point
+        # (e.g. ``kai.api.approvals``). Resolving it at call time reuses the one
+        # canonical digest function instead of duplicating it.
+        from kai.approvals.service import intent_hash
+
+        context.session.add(
+            IntentAttempt(
+                tenant_id=context.tenant_id,
+                user_id=context.user_id,
+                task_id=context.task_id,
+                approval_id=approval_id,
+                tool_name=tool.name,
+                intent_hash=intent_hash(
+                    tool=tool,
+                    arguments=arguments,
+                    account_id=context.account_id,
+                ),
+                account_id=context.account_id,
+            )
+        )
 
     async def _authenticate(self, context: ToolContext) -> Task:
         try:

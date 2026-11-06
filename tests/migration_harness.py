@@ -40,6 +40,7 @@ _EXPECTED_TABLES = (
     "runtime_executions",
     "approvals",
     "alerts",
+    "google_oauth_pending",
 )
 
 

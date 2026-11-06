@@ -43,6 +43,14 @@ the canonical reference above.
   `google_oauth_access_token_minutes` setting has no consumer, and there is
   deliberately no 401 retry.
 
+> **Temporary containment (D37):** live Google account linking is disabled.
+> `/auth/google/connect` and `/auth/google/callback` return 503; there is no
+> environment or settings switch that re-enables them. Existing linked accounts,
+> account listing, and Calendar/Gmail/Contacts token use are unchanged. Tests
+> using the deterministic Google stub opt in only through their test fixture.
+> This is not an H1 closure: re-enabling requires a reviewed identity-confirmation
+> flow (D36/B+C).
+
 ## Prerequisites
 
 - Docker + Docker Compose
@@ -93,7 +101,10 @@ $env:DATABASE_URL = "postgresql+asyncpg://kai:<password>@127.0.0.1:5432/kai"
 alembic upgrade head
 
 # 5. Run
-uvicorn kai.main:app --reload
+#    --no-access-log: the Google OAuth callback carries ``code`` and ``state`` in
+#    its query string, and the default access log would persist both. This
+#    disables access logging for the whole dev process, not OAuth alone.
+uvicorn kai.main:app --reload --no-access-log
 ```
 
 `alembic/env.py` refuses to run when `DATABASE_URL` is absent instead of falling

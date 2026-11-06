@@ -28,6 +28,38 @@ class GoogleOAuthError(RuntimeError):
     """Raised when the Google transport rejects an OAuth operation."""
 
 
+class GoogleTokenRequestError(GoogleOAuthError):
+    """A token-endpoint rejection, carrying Google's bounded error code.
+
+    The message is for local diagnosis only. ``error_code`` and ``status_code``
+    exist so the credential authority can tell a permanent rejection (the grant
+    is gone; the user must reconnect) from a transient one (Google is unhealthy
+    or unreachable) without parsing the message text.
+    """
+
+    def __init__(
+        self, message: str, *, status_code: int, error_code: str
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.error_code = error_code
+
+
+#: Token-endpoint error codes that mean the stored refresh token is dead and no
+#: retry can help. Google answers ``invalid_grant`` for an expired or revoked
+#: refresh token; anything else (5xx, ``invalid_client``, a transport failure)
+#: is not evidence about the user's grant and must stay retryable.
+PERMANENT_REFRESH_REJECTION_CODES: frozenset[str] = frozenset({"invalid_grant"})
+
+
+def is_permanent_refresh_rejection(exc: GoogleOAuthError) -> bool:
+    """Return whether ``exc`` means the stored refresh token can never be used."""
+    return (
+        isinstance(exc, GoogleTokenRequestError)
+        and exc.error_code in PERMANENT_REFRESH_REJECTION_CODES
+    )
+
+
 @dataclass(frozen=True)
 class TokenData:
     """Successful token response from the OAuth token endpoint."""
@@ -35,6 +67,7 @@ class TokenData:
     access_token: str
     refresh_token: str | None
     expires_in: int
+    scope: str | None = None
 
 
 @dataclass(frozen=True)
@@ -46,11 +79,21 @@ class UserInfo:
     email_verified: bool
 
 
-def build_authorization_url(*, scopes: list[str], redirect_uri: str, state: str) -> str:
+def build_authorization_url(
+    *,
+    scopes: list[str],
+    redirect_uri: str,
+    state: str,
+    code_challenge: str,
+) -> str:
     """Build the browser-facing authorization URL.
 
     ``access_type=offline`` is required for Google to issue a refresh token;
     identity-only scopes are always enforced by the caller, never widened here.
+
+    ``code_challenge`` is mandatory: every browser flow uses PKCE S256, so there
+    is no code path that can mint an authorization URL without a challenge.
+    The verifier itself never appears here.
     """
     settings = get_settings()
     if not settings.google_oauth_client_id:
@@ -62,6 +105,8 @@ def build_authorization_url(*, scopes: list[str], redirect_uri: str, state: str)
         "scope": " ".join(scopes),
         "access_type": "offline",
         "state": state,
+        "code_challenge": code_challenge,
+        "code_challenge_method": "S256",
     }
     return f"{AUTHORIZATION_URL}?{urlencode(params)}"
 
@@ -71,25 +116,43 @@ def _parse_token_response(resp: httpx.Response) -> TokenData:
         error_code = "unknown"
         with contextlib.suppress(ValueError):
             error_code = str(resp.json().get("error") or "unknown")
-        raise GoogleOAuthError(
-            f"google token request failed ({resp.status_code}: {error_code})"
+        raise GoogleTokenRequestError(
+            f"google token request failed ({resp.status_code}: {error_code})",
+            status_code=resp.status_code,
+            error_code=error_code,
         )
     payload = resp.json()
     access_token = payload.get("access_token")
     if not access_token:
         raise GoogleOAuthError("google token response is missing access_token")
     refresh_token = payload.get("refresh_token")
+    raw_scope = payload.get("scope")
+    if raw_scope is None:
+        scope = None
+    elif isinstance(raw_scope, str) and raw_scope.strip():
+        scope = raw_scope.strip()
+    else:
+        raise GoogleOAuthError("google token response has an invalid scope")
     return TokenData(
         access_token=access_token,
         refresh_token=str(refresh_token) if refresh_token else None,
         expires_in=int(payload.get("expires_in") or 0),
+        scope=scope,
     )
 
 
 async def exchange_code(
-    transport: httpx.AsyncClient, *, code: str, redirect_uri: str
+    transport: httpx.AsyncClient,
+    *,
+    code: str,
+    redirect_uri: str,
+    code_verifier: str,
 ) -> TokenData:
-    """Exchange an authorization code for tokens."""
+    """Exchange an authorization code for tokens.
+
+    ``code_verifier`` is required, so an exchange cannot be attempted without
+    the PKCE proof. It is sent in the request body only, never in a URL.
+    """
     settings = get_settings()
     with provider_call(provider=metrics.PROVIDER_GOOGLE, operation="oauth_exchange_code"):
         resp = await transport.post(
@@ -100,6 +163,7 @@ async def exchange_code(
                 "client_id": settings.google_oauth_client_id,
                 "client_secret": settings.google_oauth_client_secret,
                 "redirect_uri": redirect_uri,
+                "code_verifier": code_verifier,
             },
         )
         return _parse_token_response(resp)
@@ -111,15 +175,21 @@ async def refresh_access_token(
     """Exchange a refresh token for a fresh access token."""
     settings = get_settings()
     with provider_call(provider=metrics.PROVIDER_GOOGLE, operation="oauth_refresh"):
-        resp = await transport.post(
-            TOKEN_URL,
-            data={
-                "grant_type": "refresh_token",
-                "refresh_token": refresh_token,
-                "client_id": settings.google_oauth_client_id,
-                "client_secret": settings.google_oauth_client_secret,
-            },
-        )
+        try:
+            resp = await transport.post(
+                TOKEN_URL,
+                data={
+                    "grant_type": "refresh_token",
+                    "refresh_token": refresh_token,
+                    "client_id": settings.google_oauth_client_id,
+                    "client_secret": settings.google_oauth_client_secret,
+                },
+            )
+        except httpx.HTTPError as exc:
+            # A network failure says nothing about the user's grant. It must
+            # surface as a transient provider failure so the caller never turns
+            # it into "reconnect required".
+            raise GoogleOAuthError("google token endpoint is unreachable") from exc
         return _parse_token_response(resp)
 
 

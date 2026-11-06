@@ -180,6 +180,13 @@ _RESUMABLE_STATES: frozenset[str] = frozenset(
     }
 )
 
+#: States in which the durable identity set may legitimately still be empty.
+#: The runtime resolves identities exactly once, between UNDERSTANDING and
+#: PLANNING (W1/W2); every later state must already carry the set its plan and
+#: evidence were built from. ``CREATED`` is pre-identity: stage 1 moves it to
+#: ``UNDERSTANDING`` before anything is resolved.
+_PRE_IDENTITY_STATES: frozenset[str] = frozenset({CREATED, UNDERSTANDING})
+
 #: States where the runtime is blocked on somebody else, so triggering the task
 #: again would achieve nothing. ``WAITING_APPROVAL`` is not one of them: an
 #: approval that is already settled leaves the task able to move on.
@@ -516,6 +523,29 @@ class AgentRuntime:
             else None
         )
 
+        # Lifecycle integrity -- W1/W2 are the only windows where identities may
+        # still be empty. An advanced state already has a plan and possibly
+        # evidence; re-resolving identity there would let it silently acquire an
+        # identity those durable facts were never bound to. The refusal is
+        # governed: nothing is re-resolved, rewound, or re-executed.
+        if not is_prepare and task.state not in _PRE_IDENTITY_STATES:
+            refusal = _advanced_state_prerequisite_error(
+                task_state=task.state,
+                scenario=scenario,
+                execution=row,
+            )
+            if refusal is not None:
+                # Work on record means a human has to decide what the task means
+                # now, so the evidence and cursor are kept exactly as they are.
+                # A task that never ran is simply failed.
+                if row.cursor > 0 or row.evidence or row.steps_used > 0:
+                    return await self._halt(
+                        session, task, refusal, steps_used=row.steps_used
+                    )
+                return await self._fail(
+                    session, task, refusal, steps_used=row.steps_used
+                )
+
         # A task that died between the VERIFYING transition and its outcome is
         # finished here rather than re-run. The verdict is a pure function of
         # the scenario, the identities, and the evidence, all of which are
@@ -590,7 +620,15 @@ class AgentRuntime:
         # resolve and no identity gate to pass. The guard that reads and writes
         # the identity row is unchanged for every profile that does name guests.
         if not is_prepare:
-            assert scenario is not None
+            if scenario is None:
+                # Unreachable after the lifecycle guard above: only CREATED and
+                # UNDERSTANDING reach this point without a scenario, and stage 1
+                # has just resolved it. Kept as a governed refusal rather than
+                # an ``assert`` so no lifecycle corruption can surface as an
+                # ``AssertionError``.
+                return await self._fail(
+                    session, task, "cannot plan: no understanding on record"
+                )
             assert account is not None
             if not row.identities:
                 await self._fence_execution(
@@ -767,10 +805,16 @@ class AgentRuntime:
             resolved = await resolver.resolve(query=query, context=context)
             if resolved.status not in _POSITIVE_IDENTITY:
                 raise RuntimeFatal(f"attendee identity not established: {guest}")
+            # A positive verdict establishes *who*, not *where*: the row may only
+            # carry the address the resolver itself returned. Falling back to the
+            # memory hint here would persist an address the resolver never named,
+            # so a positive result without one is a refusal, not a partial row.
+            if resolved.email is None or not resolved.email.strip():
+                raise RuntimeFatal(f"attendee address not established: {guest}")
             results.append(
                 {
                     "name": guest,
-                    "email": resolved.email or email or "",
+                    "email": resolved.email,
                     "status": resolved.status.value,
                     "confidence": resolved.confidence,
                 }
@@ -1626,6 +1670,40 @@ def _plan_diverged(bound_version: int | None, current_version: int) -> str:
         f"{bound_version}, current plan is v{current_version}); the saved cursor "
         "was not reused and no step was executed"
     )
+
+
+def _advanced_state_prerequisite_error(
+    *,
+    task_state: str,
+    scenario: UnderstandingOutput | None,
+    execution: RuntimeExecution,
+) -> str | None:
+    """Why an advanced task cannot be driven from its durable state, if it cannot.
+
+    ``None`` means both prerequisites an advanced state relies on are on record.
+    Identity resolution is a pre-planning stage: the runtime resolves the guests
+    exactly once, while the task is in ``UNDERSTANDING``. Replaying it from an
+    advanced state would bind a new identity to a plan and to evidence that were
+    sealed without it, so a missing prerequisite there is a refusal rather than
+    work to redo.
+
+    The check is presence-only, deliberately: this module does not classify
+    persisted identity statuses, and the fulfillment criteria own what a sealed
+    identity set means.
+    """
+    if scenario is None:
+        return (
+            f"cannot resume a task in {task_state}: no understanding on record; "
+            "the understanding is resolved before planning and is not replayed "
+            "from an advanced state"
+        )
+    if not execution.identities:
+        return (
+            f"cannot resume a task in {task_state}: no runtime identities on "
+            "record; identity resolution must complete before the task leaves "
+            "UNDERSTANDING and is not replayed from an advanced state"
+        )
+    return None
 
 
 def _control_facts(

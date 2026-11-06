@@ -1,0 +1,40 @@
+# Repository metadata and local state
+.git
+.gitignore
+.github
+.opencode
+
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+
+# Python environments and caches
+.venv
+venv
+__pycache__
+*.py[cod]
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.coverage
+htmlcov
+
+# Build and review artifacts
+dist
+build
+*.egg-info
+*.log
+*.sqlite
+*.db
+*.dump
+kai_review
+
+# Editor and OS noise
+.vscode
+.idea
+.DS_Store
+Thumbs.db

@@ -24,7 +24,9 @@ from kai.contacts.models import Contact
 from kai.contacts.service import AccountNotFoundError, list_contacts, match_contacts
 from kai.db.engine import get_session
 from kai.db.models import GoogleAccount, User
+from kai.google.client import GoogleOAuthError
 from kai.google.deps import get_google_http_client
+from kai.google.service import GOOGLE_RECONNECT_DETAIL, GoogleReconnectRequiredError
 
 router = APIRouter(prefix="/contacts", tags=["contacts"])
 
@@ -77,6 +79,16 @@ async def google_contacts(
     except AccountNotFoundError as exc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)
+        ) from exc
+    except GoogleReconnectRequiredError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=GOOGLE_RECONNECT_DETAIL,
+        ) from exc
+    except GoogleOAuthError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="google provider temporarily unavailable",
         ) from exc
     except GoogleInvalidTokenError as exc:
         raise HTTPException(

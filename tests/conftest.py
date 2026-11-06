@@ -13,7 +13,7 @@ whole run, so pooled asyncpg connections are never handed to a closed loop.
 from __future__ import annotations
 
 import os
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterator
 from typing import Final
 
 import httpx
@@ -153,6 +153,11 @@ def pytest_configure(config: pytest.Config) -> None:
     )
     config.addinivalue_line(
         "markers",
+        "no_db_unit: pure unit tests that never open a database connection;"
+        " the autouse state fixture yields without checking or truncating",
+    )
+    config.addinivalue_line(
+        "markers",
         f"{MIGRATION_MARKER}: Alembic migration tests that run only against"
         " the per-run migration database; no normal-suite truncation",
     )
@@ -192,16 +197,31 @@ def pytest_collection_modifyitems(
 
 
 @pytest.fixture
-def google_settings(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Give every Google/Contacts test a deterministic OAuth configuration."""
+def google_settings(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Give every Google/Contacts test a deterministic OAuth configuration.
+
+    D37: production ``/connect`` and ``/callback`` are fail-closed behind
+    ``google_oauth_linking_guard`` and have no environment switch. Tests that
+    use the deterministic Google stub opt in *here only* by overriding that
+    dependency; the override is removed when the fixture tears down. Keeping
+    the opt-in in this fixture, rather than in an environment variable, means a
+    production or developer shell cannot enable linking by inheriting one.
+    """
     monkeypatch.setenv("GOOGLE_OAUTH_CLIENT_ID", "test-client-id")
     monkeypatch.setenv("GOOGLE_OAUTH_CLIENT_SECRET", "test-client-secret")
     monkeypatch.setenv(
-        "GOOGLE_OAUTH_REDIRECT_URI", "http://testserver/api/v1/auth/google/callback"
+        "GOOGLE_OAUTH_REDIRECT_URI", "https://testserver/api/v1/auth/google/callback"
     )
     get_settings.cache_clear()
-    yield
-    get_settings.cache_clear()
+
+    from kai.api.google import google_oauth_linking_guard
+
+    app.dependency_overrides[google_oauth_linking_guard] = lambda: None
+    try:
+        yield
+    finally:
+        app.dependency_overrides.pop(google_oauth_linking_guard, None)
+        get_settings.cache_clear()
 
 
 @pytest_asyncio.fixture(autouse=True)
@@ -220,8 +240,9 @@ async def _reset_rate_limits() -> AsyncIterator[None]:
 
 
 _TRUNCATE_SQL: Final = (
-    "TRUNCATE TABLE tenants, users, google_accounts, tasks, task_plans,"
-    " approvals, approval_rule_suggestions, runtime_executions,"
+    "TRUNCATE TABLE tenants, users, google_accounts, google_oauth_pending,"
+    " tasks, task_plans,"
+    " approvals, approval_rule_suggestions, intent_attempts, runtime_executions,"
     " memory_entries,"
     " memory_preferences, revoked_tokens,"
     " alerts, alert_dispatcher_state"
@@ -264,10 +285,12 @@ async def _clean_state(request: pytest.FixtureRequest) -> AsyncIterator[None]:
 
     Delegates to :func:`_clean_state_cycle`. Tests marked ``db_guard_unit``
     never touch the database, so the fixture yields immediately without
-    checking or truncating.
+    checking or truncating. Tests marked ``no_db_unit`` make the same promise
+    for the same reason, while keeping the guard's own marker meaning intact.
     """
     if (
         request.node.get_closest_marker("db_guard_unit") is not None
+        or request.node.get_closest_marker("no_db_unit") is not None
         or request.node.get_closest_marker(MIGRATION_MARKER) is not None
     ):
         yield
@@ -285,7 +308,10 @@ async def client() -> AsyncIterator[httpx.AsyncClient]:
     """
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(
-        transport=transport, base_url="http://testserver"
+        # OAuth binding and pending cookies are deliberately Secure in the
+        # application. The test client therefore needs a secure origin too;
+        # changing the cookie policy would weaken the production contract.
+        transport=transport, base_url="https://testserver"
     ) as c:
         yield c
 

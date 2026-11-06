@@ -63,6 +63,7 @@ from contextlib import contextmanager
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Any, Final
+from unittest.mock import patch
 from uuid import uuid4
 
 import httpx
@@ -72,7 +73,11 @@ from sqlalchemy import event
 from kai.identity import IdentityStatus
 from kai.memory.models import MemoryType
 from kai.memory.service import create_memory
-from kai.planner.service import PlanNotFoundError
+from kai.planner.service import (
+    PlannerService,
+    PlanNotAllowedError,
+    PlanNotFoundError,
+)
 from kai.runtime.models import RuntimeExecution
 from kai.runtime.schemas import MeetingWindow
 from kai.runtime.service import (
@@ -100,6 +105,47 @@ MODELS: Final = "src/kai/runtime/models.py"
 API: Final = "src/kai/api/runtime.py"
 SCAN_ROOTS: Final = (REPO / "src", REPO / "alembic")
 COLUMN: Final = "identities"
+
+#: The head of the *deliverable* migration chain: the last revision this branch
+#: actually ships. Local, unapproved work may add heads beside it; those are named
+#: in ``_LOCAL_ONLY_REVISIONS`` so they are declared here instead of silently
+#: ignored, and so the guard keeps working in a clean delivery tree where they are
+#: absent.
+DELIVERY_HEAD: Final = "a7c9e1f3b5d2"
+_LOCAL_ONLY_REVISIONS: Final = frozenset({"b2f7c1d9e4a6"})
+
+#: 14 revisions tracked on the branch, plus ``a7c9e1f3b5d2_add_intent_attempts``.
+DELIVERY_CHAIN_LENGTH: Final = 15
+
+
+def _delivery_chain() -> tuple[str, ...]:
+    """Return the revisions of the deliverable chain, newest first.
+
+    Counting ``*.py`` files cannot tell the deliverable chain from unrelated local
+    work, and it does not prove the files form a chain at all. This walks the chain
+    from ``base`` to :data:`DELIVERY_HEAD` through Alembic's own revision map, then
+    requires every revision on disk to be either on that chain or declared
+    local-only. An *unexpected* migration therefore still fails the guard, whether
+    it joins the chain (the length changes) or dangles off it (it is off-chain and
+    undeclared).
+    """
+    from alembic.config import Config
+    from alembic.script import ScriptDirectory
+
+    script = ScriptDirectory.from_config(Config(str(REPO / "alembic.ini")))
+    chain = tuple(
+        rev.revision for rev in script.walk_revisions("base", DELIVERY_HEAD)
+    )
+    every_revision = {
+        rev.revision for rev in script.walk_revisions("base", "heads")
+    }
+    undeclared = every_revision - set(chain) - _LOCAL_ONLY_REVISIONS
+    assert undeclared == set(), (
+        f"migration(s) off the deliverable chain and not declared local-only: {sorted(undeclared)}"
+    )
+    undeclared_heads = set(script.get_heads()) - {DELIVERY_HEAD} - _LOCAL_ONLY_REVISIONS
+    assert undeclared_heads == set(), f"undeclared migration head(s): {sorted(undeclared_heads)}"
+    return chain
 
 GUEST: Final = "Alice"
 ALICE: Final = "alice@example.com"
@@ -497,13 +543,15 @@ def test_no_dml_or_setattr_path_can_write_the_column() -> None:
     assert offenders == [], f"a DML path names the column: {offenders}"
 
     migrations = sorted((REPO / "alembic" / "versions").glob("*.py"))
-    # 14 = the original 11 plus ``d4e5f6a7b8c9_add_revoked_tokens`` (the
-    # access-token revocation table) plus ``a1b2c3d4e5f7_add_alerts`` (the
-    # operational-alert table) plus ``e6f7a8b9c0d1_add_alert_outbox`` (the
-    # durable delivery state on that table). The count is asserted so an
-    # *unintended* migration cannot appear unnoticed; a new one has to be
-    # declared here.
-    assert len(migrations) == 14, f"unexpected migration count: {len(migrations)}"
+    # The guard is the deliverable chain, not a file count: 15 revisions from base
+    # to ``a7c9e1f3b5d2`` (the O1-B INTENT attempt record). Declaring the length
+    # means an *unintended* migration cannot appear unnoticed -- a new one has to
+    # be declared here -- while local, unapproved work (``b2f7c1d9e4a6``, deferred
+    # Google linking) is named rather than counted, so the guard passes in a clean
+    # delivery tree where that file is absent.
+    chain = _delivery_chain()
+    assert len(chain) == DELIVERY_CHAIN_LENGTH, f"unexpected deliverable chain: {chain}"
+    assert chain[0] == DELIVERY_HEAD, f"deliverable chain head is not declared: {chain[0]}"
     declaring = [p for p in migrations if "'identities'," in p.read_text(encoding="utf-8")]
     assert len(declaring) == 1, f"expected one migration to declare the column: {declaring}"
     text = declaring[0].read_text(encoding="utf-8")
@@ -755,11 +803,12 @@ async def _drive_in_session(
     against live evidence. For the failing run both are withheld, so the resolver returns
     ``UNKNOWN`` on its own judgement and the real guard raises.
 
-    The task is left in ``PLANNING`` with the scenario already on the row, so Stage 1 is
-    skipped and identity is the first thing that runs; the row carries this worker's claim
-    token, so the fences pass; and the run then stops at the missing plan, which is after
-    the point under test and is recorded as its own event so it can never be mistaken for
-    the identity gate.
+    The task is left in ``UNDERSTANDING`` with the scenario already on the row, so Stage 1
+    is skipped and identity is the first thing that runs (the only state in which an empty
+    identity set is still legitimate). The plan stage is replaced by a governed planning
+    refusal, so the run stops *after* the write and at a failure gate that is recorded as
+    its own event, never mistaken for the identity gate. The row carries this worker's
+    claim token, so the fences pass.
     """
     owner = f"owner-{uuid4().hex[:10]}@corp.example"
     tenant, user = await make_tenant_user(owner)
@@ -767,7 +816,7 @@ async def _drive_in_session(
         tenant_id=tenant.id, user_id=user.id, email=owner, sub=f"sub-{uuid4().hex[:8]}"
     )
     task = await make_task(
-        tenant_id=tenant.id, user_id=user.id, state="PLANNING", risk_policy="MEDIUM"
+        tenant_id=tenant.id, user_id=user.id, state="UNDERSTANDING", risk_policy="MEDIUM"
     )
     backend = GoogleBackend()
     if resolvable:
@@ -807,9 +856,20 @@ async def _drive_in_session(
     try:
         gateway, _ = make_gateway()
         runtime = AgentRuntime(gateway=gateway, model=_UnreachableModel())
-        outcome = await runtime._drive(
-            session, task=task, row=row, transport=transport, claim=row.claim_token
-        )
+        # The identity write must still be observable in a state where an empty
+        # set is legitimate, and the run must still stop after it. A governed
+        # planning refusal does that without a plan, a model call, or a state in
+        # which the lifecycle guard would refuse before identity runs.
+        with patch.object(
+            PlannerService,
+            "create_plan",
+            side_effect=PlanNotAllowedError(
+                "observation stops after the identity stage"
+            ),
+        ):
+            outcome = await runtime._drive(
+                session, task=task, row=row, transport=transport, claim=row.claim_token
+            )
         # ``make_task`` hands back an instance from its own session, and the copy in hand
         # is stale once ``_fail`` has committed the transition. Re-reading it through this
         # session means the tests assert persisted state rather than a local leftover.
@@ -846,9 +906,9 @@ async def test_drive_resolves_then_writes_the_identity() -> None:
     from, so it fails if the write is hoisted above the call, if a second write appears,
     or if the write leaves ``_drive``.
 
-    The trailing failure is the absent plan, in a later stage. It is asserted to sit at a
-    *different* line than the identity gate, which is what stops the two from being
-    conflated in this log.
+    The trailing failure is the governed planning refusal, in a later stage. It is
+    asserted to sit at a *different* line than the identity gate, which is what stops the
+    two from being conflated in this log.
     """
     outcome, row, _, events = await _drive_once(resolvable=True)
 
@@ -994,12 +1054,16 @@ def test_this_round_changed_no_semantics() -> None:
     # task_preparation profile is the only other live-sealable question.
     assert frozenset({"calendar_meeting", "task_preparation"}) == LIVE_SEALABLE_PROFILES
 
-    # The identity round itself added no migration. The twelfth, thirteenth and
-    # fourteenth files are ``d4e5f6a7b8c9_add_revoked_tokens`` (access-token
-    # revocation), ``a1b2c3d4e5f7_add_alerts`` (operational alerts) and
-    # ``e6f7a8b9c0d1_add_alert_outbox`` (their durable delivery state) from later
-    # rounds, which touch no identity column.
-    assert len(list((REPO / "alembic" / "versions").glob("*.py"))) == 14
+    # The identity round itself added no migration. Later rounds added
+    # ``d4e5f6a7b8c9_add_revoked_tokens``, ``a1b2c3d4e5f7_add_alerts`` and
+    # ``e6f7a8b9c0d1_add_alert_outbox``, and this round adds
+    # ``a7c9e1f3b5d2_add_intent_attempts`` (the O1-B INTENT attempt record); none
+    # of them touches an identity column. The chain is asserted by
+    # :func:`_delivery_chain` rather than by counting files, so the guard holds in
+    # a clean delivery tree and still rejects an unexpected migration.
+    chain = _delivery_chain()
+    assert len(chain) == DELIVERY_CHAIN_LENGTH, f"unexpected deliverable chain: {chain}"
+    assert chain[0] == DELIVERY_HEAD, f"deliverable chain head is not declared: {chain[0]}"
 
     # The conflict rule is the same object, untouched: the round changed no semantics, so
     # it is referenced rather than restated.

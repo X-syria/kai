@@ -637,10 +637,15 @@ async def test_http_calendar_slots_refreshes_expired_token(
 ) -> None:
     token = await _register(client)
     url = await _connect(client, token)
+    started = await client.get(
+        f"{API_PREFIX}/auth/google/callback",
+        params={"state": _state_from(url), "code": "auth-code-123"},
+    )
+    assert started.status_code == 303
     assert (
-        await client.get(
-            f"{API_PREFIX}/auth/google/callback",
-            params={"state": _state_from(url), "code": "auth-code-123"},
+        await client.post(
+            f"{API_PREFIX}/auth/google/pending/confirm",
+            headers={"Authorization": f"Bearer {token}"},
         )
     ).status_code == 200
 
@@ -687,10 +692,15 @@ async def test_http_reconnect_keeps_refresh_token_and_rearms_the_expiry(
     """
     token = await _register(client)
     url = await _connect(client, token)
+    started = await client.get(
+        f"{API_PREFIX}/auth/google/callback",
+        params={"state": _state_from(url), "code": "auth-code-123"},
+    )
+    assert started.status_code == 303
     assert (
-        await client.get(
-            f"{API_PREFIX}/auth/google/callback",
-            params={"state": _state_from(url), "code": "auth-code-123"},
+        await client.post(
+            f"{API_PREFIX}/auth/google/pending/confirm",
+            headers={"Authorization": f"Bearer {token}"},
         )
     ).status_code == 200
 
@@ -705,10 +715,15 @@ async def test_http_reconnect_keeps_refresh_token_and_rearms_the_expiry(
     stub.authorization_access_token = "reconnected-access-token"
     stub.omit_refresh_on_exchange = True
     url2 = await _connect(client, token)
+    restarted = await client.get(
+        f"{API_PREFIX}/auth/google/callback",
+        params={"state": _state_from(url2), "code": "auth-code-456"},
+    )
+    assert restarted.status_code == 303
     assert (
-        await client.get(
-            f"{API_PREFIX}/auth/google/callback",
-            params={"state": _state_from(url2), "code": "auth-code-456"},
+        await client.post(
+            f"{API_PREFIX}/auth/google/pending/confirm",
+            headers={"Authorization": f"Bearer {token}"},
         )
     ).status_code == 200
 

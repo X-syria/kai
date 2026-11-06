@@ -936,11 +936,14 @@ async def test_responses_never_expose_internal_metadata(
 # --- migration -------------------------------------------------------------
 
 REVISION_PREV = "5f3e1d2c4b6a"
-# The repository head, which moves as later rounds add migrations. This test
-# only cares that downgrade -> upgrade is clean and that the head is applied.
-# Head is ``e6f7a8b9c0d1`` (``add_alert_outbox``), which chains off
-# ``a1b2c3d4e5f7`` (``add_alerts``).
-REVISION_HEAD = "e6f7a8b9c0d1"
+# The head of the *deliverable* migration chain. Pinned explicitly rather than
+# read via ``migration_harness.current_head()``: that helper calls
+# ``ScriptDirectory.get_current_head()``, which raises when the script directory
+# has more than one head -- the state of a working tree that still carries the
+# untracked, unapproved ``b2f7c1d9e4a6`` alongside ``a7c9e1f3b5d2``. The
+# assertion below only cares that downgrade -> upgrade is clean and that this
+# head is applied.
+REVISION_HEAD = "a7c9e1f3b5d2"
 
 
 def _alembic(target_url: str, *args: str) -> subprocess.CompletedProcess[str]:
